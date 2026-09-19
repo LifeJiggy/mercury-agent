@@ -748,15 +748,29 @@ export class CLIChannel extends BaseChannel {
           }
           return;
         }
-        // /persona <text> inside a bot chat rewrites to the explicit setter
-        // so the persona flow works without leaving the bot thread.
+        // /skip during persona capture routes INTO the bot thread so the
+        // agent's capture state machine sees it — a bare slash here would
+        // exit the chat and strand the pending persona (the onboarding
+        // prompt explicitly tells the user to send /skip).
+        if (trimmed === '/skip') {
+          const wrapped = `/bot ${this.activeBotId} /skip`;
+          this.pendingBotChatTarget = this.activeBotId;
+          try {
+            onInput(wrapped);
+          } finally {
+            this.pendingBotChatTarget = null;
+          }
+          return;
+        }
+        // /persona inside a bot chat rewrites to the explicit setter so the
+        // persona flow works without leaving the bot thread. Bare /persona
+        // arms the capture (next message becomes the persona) — it must NOT
+        // degrade to the /bots roster.
         if (trimmed.startsWith('/persona')) {
           const personaText = trimmed.slice('/persona'.length).trim();
-          if (personaText) {
-            onInput(`/bots persona ${this.activeBotId} ${personaText}`);
-          } else {
-            onInput('/bots');
-          }
+          onInput(personaText
+            ? `/bots persona ${this.activeBotId} ${personaText}`
+            : `/bots persona ${this.activeBotId}`);
           return;
         }
         // Any other slash command exits the bot chat first (review D2):

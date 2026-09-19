@@ -1310,7 +1310,7 @@ export class Agent {
     const action = (parts[0] ?? '').toLowerCase();
 
     // All bot-targeting actions accept id OR name — resolve to the id here.
-    if (['open', 'send', 'journal', 'inbox', 'budget', 'edit', 'delete', 'enable', 'disable', 'stop', 'pause', 'start', 'run'].includes(action) && parts[1]) {
+    if (['open', 'send', 'journal', 'inbox', 'budget', 'edit', 'delete', 'enable', 'disable', 'stop', 'pause', 'start', 'run', 'persona'].includes(action) && parts[1]) {
       const resolved = bm.resolveBotId(parts[1]);
       if (resolved) parts[1] = resolved;
     }
@@ -1400,11 +1400,27 @@ export class Agent {
     if (action === 'persona') {
       const target = parts[1]?.toLowerCase();
       const personaText = parts.slice(2).join(' ');
-      if (!target || !personaText || !bm.store.exists(target)) {
-        await channel.send('Usage: `/bots persona <id> <full persona text in one message>` — or open the bot chat (`/bots open <id>`) and type `/persona <text>`.', channelId);
+      if (!target) {
+        await channel.send('Usage: `/bots persona <id> <full persona text in one message>` — or open the bot chat (`/bots open <id>`) and type `/persona`.', channelId);
         return;
       }
-      await this.finalizePersona(bm, target, personaText, msg);
+      const resolved = bm.resolveBotId(target) ?? target;
+      if (!bm.store.exists(resolved)) {
+        await channel.send(`No bot "${target}". See \`/bots\` for the roster.`, channelId);
+        return;
+      }
+      if (!personaText) {
+        // Bare `/persona` (typed inside the bot chat): arm the capture —
+        // the next message in that thread becomes the persona. This is the
+        // promised flow ("edit it anytime with /persona here"); it must not
+        // degrade to the /bots roster.
+        this.pendingBudgetFor = null;
+        this.pendingPersonaFor = resolved;
+        const name = bm.store.get(resolved)?.name ?? resolved;
+        await channel.send(`✍️ Persona capture armed for **${name}** — your next message in this chat becomes its persona. \`/skip\` keeps the current one.`, `bot:${resolved}`);
+        return;
+      }
+      await this.finalizePersona(bm, resolved, personaText, msg);
       return;
     }
 

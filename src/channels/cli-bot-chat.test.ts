@@ -1,4 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
 import { CLIChannel } from './cli.js';
 
 describe('CLIChannel bot chat (transcript swap + target routing)', () => {
@@ -68,5 +71,28 @@ describe('CLIChannel bot chat (transcript swap + target routing)', () => {
     channel.enterBotChat('researcher', 'Research');
     const hints = channel.getTuiState().chatMessages.filter(m => m.content.includes('bot chat — everything you type'));
     expect(hints).toHaveLength(1);
+  });
+});
+
+// The bot-chat input routing lives inside the TUI mount closure (not a
+// standalone method), so the /persona + /skip contracts are pinned as source
+// assertions — the established pattern for agent/channel internals.
+const cliSrc = readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'cli.ts'), 'utf8');
+const agentSrc = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'core', 'agent.ts'), 'utf8');
+
+describe('bot chat /persona + /skip routing', () => {
+  it('bare /persona arms persona capture — never degrades to the /bots roster', () => {
+    expect(cliSrc).toMatch(/onInput\(personaText\s*\n\s*\? `\/bots persona \$\{this\.activeBotId\} \$\{personaText\}`\s*\n\s*: `\/bots persona \$\{this\.activeBotId\}`\)/);
+    // The agent side consumes the empty-text form as "arm the capture".
+    expect(agentSrc).toMatch(/action === 'persona'[\s\S]*?this\.pendingPersonaFor = resolved/s);
+    expect(agentSrc).toContain('Persona capture armed');
+  });
+
+  it('/skip inside a bot chat routes INTO the bot thread (capture state machine sees it)', () => {
+    expect(cliSrc).toMatch(/trimmed === '\/skip'[\s\S]*?`\/bot \$\{this\.activeBotId\} \/skip`/s);
+  });
+
+  it('/bots persona resolves bot names too (not just ids)', () => {
+    expect(agentSrc).toMatch(/'open', 'send', 'journal', 'inbox', 'budget', 'edit', 'delete', 'enable', 'disable', 'stop', 'pause', 'start', 'run', 'persona'/);
   });
 });
