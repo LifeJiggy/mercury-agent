@@ -86,6 +86,8 @@ export interface BotQueueBackend {
   rehydratable(): DurableBotJob[];
   /** Pending jobs whose run-after time has arrived (retry backoff elapsed). */
   dueJobs(): DurableBotJob[];
+  /** All pending jobs for one bot, in creation order — explicit resume (/bots start), ignores retry backoff. */
+  pendingJobs(botId: string): DurableBotJob[];
   /** Expired-lease claimed jobs → pending. Returns the count requeued. */
   requeueExpiredLeases(): number;
   heartbeatLease(jobId: string, leaseSeconds: number): void;
@@ -176,6 +178,11 @@ export class BotQueue {
   /** Pending jobs whose retry backoff has elapsed (swept periodically). */
   dueJobs(): DurableBotJob[] {
     return this.backend.dueJobs();
+  }
+
+  /** All pending jobs for one bot — explicit resume via /bots start. */
+  pendingJobs(botId: string): DurableBotJob[] {
+    return this.backend.pendingJobs(botId);
   }
 
   enqueueMail(mail: Omit<DurableMail, 'id'>): string {
@@ -342,6 +349,13 @@ export class SqliteQueueBackend implements BotQueueBackend {
     const rows = this.db.prepare(
       `SELECT * FROM bot_jobs WHERE state = 'pending' AND (run_after IS NULL OR run_after <= ?) ORDER BY created_at`,
     ).all(Date.now()) as any[];
+    return rows.map(normalizeJob);
+  }
+
+  pendingJobs(botId: string): DurableBotJob[] {
+    const rows = this.db.prepare(
+      `SELECT * FROM bot_jobs WHERE bot_id = ? AND state = 'pending' ORDER BY created_at`,
+    ).all(botId) as any[];
     return rows.map(normalizeJob);
   }
 
@@ -531,6 +545,10 @@ export class JsonFileQueueBackend implements BotQueueBackend {
   dueJobs(): DurableBotJob[] {
     const now = Date.now();
     return this.data.jobs.filter(j => j.state === 'pending' && (j.runAfter === undefined || j.runAfter <= now));
+  }
+
+  pendingJobs(botId: string): DurableBotJob[] {
+    return this.data.jobs.filter(j => j.botId === botId && j.state === 'pending');
   }
 
   enqueueMail(mail: Omit<DurableMail, 'id'>): string {

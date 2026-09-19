@@ -84,6 +84,16 @@ describe('BotQueue backends (JSON-file + SQLite semantics)', () => {
         expect(backend.counts()).toEqual({ pending: 0, claimed: 0, dlq: 0 });
       });
 
+      it('pendingJobs returns only that bot’s pending work, ignoring retry backoff', () => {
+        const backend = name === 'json' ? new JsonFileQueueBackend(root, 100) : new SqliteQueueBackend(root, 100, require('better-sqlite3'));
+        backend.enqueue(job('h1'));
+        backend.enqueue(job('h2', { botId: 'other' }));
+        backend.enqueue(job('backoff', { idempotencyKey: idempotencyKeyFor('researcher', 'chat', 'task backoff') }));
+        backend.retry('backoff', 1, Date.now() + 60_000); // in retry backoff
+        const pending = backend.pendingJobs('researcher');
+        expect(pending.map(j => j.id)).toEqual(['h1', 'backoff']); // backoff included: explicit resume overrides it
+      });
+
       it('settle dead moves the job to the DLQ with the reason', () => {
         const backend = name === 'json' ? new JsonFileQueueBackend(root, 100) : new SqliteQueueBackend(root, 100, require('better-sqlite3'));
         backend.enqueue(job('a1'));

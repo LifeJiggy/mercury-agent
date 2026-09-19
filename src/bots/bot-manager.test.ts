@@ -103,14 +103,30 @@ describe('BotManager queue + turn lifecycle', () => {
       expect(records[0].state).toBe('completed');
     });
     // Hermes/OpenClaw contract: the full result lands in the bot's OWN thread;
-    // the requesting session gets at most a one-line pointer.
+    // the CLI session that asked gets NOTHING — no pointer into the main chat
+    // (a delayed routine/retry run would otherwise print into whatever
+    // session is open days later — the thread leak).
     await vi.waitFor(() => {
       expect(delivered.some(d => d.target === 'bot:researcher' && d.message.includes('done'))).toBe(true);
-      expect(delivered.some(d => d.message.includes('finished its task') && d.message.includes('/bots open researcher'))).toBe(true);
     });
+    expect(delivered.every(d => d.target === 'bot:researcher')).toBe(true);
+    expect(delivered.some(d => d.message.includes('finished its task'))).toBe(false);
     const summary = manager.getStatusSummaries().find(s => s.id === 'researcher');
     expect(summary?.state).toBe('idle');
     expect(summary?.lastRunState).toBe('completed');
+  });
+
+  it('remote source channels still receive the full result (no bot threads there)', async () => {
+    mockedGenerateText.mockResolvedValue({ text: 'remote done', finishReason: 'stop', usage: { inputTokens: 10, outputTokens: 5 } } as any);
+    seedBot(store, 'courier');
+    const delivered: Array<{ target: string; message: string }> = [];
+    manager['notify'] = async (t, target, message) => { delivered.push({ target: `${t}:${target}`, message }); };
+    manager.enqueue('courier', { trigger: 'chat', prompt: 'go', source: { channelType: 'telegram', channelId: 'chat-42' } });
+    await vi.waitFor(() => {
+      expect(delivered.some(d => d.target === 'telegram:chat-42' && d.message.includes('remote done'))).toBe(true);
+    });
+    // The bot thread still gets it too.
+    expect(delivered.some(d => d.target === 'cli:bot:courier' && d.message.includes('remote done'))).toBe(true);
   });
 
   it('pauses the bot for the rest of the day when the daily token budget is hit', async () => {
@@ -140,6 +156,54 @@ describe('BotManager queue + turn lifecycle', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it('stop holds queued jobs (durable, nothing lost) and start resumes them', async () => {
+    let release!: () => void;
+    const gate = new Promise<void>(res => { release = res; });
+    mockedGenerateText.mockImplementation(() => gate.then(() => ({ text: 'ok', finishReason: 'stop', usage: { inputTokens: 1, outputTokens: 1 } } as any)));
+    seedBot(store, 'worker');
+    manager.enqueue('worker', { trigger: 'chat', prompt: 'one' });
+    manager.enqueue('worker', { trigger: 'chat', prompt: 'two' }); // queues behind the running turn
+    await vi.waitFor(() => expect(manager.getQueuedCount('worker')).toBe(1));
+
+    const stop = await manager.stop('worker');
+    expect(stop.halted).toBe(true);
+    expect(stop.heldJobs).toBe(1);
+    expect(manager.getQueuedCount('worker')).toBe(0);
+    // The queued job is NOT destroyed — its durable row stays pending.
+    expect(manager.queue.pendingJobs('worker').map(j => j.prompt)).toContain('two');
+
+    release(); // let the in-flight turn finish
+    await vi.waitFor(() => expect(manager.getJournal('worker').length).toBe(1));
+
+    const start = manager.start('worker');
+    expect(start.resumed).toBe(1);
+    await vi.waitFor(() => expect(manager.getJournal('worker').length).toBe(2));
+  });
+
+  it('start on an idle stopped bot resumes nothing and reports it', async () => {
+    seedBot(store, 'calm');
+    await manager.stop('calm'); // nothing running, nothing queued
+    expect(manager.start('calm').resumed).toBe(0);
+    expect(manager.getStatusSummaries().find(s => s.id === 'calm')?.state).toBe('idle');
+  });
+
+  it('runNow fires a configured routine now, rejects unknown ones, and wakes bare', async () => {
+    mockedGenerateText.mockResolvedValue({ text: 'digest done', finishReason: 'stop', usage: { inputTokens: 5, outputTokens: 5 } } as any);
+    seedBot(store, 'crony', { schedules: [{ name: 'digest', cron: '0 9 * * *', prompt: 'Write the daily digest' }] });
+    // Name resolution is case-insensitive; the run is journalled with trigger cron.
+    expect(manager.runNow('crony', 'DIGEST').accepted).toBe(true);
+    await vi.waitFor(() => {
+      const records = manager.getJournal('crony');
+      expect(records.length).toBe(1);
+      expect(records[0].trigger).toBe('cron');
+      expect(records[0].summary).toContain('digest done');
+    });
+    expect(manager.runNow('crony', 'nope')).toMatchObject({ accepted: false, reasonCode: 'routine_unknown' });
+    expect(manager.runNow('ghost', 'digest')).toMatchObject({ accepted: false, reasonCode: 'target_unknown' });
+    // No routine named → a bare wake turn with the canned wake prompt.
+    expect(manager.runNow('crony').accepted).toBe(true);
   });
 
   it('degrades to a stateless bot when the memory store cannot be built', async () => {
@@ -194,6 +258,9 @@ describe('Main-agent bots awareness (system prompt section)', () => {
     expect(section).toContain('/bot <id> <message>');
     expect(section).toContain('dispatch_bot');
     expect(section).toContain('/bots open <id>');
+    // The main agent must not promise main-chat delivery — results live in
+    // the bot thread only (§3.1, thread-leak fix).
+    expect(section).toContain('never in this chat');
   });
 
   it('empty fleet produces NO prompt section (zero drift for botless users)', () => {

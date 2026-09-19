@@ -59,6 +59,10 @@ export interface BotManagerDeps {
 const MAX_TRANSIENT_ATTEMPTS = 3;
 const MAILBOX_CAPACITY = 100;
 
+/** Bare wake turn (`/bots run <id>` with no routine): the bot gets a real
+ * turn with no task attached — it checks its mailbox and standing work. */
+const WAKE_PROMPT = '[wake] You were triggered manually with no specific task attached. Check your mailbox and any pending work; act on whatever your persona or standing routines call for, otherwise reply with a one-line status.';
+
 /** Structural subset of the main Scheduler the bot runtime needs. */
 type BotSchedulerLike = {
   addDelayedTask(m: { id: string; description: string; prompt: string; delaySeconds?: number; executeAt?: string; botId?: string; createdAt: string }): void;
@@ -102,8 +106,18 @@ export class BotManager {
   }
 
   private async alertOwner(botId: string, message: string): Promise<void> {
-    if (!this.alert) return;
-    await this.alert(message).catch((e) => logger.warn({ e, botId }, 'Bot alert send failed'));
+    // Needs-you events (permanent failure, budget pause) live in the BOT'S
+    // OWN thread — the main chat is never informed (§3.1). Remote owner
+    // surfaces (signal/telegram/…) still get the heads-up via the alert
+    // channel; the CLI is excluded there (agent wiring) because it would
+    // print into whatever main session is open.
+    if (this.notify) {
+      await this.notify('cli', `bot:${botId}`, message).catch((e) =>
+        logger.warn({ e, botId }, 'Bot alert to bot thread failed'));
+    }
+    if (this.alert) {
+      await this.alert(message).catch((e) => logger.warn({ e, botId }, 'Bot alert send failed'));
+    }
   }
 
   private queues: Map<string, BotJob[]> = new Map();
@@ -118,6 +132,9 @@ export class BotManager {
   private journals: Map<string, BotJournal> = new Map();
   private userMemories: Map<string, UserMemoryStore | null> = new Map();
   private disabled = new Set<string>();
+  /** Bots stopped by the user (/bots stop) — their held jobs must not sneak
+   * back in via the passive due-sweep; only /bots start (or a restart) resumes. */
+  private held = new Set<string>();
   /** Per-bot daily token usage: botId → { day (UTC yyyy-mm-dd), tokens }. */
   private dailyTokens: Map<string, { day: string; tokens: number }> = new Map();
   private pausedForBudget = new Set<string>();
@@ -173,7 +190,7 @@ export class BotManager {
   private resumeDueJobs(): void {
     const due = this.queue.dueJobs();
     for (const job of due) {
-      if (this.disabled.has(job.botId)) continue;
+      if (this.disabled.has(job.botId) || this.held.has(job.botId)) continue;
       const running = this.running.get(job.botId)?.size ?? 0;
       const q = this.queues.get(job.botId) ?? [];
       const alreadyQueued = q.some(j => j.id === job.id);
@@ -423,11 +440,14 @@ export class BotManager {
         this.queue.settle(job.id, 'done');
       }
 
-      // Deliver the outcome — Hermes/OpenClaw model (BOTS-ARCHITECTURE §3.1):
-      // the FULL result always lands in the BOT'S OWN thread; the session
-      // that asked for it gets only a one-line pointer. Remote channels
-      // (Telegram/web) are the exception — the user cannot open bot threads
-      // from there, so the full result is delivered in that chat. Halts
+      // Deliver the outcome — the bot thread is the ONLY local surface
+      // (BOTS-ARCHITECTURE §3.1): the FULL result lands in the BOT'S OWN
+      // thread and the CLI session that asked is NOT notified at all — a
+      // pointer into the main chat would leak into whatever session is open
+      // days later (a routine or retry finishing inside a brand-new session
+      // printed bot traffic into the user's regular chat/code). Remote
+      // channels (Telegram/web) stay the exception: their user cannot open
+      // bot threads, so the full result is delivered in that chat. Halts
       // report too (a stopped run must announce it stopped, §2.6).
       if (this.notify && job.trigger !== 'mailbox') {
         const botThread = `bot:${botId}`;
@@ -438,21 +458,13 @@ export class BotManager {
         // 1. Full result → the bot's own thread, always.
         await this.notify('cli', botThread, fullText).catch((e) =>
           logger.warn({ e, botId }, 'Bot result deliver to bot thread failed'));
-        // 2. Requesting surface: pointer line for TUI sessions; full result
-        // for remote channels (their user can't open bot threads).
+        // 2. Remote requesting surface only — no CLI pointer, no main-chat
+        // traffic, ever.
         const sourceChannelType = job.source?.channelType ?? 'cli';
         const sourceChannelId = job.source?.channelId;
-        if (sourceChannelId && sourceChannelId !== botThread) {
-          if (sourceChannelType === 'cli') {
-            const pointer = output.status === 'completed'
-              ? `🤖 **${manifest.name}** finished its task — full result in its chat (\`/bots open ${botId}\`).`
-              : `🤖 **${manifest.name}** run ended (${output.status}) — details in \`/bots open ${botId}\`.`;
-            await this.notify('cli', sourceChannelId, pointer).catch((e) =>
-              logger.warn({ e, botId }, 'Bot pointer notify failed'));
-          } else {
-            await this.notify(sourceChannelType, sourceChannelId, fullText).catch((e) =>
-              logger.warn({ e, botId }, 'Bot remote-channel result notify failed'));
-          }
+        if (sourceChannelId && sourceChannelId !== botThread && sourceChannelType !== 'cli') {
+          await this.notify(sourceChannelType, sourceChannelId, fullText).catch((e) =>
+            logger.warn({ e, botId }, 'Bot remote-channel result notify failed'));
         }
       }
     } catch (err: any) {
@@ -584,6 +596,7 @@ export class BotManager {
     this.lastRun.delete(botId);
     this.needsYou.delete(botId);
     this.pausedForBudget.delete(botId);
+    this.held.delete(botId);
     logger.info({ botId }, 'Bot deleted: queue/mail/DLQ purged, routines removed');
   }
 
@@ -622,19 +635,90 @@ export class BotManager {
 
   async halt(botId: string, jobId?: string): Promise<boolean> {
     const running = this.running.get(botId);
-    if (!running || running.size === 0) return false;
-    for (const id of running) {
+    const hadRunning = !!running && running.size > 0;
+    for (const id of running ?? []) {
       if (jobId && id !== jobId) continue;
       this.aborts.get(`${botId}:${id}`)?.abort();
     }
+    // Queued-but-not-started jobs leave the in-memory lane; their durable rows
+    // stay pending, so /bots start (or a restart) can resume them — stop never
+    // silently destroys queued work (§2.7 control plane).
     this.queues.set(botId, jobId ? (this.queues.get(botId) ?? []).filter(j => j.id !== jobId) : []);
-    return true;
+    return hadRunning;
   }
 
   async haltAll(): Promise<void> {
     for (const [botId] of this.running) {
       await this.halt(botId);
     }
+  }
+
+  /**
+   * User-facing stop: abort the running turn(s) AND hold queued work. Held
+   * jobs stay durable-pending (survive a restart); the passive due-sweep
+   * skips held bots, so nothing resumes until /bots start. Explicit new
+   * triggers (send/mail/cron) still work — the bot is stopped, not disabled.
+   */
+  async stop(botId: string): Promise<{ halted: boolean; heldJobs: number }> {
+    const heldJobs = (this.queues.get(botId) ?? []).length;
+    const halted = await this.halt(botId);
+    this.held.add(botId);
+    if (heldJobs > 0) {
+      logger.info({ botId, heldJobs }, 'Bot stopped — queued jobs held (resumable via /bots start)');
+    }
+    return { halted, heldJobs };
+  }
+
+  /**
+   * User-facing resume (the counterpart of stop): clear the stop-hold,
+   * re-enter held/pending durable jobs, and kick the queue. A disabled bot
+   * is enabled first — "start" is unambiguous. Safe on an already-running bot.
+   */
+  start(botId: string): { resumed: number } {
+    const manifest = this.store.get(botId);
+    if (!manifest) throw new Error(`Bot "${botId}" does not exist`);
+    this.held.delete(botId);
+    const resumed = this.rehydratePending(botId);
+    if (!manifest.enabled || this.disabled.has(botId)) {
+      this.setEnabled(botId, true); // persists enabled + pumps
+    } else {
+      this.pump(botId);
+    }
+    return { resumed };
+  }
+
+  /** Pull durable pending jobs for a bot back into the in-memory queue. */
+  private rehydratePending(botId: string): number {
+    const pending = this.queue.pendingJobs(botId);
+    if (pending.length === 0) return 0;
+    const q = this.queues.get(botId) ?? [];
+    const running = this.running.get(botId) ?? new Set();
+    let added = 0;
+    for (const job of pending) {
+      if (q.some(j => j.id === job.id) || running.has(job.id)) continue;
+      q.push({
+        id: job.id, botId, trigger: job.trigger, prompt: job.prompt,
+        fromBot: job.fromBot, source: job.source, createdAt: job.createdAt, attempts: job.attempts,
+      });
+      added++;
+    }
+    if (added > 0) {
+      this.queues.set(botId, q);
+      logger.info({ botId, resumed: added }, 'Re-entered pending bot jobs (explicit resume)');
+    }
+    return added;
+  }
+
+  /** Fire a bot's configured routine immediately, or send a bare wake turn. */
+  runNow(botId: string, routineName?: string): { accepted: boolean; jobId?: string; reasonCode?: string } {
+    const manifest = this.store.get(botId);
+    if (!manifest) return { accepted: false, reasonCode: 'target_unknown' };
+    if (routineName) {
+      const routine = (manifest.schedules ?? []).find(r => r.name.toLowerCase() === routineName.toLowerCase());
+      if (!routine) return { accepted: false, reasonCode: 'routine_unknown' };
+      return this.enqueue(botId, { trigger: 'cron', prompt: routine.prompt });
+    }
+    return this.enqueue(botId, { trigger: 'chat', prompt: WAKE_PROMPT });
   }
 
   setEnabled(botId: string, enabled: boolean): void {
@@ -735,10 +819,10 @@ export class BotManager {
       lines.push(`- **${m.name}** (\`${m.id}\`)${desc} [${state}]`);
     }
     lines.push(`Bot control (never route bot work through this main conversation):
-- \`/bot <id> <message>\` or \`@<id> <message>\` — dispatch a task to a bot; its reply arrives in this chat when done.
+- \`/bot <id> <message>\` or \`@<id> <message>\` — dispatch a task to a bot; the result lands ONLY in the bot's own thread (\`/bots open <id>\`), never in this chat.
 - \`/bots open <id>\` — open the bot's own chat; \`/bots\` — roster with live states.
 - \`/bots create <id> "Name" "Description"\` — onboard; \`/bots persona <id> <text>\` — set its character.
-- \`/bots journal <id>\` — recent runs; \`/bots dlq\` — failed jobs (replayable); \`/bots stop|enable|disable <id>\`.
+- \`/bots journal <id>\` — recent runs; \`/bots dlq\` — failed jobs (replayable); \`/bots stop|start|enable|disable <id>\`; \`/bots run <id> [routine]\` — fire a routine now (or a bare wake).
 - The dispatch_bot tool lets you hand a task to a bot mid-conversation and continue talking; the result is delivered when the bot finishes.`);
     return lines.join('\n');
   }

@@ -576,7 +576,12 @@ export class Agent {
     });
     botManager.setAlert(async (message) => {
       const channel = this.channels.getNotificationChannel();
-      await channel?.send(message).catch((e) => logger.warn({ e }, 'bot alert send failed'));
+      // The CLI is NOT a needs-you surface: an alert printed there lands in
+      // the main chat (bot thread leak) — the bot's own thread already
+      // carries the event via botManager's own notify.
+      if (channel && channel.type !== 'cli') {
+        await channel.send(message).catch((e) => logger.warn({ e }, 'bot alert send failed'));
+      }
     });
   }
 
@@ -1275,7 +1280,7 @@ export class Agent {
     const action = (parts[0] ?? '').toLowerCase();
 
     // All bot-targeting actions accept id OR name — resolve to the id here.
-    if (['open', 'send', 'journal', 'inbox', 'budget', 'edit', 'delete', 'enable', 'disable', 'stop', 'pause'].includes(action) && parts[1]) {
+    if (['open', 'send', 'journal', 'inbox', 'budget', 'edit', 'delete', 'enable', 'disable', 'stop', 'pause', 'start', 'run'].includes(action) && parts[1]) {
       const resolved = bm.resolveBotId(parts[1]);
       if (resolved) parts[1] = resolved;
     }
@@ -1491,8 +1496,51 @@ export class Agent {
         await channel.send('Usage: `/bots stop <id>`', channelId);
         return;
       }
-      const halted = await bm.halt(target);
-      await channel.send(halted ? `⛔ Halt signal sent to **${target}** — it will stop after the current tool step.` : `**${target}** has nothing running.`, channelId);
+      const result = await bm.stop(target);
+      const heldNote = result.heldJobs > 0 ? `\n↩ ${result.heldJobs} queued job(s) held — resume with \`/bots start ${target}\`.` : '';
+      await channel.send(result.halted
+        ? `⛔ Halt signal sent to **${target}** — it will stop after the current tool step.${heldNote}`
+        : `⛔ **${target}** stopped — nothing was running.${heldNote}`, channelId);
+      return;
+    }
+
+    if (action === 'start') {
+      const target = parts[1]?.toLowerCase();
+      if (!target) {
+        await channel.send('Usage: `/bots start <id>`', channelId);
+        return;
+      }
+      try {
+        const { resumed } = bm.start(target);
+        await channel.send(resumed > 0
+          ? `▶️ **${target}** started — ${resumed} held job(s) back in the queue.`
+          : `▶️ **${target}** started — nothing was held; it is idle and ready for tasks.`, channelId);
+      } catch (err: any) {
+        await channel.send(`Failed: ${err?.message}`, channelId);
+      }
+      return;
+    }
+
+    if (action === 'run') {
+      const target = parts[1]?.toLowerCase();
+      const routine = parts.slice(2).join(' ') || undefined;
+      if (!target) {
+        await channel.send('Usage: `/bots run <id> [routineName]` — no routine = a bare wake turn.', channelId);
+        return;
+      }
+      const result = bm.runNow(target, routine);
+      if (!result.accepted) {
+        if (result.reasonCode === 'routine_unknown') {
+          const names = (bm.store.get(target)?.schedules ?? []).map(r => r.name);
+          await channel.send(`No routine "${routine}" on **${target}**.${names.length ? ` Configured: ${names.join(', ')}` : ' This bot has no routines — add them with `/bots edit <id>` or /bots open.'}`, channelId);
+          return;
+        }
+        await channel.send(`Could not run **${target}**: [reason: ${result.reasonCode}]`, channelId);
+        return;
+      }
+      await channel.send(routine
+        ? `🏃 Routine **${routine}** fired on **${target}** (job ${result.jobId}) — runs outside the main conversation.`
+        : `🏃 Wake sent to **${target}** (job ${result.jobId}) — it gets a turn to check its mailbox and pending work.`, channelId);
       return;
     }
 
@@ -1600,7 +1648,8 @@ export class Agent {
       '`/bots dlq` — dead-lettered jobs\n' +
       '`/bots replay <botId> <jobId>` — re-run a dead-lettered job\n' +
       '`/bots storage` — disk usage\n' +
-      '`/bots enable|disable|stop <id>` — control (disable = pause, enable = resume)\n' +
+      '`/bots enable|disable|stop|start <id>` — control (stop holds queued jobs; start resumes them)\n' +
+      '`/bots run <id> [routineName]` — fire a routine now, or a bare wake turn\n' +
       '`/bots delete <id> confirm` — permanently delete',
       channelId,
     );

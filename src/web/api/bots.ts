@@ -134,7 +134,7 @@ app.post('/api/bots/:id/replay/:jobId', (c: any) => {
   return c.json({ ...result, status: 'accepted' });
 });
 
-// Enable/disable/stop controls
+// Enable/disable/stop/start controls
 app.post('/api/bots/:id/enable', (c: any) => {
   if (!botManager) return c.json({ error: 'Bots not available' }, 400);
   try {
@@ -157,9 +157,33 @@ app.post('/api/bots/:id/disable', (c: any) => {
 
 app.post('/api/bots/:id/stop', async (c: any) => {
   if (!botManager) return c.json({ error: 'Bots not available' }, 400);
-  const halted = await botManager.halt(c.req.param('id'));
-  return c.json({ ok: halted, message: halted ? 'Halt signal sent' : 'Nothing running' });
+  const result = await botManager.stop(c.req.param('id'));
+  return c.json({ ok: true, halted: result.halted, heldJobs: result.heldJobs, message: haltedMessage(result) });
 });
+
+app.post('/api/bots/:id/start', (c: any) => {
+  if (!botManager) return c.json({ error: 'Bots not available' }, 400);
+  try {
+    const result = botManager.start(c.req.param('id'));
+    return c.json({ ok: true, resumed: result.resumed, message: result.resumed > 0 ? `Resumed ${result.resumed} held job(s)` : 'Nothing held — bot is ready' });
+  } catch (err: any) {
+    return c.json({ error: err?.message }, 404);
+  }
+});
+
+// Fire a routine now (body { routine }) or send a bare wake turn
+app.post('/api/bots/:id/run', async (c: any) => {
+  if (!botManager) return c.json({ error: 'Bots not available' }, 400);
+  const body = await c.req.json().catch(() => null) as { routine?: string } | null;
+  const result = botManager.runNow(c.req.param('id'), body?.routine);
+  if (!result.accepted) return c.json(result, result.reasonCode === 'routine_unknown' ? 404 : 409);
+  return c.json({ ...result, status: 'accepted' }, 202);
+});
+
+function haltedMessage(result: { halted: boolean; heldJobs: number }): string {
+  const base = result.halted ? 'Halt signal sent' : 'Nothing running';
+  return result.heldJobs > 0 ? `${base}; ${result.heldJobs} queued job(s) held` : base;
+}
 
 // Storage view
 app.get('/api/bots-storage', (c: any) => {

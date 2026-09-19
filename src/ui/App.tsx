@@ -1041,6 +1041,7 @@ export function TuiApp({ channel, onInput, onPermissionResolve, onExit, spotifyC
           programmingMode={state.programmingMode}
           projectContext={state.projectContext}
           botChat={state.botChat}
+          botsWorking={state.botRoster.filter((b) => b.state === 'running').length}
         />
       )}
       {showInput && state.mode !== 'mercury-code' && slashSuggestions.length > 0 && (
@@ -2189,6 +2190,7 @@ function InputBox({
   programmingMode,
   projectContext,
   botChat,
+  botsWorking,
 }: {
   input: string;
   cursorPos: number;
@@ -2196,6 +2198,8 @@ function InputBox({
   programmingMode: ProgrammingModeState;
   projectContext: string | null;
   botChat?: { botId: string; botName: string } | null;
+  /** Bots currently running a turn (live roster, polled every 2s). */
+  botsWorking?: number;
 }) {
   const inWorkspace = mode === 'workspace';
   const inCoding = mode === 'coding' || inWorkspace;
@@ -2228,6 +2232,11 @@ function InputBox({
         <Text color={programmingMode === 'execute' ? 'green' : programmingMode === 'plan' ? 'yellow' : 'gray'}>
           mode={programmingMode.toUpperCase()}
         </Text>
+        {/* Ambient bot-fleet status: shown ONLY while bots are actually
+            working (idle = nothing rendered, no "idle" noise). */}
+        {botsWorking && botsWorking > 0 ? (
+          <Text color="magenta"> 🤖 {botsWorking} working</Text>
+        ) : null}
       </Box>
       <Box paddingX={1} flexDirection="column">
         {lines.map((line, i) => (
