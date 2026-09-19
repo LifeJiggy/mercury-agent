@@ -66,4 +66,49 @@ describe('refinePersona (convert to template)', () => {
     const throwing = { ...stubProvider(), generateText: async () => { throw new Error('HTTP 500'); } } as any;
     expect(await refinePersona('raw persona text', 'R', throwing)).toBeNull();
   });
+
+  it('big personas get the two-pass build: inventory extraction, then drafting against it', async () => {
+    const calls: string[] = [];
+    const recording = {
+      ...stubProvider(),
+      generateText: async (prompt: string) => {
+        calls.push(prompt);
+        return {
+          text: scriptedResponses.shift() ?? '',
+          inputTokens: 0, outputTokens: 0, totalTokens: 0, model: 'stub', provider: 'stub',
+        };
+      },
+    } as any;
+    scriptedResponses.push('- verifies repos are active\n- never recommends unverified sources\n- prefers depth over volume');
+    scriptedResponses.push(goodTemplate);
+    // >4000 chars of raw persona triggers the inventory pass.
+    const longRaw = 'I want a research bot. '.repeat(200) + 'It verifies repos are active before recommending, never recommends unverified sources, prefers depth over volume, and reports with a one-line summary.';
+    expect(longRaw.length).toBeGreaterThan(4_000);
+    const result = await refinePersona(longRaw, 'Research', recording);
+    expect(result).toContain('## Standing instructions');
+    // Pass 1 = extraction, pass 2 = draft carrying the inventory checklist.
+    expect(calls).toHaveLength(2);
+    expect(calls[0]).toContain('checklist');
+    expect(calls[1]).toContain('Requirements inventory');
+    expect(calls[1]).toContain('verifies repos are active');
+  });
+
+  it('a failing inventory pass falls back to the single-pass build', async () => {
+    let calls = 0;
+    const flakyInventory = {
+      ...stubProvider(),
+      generateText: async (prompt: string) => {
+        calls++;
+        if (prompt.includes('checklist')) throw new Error('HTTP 500');
+        return {
+          text: goodTemplate,
+          inputTokens: 0, outputTokens: 0, totalTokens: 0, model: 'stub', provider: 'stub',
+        };
+      },
+    } as any;
+    const longRaw = 'Detailed research persona. '.repeat(200) + 'Be skeptical.';
+    const result = await refinePersona(longRaw, 'Research', flakyInventory);
+    expect(calls).toBe(2);
+    expect(result).toContain('# Research');
+  });
 });
