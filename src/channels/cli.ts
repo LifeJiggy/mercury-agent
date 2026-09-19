@@ -1821,6 +1821,13 @@ export class CLIChannel extends BaseChannel {
     if (!fs.existsSync(target)) return { ok: false, message: `Directory does not exist: ${target}` };
     if (!fs.statSync(target).isDirectory()) return { ok: false, message: `Not a directory: ${target}` };
 
+    // A bot chat must not survive a mode switch: a stranded activeBotId would
+    // park every later send into the hidden main transcript (invisible
+    // responses) and wrap nothing visibly. The typed /code path already
+    // exits the bot chat first — this covers every OTHER entry (the
+    // automatic coding hand-off, Esc flows).
+    if (this.activeBotId) this.exitBotChat();
+
     const dirName = path.basename(target) || target;
     this.exitEscArmed = false;
     this.update({

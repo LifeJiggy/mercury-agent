@@ -417,6 +417,17 @@ function looksResearchy(text: string): boolean {
 export const MERCURY_CODE_HANDOFF_TIMEOUT_MS = 45_000;
 
 /**
+ * Fleet-control verbs: `/bot <verb> …` where the first token resolves to NO
+ * configured bot is a control command typed on the message slash — it is
+ * routed to the /bots surface instead of failing as an unknown target.
+ * (A bot actually named e.g. "start" always wins — bot resolution first.)
+ */
+export const BOT_CONTROL_VERBS = new Set([
+  'start', 'stop', 'pause', 'enable', 'disable', 'run', 'open', 'send',
+  'journal', 'inbox', 'budget', 'edit', 'delete', 'replay', 'list', 'dlq', 'storage',
+]);
+
+/**
  * Whitelabel a provider error into one short, respectful line for the chat:
  * the user gets the real reason (token expired, rate limit, server error) —
  * never a stack trace or raw HTTP dump.
@@ -672,6 +683,19 @@ export class Agent {
       const spaceIndex = rest.indexOf(' ');
       const rawTarget = (spaceIndex === -1 ? rest : rest.slice(0, spaceIndex)).toLowerCase();
       const message = spaceIndex === -1 ? '' : rest.slice(spaceIndex + 1).trim();
+      // `/bot start <id>` etc. — a fleet-control verb typed on the message
+      // slash: the first token resolves to NO bot, so it was never a target.
+      // Route it to /bots (the control surface) instead of failing with a
+      // confusing "Could not message start: target_unknown".
+      if (BOT_CONTROL_VERBS.has(rawTarget) && !this.botManager.resolveBotId(rawTarget)) {
+        const channel = this.channels.getChannelForMessage(msg);
+        if (channel) {
+          this.handleBotsCommand(trimmed.replace(/^\/bot\b/, '/bots'), msg, channel).catch((err) => {
+            logger.error({ err: (err as any)?.message ?? err, content: trimmed.slice(0, 50) }, '/bots command failed');
+          });
+          return;
+        }
+      }
       const botId = this.botManager.resolveBotId(rawTarget) ?? rawTarget;
       if (botId && message) {
         void this.dispatchToBot(botId, message, msg);
@@ -884,11 +908,17 @@ export class Agent {
     const explanation =
       'Research mode will search the web, cross-check multiple sources, gather images, and produce a full research article as rich markdown. It runs longer than a quick answer and will not be killed early.';
 
-    const choice = await this.presentChoice(
+    // Time-weighted default (same contract as the Mercury Code hand-off): an
+    // unanswered prompt must never hold a chat message hostage. No answer
+    // within the window → "Quick answer", nothing remembered, and the next
+    // research-shaped question asks again.
+    const choice = await this.presentChoiceWithTimeout(
       `This looks like a research question. ${explanation}\n\nHow do you want to proceed?`,
       ['Full research mode (deep, multi-source article)', 'Quick answer (normal conversation)'],
       msg.channelId,
       msg.channelType,
+      MERCURY_CODE_HANDOFF_TIMEOUT_MS,
+      1, // unanswered = Quick answer (not remembered — nobody chose)
     );
 
     if (choice.toLowerCase().startsWith('full')) {
