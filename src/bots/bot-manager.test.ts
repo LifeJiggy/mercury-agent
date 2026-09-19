@@ -373,6 +373,41 @@ describe('Per-bot permission isolation (fail-closed)', () => {
     expect(pm.getManifest().capabilities.shell.blocked).toContain('sudo *');
   });
 
+  it('persona ## Access grants merge additively into the registry scopes', () => {
+    const manifest = store.create({ id: 'cookiebot', name: 'Cookiebot' }) as BotManifest;
+    store.writePersona('cookiebot', `# Cookiebot\n\n## Access\n\n- ~/cookies — read\n- /tmp/execdir — execute\n`);
+    const registry = createBotCapabilityRegistry({
+      botId: 'cookiebot',
+      manifest,
+      botDir: store.botDir('cookiebot'),
+      permissions: store.readPermissions('cookiebot'),
+      persona: store.readPersona('cookiebot'),
+      userMemory: null,
+      config: getDefaultConfig() as MercuryConfig,
+    });
+    const scopes = registry.permissions.getManifest().capabilities.filesystem.scopes;
+    // Own profile dir (default grant) still there, plus the persona grants.
+    expect(scopes.some(s => s.path === store.botDir('cookiebot'))).toBe(true);
+    expect(scopes.some(s => s.path.endsWith('/cookies') && s.read && !s.write)).toBe(true);
+    expect(scopes.some(s => s.path === '/tmp/execdir' && s.execute)).toBe(true);
+  });
+
+  it('a persona without an Access section changes nothing (current permissions apply)', () => {
+    const manifest = store.create({ id: 'plainbot', name: 'Plainbot' }) as BotManifest;
+    const registry = createBotCapabilityRegistry({
+      botId: 'plainbot',
+      manifest,
+      botDir: store.botDir('plainbot'),
+      permissions: store.readPermissions('plainbot'),
+      persona: store.readPersona('plainbot'), // default template: examples only, no grant bullets
+      userMemory: null,
+      config: getDefaultConfig() as MercuryConfig,
+    });
+    const scopes = registry.permissions.getManifest().capabilities.filesystem.scopes;
+    expect(scopes).toHaveLength(1);
+    expect(scopes[0].path).toBe(store.botDir('plainbot'));
+  });
+
   it('fs write outside the bot scope is denied without prompting', async () => {
     const manifest = store.create({ id: 'writer', name: 'Writer' }) as BotManifest;
     const registry = createBotCapabilityRegistry({

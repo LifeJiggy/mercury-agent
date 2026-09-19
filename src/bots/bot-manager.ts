@@ -545,6 +545,10 @@ export class BotManager {
       manifest,
       botDir: this.store.botDir(botId),
       permissions: this.store.readPermissions(botId),
+      // The persona's `## Access` section grants extra path scopes — read at
+      // registry build, so a persona edit (invalidateRuntime on write) applies
+      // to the very next turn.
+      persona: this.store.readPersona(botId),
       userMemory: this.userMemoryFor(botId, manifest),
       config: this.config,
     });

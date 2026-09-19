@@ -9,6 +9,13 @@ export interface FileScope {
   path: string;
   read: boolean;
   write: boolean;
+  /**
+   * Explicit execute grant (fail-closed bots): shell commands whose path
+   * arguments all resolve inside this scope may run. The global
+   * blocked-command list always wins; commands without path arguments stay
+   * approval-gated.
+   */
+  execute?: boolean;
 }
 
 export interface ShellPermissions {
@@ -542,7 +549,7 @@ export class PermissionManager {
         const hasPathTraversal = this.hasPathBeyondCwd(segment);
         if (hasPathTraversal) {
           const scopeCheck = await this.checkFsAccess(hasPathTraversal, 'write');
-          if (!scopeCheck.allowed) {
+          if (!scopeCheck.allowed && !this.isExecuteScoped(hasPathTraversal)) {
             return { allowed: false, reason: `No permission to access ${hasPathTraversal}. Use approve_scope tool with path="${hasPathTraversal}" and mode="write" to request access.`, needsApproval: false };
           }
         }
@@ -558,6 +565,19 @@ export class PermissionManager {
     if (allSegmentsSafeRead) {
       logger.info({ cmd: trimmed, segments: segments.length }, 'Shell command auto-approved (safe read-only)');
       return { allowed: true, needsApproval: false };
+    }
+
+    // Fail-closed execute grants (bots): an explicitly granted execute scope
+    // lets the bot run commands whose path arguments ALL live inside it — the
+    // blocked list already won above. Commands with no path argument stay
+    // approval-gated: an unscoped `npm install` mutates cwd and can reach
+    // anywhere via the network, so it is not covered by a directory grant.
+    if (this.failClosed) {
+      const pathTokens = segments.flatMap(s => this.extractPathTokens(s));
+      if (pathTokens.length > 0 && pathTokens.every(t => this.isExecuteScoped(t))) {
+        logger.info({ cmd: trimmed, paths: pathTokens.length }, 'Shell command allowed by execute scope');
+        return { allowed: true, needsApproval: false };
+      }
     }
 
     // All non-safe commands require user approval in ask-me mode
@@ -681,22 +701,34 @@ export class PermissionManager {
     }
   }
 
-  private hasPathBeyondCwd(command: string): string | null {
-    const pathPatterns = [
-      /(?:^|\s)(\/[^\s]+)/,
-      /(?:^|\s)(~\/[^\s]+)/,
-      /(?:^|\s)\.\.\/([^\s]+)/,
-      /(?:^|\s)([A-Za-z]:\\[^\s]+)/,
-      /(?:^|\s)(\\\\[^\s]+)/,
-    ];
-    for (const p of pathPatterns) {
-      const match = command.match(p);
-      if (match) {
-        const candidate = resolve(match[1].replace(/^~/, homedir()));
-        if (!candidate.startsWith(this.cwd)) {
-          return candidate;
-        }
+  private static readonly PATH_PATTERNS = [
+    /(?:^|\s)(\/[^\s]+)/,
+    /(?:^|\s)(~\/[^\s]+)/,
+    /(?:^|\s)\.\.\/([^\s]+)/,
+    /(?:^|\s)([A-Za-z]:\\[^\s]+)/,
+    /(?:^|\s)(\\\\[^\s]+)/,
+  ];
+
+  /** Every path-like token in a command segment, resolved (tilde expanded). */
+  private extractPathTokens(text: string): string[] {
+    const out: string[] = [];
+    for (const pattern of PermissionManager.PATH_PATTERNS) {
+      for (const match of text.matchAll(new RegExp(pattern.source, 'g'))) {
+        out.push(resolve(match[1].replace(/^~/, homedir())));
       }
+    }
+    return out;
+  }
+
+  /** A resolved path is covered by an explicit execute grant. */
+  private isExecuteScoped(resolvedPath: string): boolean {
+    if (this.findScope(resolvedPath)?.execute) return true;
+    return this.findTempScope(resolvedPath)?.execute === true;
+  }
+
+  private hasPathBeyondCwd(command: string): string | null {
+    for (const candidate of this.extractPathTokens(command)) {
+      if (!candidate.startsWith(this.cwd)) return candidate;
     }
     return null;
   }

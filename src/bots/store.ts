@@ -100,6 +100,15 @@ falls outside it.
 - If you lack permission for an action, stop and report it in your summary
   instead of attempting a workaround.
 
+## Access
+
+You can always read and write inside your own profile directory. Anything
+else is denied until it is granted here — one bullet per directory (the
+forms below are examples only; write real bullets to grant access):
+\`- ~/some/dir — read\` · \`- ~/other/dir — read, write\` · \`- /usr/local/bin/tool — execute\`.
+A granted directory covers everything inside it. Outside these grants you
+do not act — you stop and report which access you would have needed.
+
 ## Output
 
 - Lead with the outcome, then the details.

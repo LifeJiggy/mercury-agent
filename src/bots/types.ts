@@ -108,6 +108,11 @@ export interface BotPathScope {
   scope: string;
   read?: boolean;
   write?: boolean;
+  /**
+   * May run shell commands whose path arguments lie inside this scope
+   * (fail-closed bots only; the global blocked-command list still wins).
+   */
+  execute?: boolean;
 }
 
 /** One journal entry — the permanent compact record of a bot run. */

@@ -5,6 +5,7 @@ import type { UserMemoryStore } from '../memory/user-memory.js';
 import type { MercuryConfig } from '../utils/config.js';
 import { logger } from '../utils/logger.js';
 import type { BotManifest, BotPermissionsFile, BotPathScope } from './types.js';
+import { parsePersonaAccess } from './persona-access.js';
 
 /**
  * Tools a bot must never see, regardless of manifest. These are the tools
@@ -36,6 +37,11 @@ export interface BotRegistryDeps {
   config: MercuryConfig;
   /** Per-bot memory store (P0-5); null until memory scoping is wired. */
   userMemory?: UserMemoryStore | null;
+  /**
+   * Persona text — a `## Access` section grants extra path scopes (merged
+   * with permissions.yaml). Absent or empty section = no change.
+   */
+  persona?: string;
 }
 
 /**
@@ -55,7 +61,10 @@ export function createBotCapabilityRegistry(deps: BotRegistryDeps): CapabilityRe
   // Reshape the manifest in place (never call save() — that writes the
   // global ~/.mercury/permissions.yaml, and bots have no path to it).
   const manifest = pm.getManifest();
-  manifest.capabilities.filesystem.scopes = buildBotScopes(deps.permissions.paths, deps.botDir);
+  manifest.capabilities.filesystem.scopes = buildBotScopes(
+    mergeScopeGrants(deps.permissions.paths, parsePersonaAccess(deps.persona ?? '')),
+    deps.botDir,
+  );
   manifest.capabilities.shell.autoApproved = [];
   manifest.capabilities.shell.blocked = [
     ...new Set([...manifest.capabilities.shell.blocked, ...(deps.permissions.blockedCommands ?? [])]),
@@ -97,18 +106,50 @@ export function filterBotTools(all: Record<string, any>, manifest: BotManifest):
 }
 
 /**
- * Bot path scopes from permissions.yaml. 'self' resolves to the bot's own
- * profile dir; everything else resolves against cwd or home (~). An
- * unconfigured bot gets NO filesystem access (fail-closed) — but the store
- * always writes a default self scope at creation.
+ * Merge raw scope grants from permissions.yaml and the persona's `## Access`
+ * section. Additive by design: the persona can only WIDEN what
+ * permissions.yaml already grants, and the same path granted twice unions
+ * its modes. No persona Access section = permissions.yaml alone (unchanged).
  */
-function buildBotScopes(paths: BotPathScope[] | undefined, botDir: string): Array<{ path: string; read: boolean; write: boolean }> {
-  const scopes: Array<{ path: string; read: boolean; write: boolean }> = [];
+function mergeScopeGrants(
+  fileScopes: BotPathScope[] | undefined,
+  personaScopes: BotPathScope[],
+): BotPathScope[] {
+  if (personaScopes.length === 0) return fileScopes ?? [];
+  const merged = [...(fileScopes ?? [])];
+  for (const grant of personaScopes) {
+    const key = normalizeScopeKey(grant.scope);
+    const existing = merged.find(p => normalizeScopeKey(p.scope) === key);
+    if (existing) {
+      existing.read = existing.read || grant.read;
+      existing.write = existing.write || grant.write;
+      existing.execute = existing.execute || grant.execute;
+    } else {
+      merged.push(grant);
+    }
+  }
+  return merged;
+}
+
+/** Key for grant de-duplication: resolved absolute path ('self' resolved later). */
+function normalizeScopeKey(scope: string): string {
+  return scope === 'self' ? 'self' : resolve(scope.replace(/^~/, homedir())).toLowerCase();
+}
+
+/**
+ * Bot path scopes from permissions.yaml + persona Access grants. 'self'
+ * resolves to the bot's own profile dir; everything else resolves against
+ * cwd or home (~). An unconfigured bot gets NO filesystem access
+ * (fail-closed) — but the store always writes a default self scope at
+ * creation.
+ */
+function buildBotScopes(paths: BotPathScope[] | undefined, botDir: string): Array<{ path: string; read: boolean; write: boolean; execute?: boolean }> {
+  const scopes: Array<{ path: string; read: boolean; write: boolean; execute?: boolean }> = [];
   for (const p of paths ?? []) {
     const resolved = p.scope === 'self'
       ? resolve(botDir)
       : resolve(p.scope.replace(/^~/, homedir()));
-    scopes.push({ path: resolved, read: p.read ?? false, write: p.write ?? false });
+    scopes.push({ path: resolved, read: p.read ?? false, write: p.write ?? false, execute: p.execute || undefined });
   }
   return scopes;
 }

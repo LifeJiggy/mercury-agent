@@ -1,5 +1,6 @@
 import type { BaseProvider } from '../providers/base.js';
 import { logger } from '../utils/logger.js';
+import { parsePersonaAccess } from './persona-access.js';
 
 export interface PersonaRefinement {
   /** Refined persona (template format), or null when unusable. */
@@ -95,7 +96,11 @@ Output ONLY markdown, in exactly this shape:
 
 <output format expectations: shape, length, evidence, tone>
 
-Rules: keep length proportional to the source material — a rich persona stays rich, never compress requirements away; never invent new capabilities, tools, or permissions; keep stated restrictions verbatim in meaning; no preamble, no code fences.`,
+## Access
+
+<directory access the user EXPLICITLY granted — one bullet per grant, exactly like: \`- ~/some/dir — read\` or \`- ~/other/dir — read, write\` or \`- /usr/local/bin/tool — execute\`. Extract these ONLY from paths + access the user stated; if the user granted nothing beyond the bot's own profile directory, write the single line: Only the bot's own profile directory.>
+
+Rules: keep length proportional to the source material — a rich persona stays rich, never compress requirements away; never invent new capabilities, tools, or permissions; keep stated restrictions verbatim in meaning; the ## Access section may contain ONLY directory access the user stated — never invent paths, and never add write or execute where the user said read; no preamble, no code fences.`,
     'You write precise bot persona files. Restructure only; never add or remove requirements.',
   );
   const text = (result.text ?? '').trim();
@@ -109,5 +114,39 @@ Rules: keep length proportional to the source material — a rich persona stays 
     logger.debug({ botName }, 'Persona refinement produced unusable output — keeping raw');
     return null;
   }
-  return text.endsWith('\n') ? text : text + '\n';
+  return sanitizePersonaAccess(text.endsWith('\n') ? text : text + '\n', source);
+}
+
+/**
+ * Enforce the no-invented-permissions rule on the drafted `## Access`
+ * section: a grant whose path the user never wrote (a copied example, a
+ * hallucinated path) is removed, and an Access section with no surviving
+ * grants is dropped entirely. `self` is always allowed — it is the default.
+ */
+function sanitizePersonaAccess(draft: string, source: string): string {
+  if (!draft.includes('## Access')) return draft;
+  const lines = draft.split('\n');
+  const start = lines.findIndex(l => /^##\s+Access\b/i.test(l));
+  if (start === -1) return draft;
+  let end = lines.length;
+  for (let i = start + 1; i < lines.length; i++) {
+    if (/^#{1,2}\s/.test(lines[i])) { end = i; break; }
+  }
+  const kept: string[] = [];
+  for (const line of lines.slice(start, end)) {
+    const bullet = /^\s*[-*]\s+(.+)$/.exec(line);
+    if (!bullet) { kept.push(line); continue; }
+    const grant = parsePersonaAccess(`## Access\n${line}`)[0];
+    const path = grant?.scope ?? '';
+    if (!path || path === 'self' || source.includes(path)) {
+      kept.push(line);
+    }
+    // else: dropped — the user never wrote this path
+  }
+  const section = kept.filter(l => l.trim().length > 0);
+  if (section.length <= 1) {
+    // No grants survived — drop the empty section entirely.
+    return [...lines.slice(0, start), ...lines.slice(end)].join('\n').replace(/\n+$/, '') + '\n';
+  }
+  return [...lines.slice(0, start), ...section, ...lines.slice(end)].join('\n');
 }

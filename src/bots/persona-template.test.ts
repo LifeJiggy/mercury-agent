@@ -93,6 +93,60 @@ describe('refinePersona (convert to template)', () => {
     expect(calls[1]).toContain('verifies repos are active');
   });
 
+  it('drops Access grants for paths the user never wrote (no invented permissions)', async () => {
+    scriptedResponses.push(`# R
+
+Research.
+
+## Character
+
+Skeptical.
+
+## Standing instructions
+
+- Be skeptical
+
+## Access
+
+- ~/cookies — read
+- ~/some/dir — read
+
+## Output
+
+Concise.
+`);
+    const raw = 'Research bot; may read ~/cookies for cookie context.';
+    const result = await refinePersona(raw, 'R', stubProvider());
+    expect(result).toContain('~/cookies');
+    expect(result).not.toContain('~/some/dir');
+  });
+
+  it('drops the whole Access section when no user-stated grant survives', async () => {
+    scriptedResponses.push(`# R
+
+Research.
+
+## Character
+
+Skeptical.
+
+## Standing instructions
+
+- Be skeptical
+
+## Access
+
+- ~/some/dir — read
+- /etc — read
+
+## Output
+
+Concise.
+`);
+    const result = await refinePersona('plain research bot, no special access', 'R', stubProvider());
+    expect(result).not.toContain('## Access');
+  });
+
   it('a failing inventory pass falls back to the single-pass build', async () => {
     let calls = 0;
     const flakyInventory = {
