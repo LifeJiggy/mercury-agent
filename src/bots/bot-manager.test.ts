@@ -206,6 +206,21 @@ describe('BotManager queue + turn lifecycle', () => {
     expect(manager.runNow('crony').accepted).toBe(true);
   });
 
+  it('tells the bot its sandbox paths and the shared-folder standing rule', async () => {
+    seedBot(store, 'pathfinder');
+    let systemPrompt = '';
+    mockedGenerateText.mockImplementation(async (opts: any) => {
+      systemPrompt = opts.system ?? '';
+      return { text: 'ok', finishReason: 'stop', usage: { inputTokens: 1, outputTokens: 1 } } as any;
+    });
+    manager.enqueue('pathfinder', { trigger: 'chat', prompt: 'hi' });
+    await vi.waitFor(() => {
+      expect(systemPrompt).toContain(store.sandboxDir('pathfinder'));
+      expect(systemPrompt).toContain('_shared');
+      expect(systemPrompt).toContain('even when not explicitly asked');
+    });
+  });
+
   it('degrades to a stateless bot when the memory store cannot be built', async () => {
     // Simulates a SQLite-less device: the store factory throws.
     const config = getDefaultConfig() as MercuryConfig;
@@ -406,6 +421,30 @@ describe('Per-bot permission isolation (fail-closed)', () => {
     const scopes = registry.permissions.getManifest().capabilities.filesystem.scopes;
     expect(scopes).toHaveLength(1);
     expect(scopes[0].path).toBe(store.botDir('plainbot'));
+  });
+
+  it('grants the private sandbox and fleet-shared folder implicitly (rw+x)', () => {
+    const manifest = store.create({ id: 'sandboxer', name: 'Sandboxer' }) as BotManifest;
+    // create() materializes both sandbox areas
+    expect(existsSync(store.sandboxDir('sandboxer'))).toBe(true);
+    expect(existsSync(store.sharedSandboxDir())).toBe(true);
+    // and the shared dir is never mistaken for a bot
+    expect(store.list().map(m => m.id)).toEqual(['sandboxer']);
+    const registry = createBotCapabilityRegistry({
+      botId: 'sandboxer',
+      manifest,
+      botDir: store.botDir('sandboxer'),
+      permissions: store.readPermissions('sandboxer'),
+      persona: store.readPersona('sandboxer'),
+      sandbox: { workspace: store.sandboxDir('sandboxer'), shared: store.sharedSandboxDir() },
+      userMemory: null,
+      config: getDefaultConfig() as MercuryConfig,
+    });
+    const scopes = registry.permissions.getManifest().capabilities.filesystem.scopes;
+    const workspace = scopes.find(s => s.path === store.sandboxDir('sandboxer'));
+    const shared = scopes.find(s => s.path === store.sharedSandboxDir());
+    expect(workspace).toMatchObject({ read: true, write: true, execute: true });
+    expect(shared).toMatchObject({ read: true, write: true, execute: true });
   });
 
   it('fs write outside the bot scope is denied without prompting', async () => {

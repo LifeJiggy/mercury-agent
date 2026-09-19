@@ -11,6 +11,11 @@ import type {
 export const BOT_MANIFEST_FILENAME = 'bot.yaml';
 export const BOT_PERSONA_FILENAME = 'persona.md';
 export const BOT_PERMISSIONS_FILENAME = 'permissions.yaml';
+/** Fleet-shared sandbox folder (every bot gets read/write/execute). The
+ * underscore prefix keeps store.list() from ever treating it as a bot. */
+export const BOT_SHARED_SANDBOX_DIRNAME = '_shared';
+/** Per-bot private workspace inside the profile dir (auto-purged on delete). */
+export const BOT_SANDBOX_DIRNAME = 'sandbox';
 export const BOT_ENV_FILENAME = '.env';
 export const BOT_JOURNAL_FILENAME = 'journal.jsonl';
 
@@ -102,9 +107,13 @@ falls outside it.
 
 ## Access
 
-You can always read and write inside your own profile directory. Anything
-else is denied until it is granted here — one bullet per directory (the
-forms below are examples only; write real bullets to grant access):
+You always have three work areas — never ask permission for these, and do
+not declare them here: your private \`sandbox/\` folder (next to this
+persona file), the fleet \`_shared/\` folder (shared with all bots —
+publish reusable data there even when not asked), and your own profile
+directory. Anything else is denied until it is granted here — one bullet
+per directory (the forms below are examples only; write real bullets to
+grant access):
 \`- ~/some/dir — read\` · \`- ~/other/dir — read, write\` · \`- /usr/local/bin/tool — execute\`.
 A granted directory covers everything inside it. Outside these grants you
 do not act — you stop and report which access you would have needed.
@@ -142,6 +151,22 @@ export class BotStore {
       throw new Error(`Invalid bot id "${id}": escapes the bots root`);
     }
     return dir;
+  }
+
+  /** The bot's private sandbox workspace (inside its profile dir — purged on delete). */
+  sandboxDir(id: string): string {
+    return join(this.botDir(id), BOT_SANDBOX_DIRNAME);
+  }
+
+  /** The fleet-shared sandbox folder (one physical dir; every bot gets rw+x). */
+  sharedSandboxDir(): string {
+    return resolve(this.botsRoot, BOT_SHARED_SANDBOX_DIRNAME);
+  }
+
+  /** Create both sandbox areas if missing (cheap + idempotent). */
+  ensureSandboxes(id: string): void {
+    mkdirSync(this.sandboxDir(id), { recursive: true });
+    mkdirSync(this.sharedSandboxDir(), { recursive: true });
   }
 
   list(): BotManifest[] {
@@ -200,6 +225,7 @@ export class BotStore {
 
     const dir = this.botDir(id);
     mkdirSync(dir, { recursive: true });
+    this.ensureSandboxes(id);
     this.save(manifest);
     const personaFile = join(dir, manifest.persona ?? BOT_PERSONA_FILENAME);
     if (!existsSync(personaFile)) {

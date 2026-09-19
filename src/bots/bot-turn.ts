@@ -23,6 +23,8 @@ export interface BotTurnInput {
   mail: BotTurnMail[];
   /** Callback checked between rounds for newly arrived mailbox messages. */
   pollMail: () => BotTurnMail[];
+  /** Sandbox areas granted implicitly (rw+x): private workspace + fleet-shared folder. */
+  sandbox: { workspace: string; shared: string };
   capabilities: CapabilityRegistry;
   tools: Record<string, Tool>;
   userMemory: UserMemoryStore | null;
@@ -213,6 +215,12 @@ function buildBotSystemPrompt(input: BotTurnInput): string {
 - You run unattended: NEVER ask the user questions or wait for confirmation. If a required input is missing, state the assumption you are proceeding with.
 - Actions you lack permission for are denied automatically (fail-closed). Do not attempt workarounds; report what you could not do.
 - Stay in your specialty; say so plainly when a request falls outside it.`;
+
+  // Sandbox: the bot's always-granted work areas (rw+x, no permission ask).
+  prompt += `\n\nSandbox (always granted — read, write, execute; no permission needed):
+- Private workspace: ${input.sandbox.workspace} — your scratch area: drafts, intermediate work, compiled artifacts.
+- Fleet-shared folder: ${input.sandbox.shared} — one folder shared with all other bots. Publish reusable data here (clearly named files), even when not explicitly asked — other bots consume it without a handoff.
+Anything outside these two areas and your declared Access grants is denied.`;
 
   const roster = manifest.comms?.canMessage ?? [];
   if (roster.length > 0) {

@@ -1,4 +1,5 @@
 import { homedir } from 'node:os';
+import { mkdirSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { CapabilityRegistry } from '../capabilities/registry.js';
 import type { UserMemoryStore } from '../memory/user-memory.js';
@@ -6,6 +7,7 @@ import type { MercuryConfig } from '../utils/config.js';
 import { logger } from '../utils/logger.js';
 import type { BotManifest, BotPermissionsFile, BotPathScope } from './types.js';
 import { parsePersonaAccess } from './persona-access.js';
+import { BOT_SANDBOX_DIRNAME, BOT_SHARED_SANDBOX_DIRNAME } from './store.js';
 
 /**
  * Tools a bot must never see, regardless of manifest. These are the tools
@@ -42,6 +44,12 @@ export interface BotRegistryDeps {
    * with permissions.yaml). Absent or empty section = no change.
    */
   persona?: string;
+  /**
+   * Sandbox areas granted implicitly (read/write/execute, no ask, no
+   * persona declaration): deps.botDir/sandbox (private workspace) and the
+   * fleet-shared folder next to the bots root. Unset = not granted.
+   */
+  sandbox?: { workspace: string; shared: string };
 }
 
 /**
@@ -61,10 +69,19 @@ export function createBotCapabilityRegistry(deps: BotRegistryDeps): CapabilityRe
   // Reshape the manifest in place (never call save() — that writes the
   // global ~/.mercury/permissions.yaml, and bots have no path to it).
   const manifest = pm.getManifest();
-  manifest.capabilities.filesystem.scopes = buildBotScopes(
-    mergeScopeGrants(deps.permissions.paths, parsePersonaAccess(deps.persona ?? '')),
-    deps.botDir,
-  );
+  const granted = mergeScopeGrants(deps.permissions.paths, parsePersonaAccess(deps.persona ?? ''));
+  // Implicit sandbox grants come LAST and are never user-configurable away:
+  // the private workspace and the fleet-shared folder are the bot's built-in
+  // work areas (read/write/execute, no ask, no declaration).
+  if (deps.sandbox) {
+    mkdirSync(deps.sandbox.workspace, { recursive: true });
+    mkdirSync(deps.sandbox.shared, { recursive: true });
+    granted.push(
+      { scope: deps.sandbox.workspace, read: true, write: true, execute: true },
+      { scope: deps.sandbox.shared, read: true, write: true, execute: true },
+    );
+  }
+  manifest.capabilities.filesystem.scopes = buildBotScopes(granted, deps.botDir);
   manifest.capabilities.shell.autoApproved = [];
   manifest.capabilities.shell.blocked = [
     ...new Set([...manifest.capabilities.shell.blocked, ...(deps.permissions.blockedCommands ?? [])]),

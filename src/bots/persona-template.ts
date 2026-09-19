@@ -98,7 +98,7 @@ Output ONLY markdown, in exactly this shape:
 
 ## Access
 
-<directory access the user EXPLICITLY granted — one bullet per grant, exactly like: \`- ~/some/dir — read\` or \`- ~/other/dir — read, write\` or \`- /usr/local/bin/tool — execute\`. Extract these ONLY from paths + access the user stated; if the user granted nothing beyond the bot's own profile directory, write the single line: Only the bot's own profile directory.>
+<the bot ALWAYS has its private sandbox workspace and the fleet-shared folder granted automatically — never list those here. This section holds ONLY extra directory access the user EXPLICITLY granted, one bullet per grant, exactly like: \`- ~/some/dir — read\` or \`- ~/other/dir — read, write\` or \`- /usr/local/bin/tool — execute\`. Extract these ONLY from paths + access the user stated; if the user granted nothing beyond the built-in sandboxes, write the single line: Only the bot's built-in sandbox and the fleet-shared folder.>
 
 Rules: keep length proportional to the source material — a rich persona stays rich, never compress requirements away; never invent new capabilities, tools, or permissions; keep stated restrictions verbatim in meaning; the ## Access section may contain ONLY directory access the user stated — never invent paths, and never add write or execute where the user said read; no preamble, no code fences.`,
     'You write precise bot persona files. Restructure only; never add or remove requirements.',

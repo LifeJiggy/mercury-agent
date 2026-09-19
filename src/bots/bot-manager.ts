@@ -526,6 +526,7 @@ export class BotManager {
         persona: this.store.readPersona(botId),
         mail,
         pollMail: () => this.drainMailbox(botId),
+        sandbox: { workspace: this.store.sandboxDir(botId), shared: this.store.sharedSandboxDir() },
         capabilities: registry,
         tools,
         userMemory,
@@ -549,6 +550,9 @@ export class BotManager {
       // registry build, so a persona edit (invalidateRuntime on write) applies
       // to the very next turn.
       persona: this.store.readPersona(botId),
+      // Built-in work areas: private sandbox + fleet-shared folder (rw+x,
+      // implicit — no permission ask, no Access declaration).
+      sandbox: { workspace: this.store.sandboxDir(botId), shared: this.store.sharedSandboxDir() },
       userMemory: this.userMemoryFor(botId, manifest),
       config: this.config,
     });
@@ -827,6 +831,7 @@ export class BotManager {
 - \`/bots open <id>\` — open the bot's own chat; \`/bots\` — roster with live states.
 - \`/bots create <id> "Name" "Description"\` — onboard; \`/bots persona <id> <text>\` — set its character.
 - \`/bots journal <id>\` — recent runs; \`/bots dlq\` — failed jobs (replayable); \`/bots stop|start|enable|disable <id>\`; \`/bots run <id> [routine]\` — fire a routine now (or a bare wake).
+- Bots share data through the fleet-shared folder (\`${this.store.sharedSandboxDir()}\`); each also has a private sandbox next to its persona. Their outputs land in their own threads.
 - The dispatch_bot tool lets you hand a task to a bot mid-conversation and continue talking; the result is delivered when the bot finishes.`);
     return lines.join('\n');
   }
