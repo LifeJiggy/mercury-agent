@@ -137,6 +137,8 @@ function atomicWrite(filePath: string, content: string, mode: number = 0o600): v
  */
 export class BotStore {
   readonly botsRoot: string;
+  /** mtime-validated manifest cache (see get()) — write paths keep it fresh. */
+  private manifestCache = new Map<string, { mtimeMs: number; manifest: BotManifest }>();
 
   constructor(botsRoot?: string) {
     this.botsRoot = resolve(botsRoot ?? join(getMercuryHome(), 'bots'));
@@ -186,12 +188,26 @@ export class BotStore {
 
   get(id: string): BotManifest | null {
     const file = join(this.botDir(id), BOT_MANIFEST_FILENAME);
-    if (!existsSync(file)) return null;
+    if (!existsSync(file)) {
+      this.manifestCache.delete(id);
+      return null;
+    }
+    // mtime-validated cache: getStatusSummaries() runs on the TUI's 2s status
+    // poller, per chat message (system-prompt section), and per web API hit —
+    // re-reading + re-parsing every bot.yaml each time is pure event-loop
+    // tax. statSync per call keeps externally-edited manifests fresh; write
+    // paths also refresh the entry directly (same-millisecond writes would
+    // otherwise alias to the stale mtime).
+    const mtimeMs = statSync(file).mtimeMs;
+    const cached = this.manifestCache.get(id);
+    if (cached && cached.mtimeMs === mtimeMs) return cached.manifest;
     const raw = parseYaml(readFileSync(file, 'utf-8')) as Partial<BotManifest>;
     if (!raw || raw.id !== id) {
       throw new Error(`Bot manifest for "${id}" is missing or has a mismatched id`);
     }
-    return normalizeBotManifest(raw);
+    const manifest = normalizeBotManifest(raw);
+    this.manifestCache.set(id, { mtimeMs, manifest });
+    return manifest;
   }
 
   exists(id: string): boolean {
@@ -253,6 +269,9 @@ export class BotStore {
     }
     manifest.updatedAt = new Date().toISOString();
     atomicWrite(join(dir, BOT_MANIFEST_FILENAME), stringifyYaml(manifest));
+    // Same-millisecond writes would make the mtime check in get() alias to
+    // the stale entry — refresh it directly instead of relying on mtime.
+    this.manifestCache.set(manifest.id, { mtimeMs: statSync(join(dir, BOT_MANIFEST_FILENAME)).mtimeMs, manifest });
   }
 
   update(id: string, mutator: (m: BotManifest) => void): BotManifest {
@@ -272,6 +291,7 @@ export class BotStore {
     const dir = this.botDir(id);
     if (existsSync(dir)) {
       rmSync(dir, { recursive: true, force: true });
+      this.manifestCache.delete(id);
       logger.info({ botId: id }, 'Bot profile deleted');
     }
   }

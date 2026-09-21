@@ -1,4 +1,4 @@
-import { appendFileSync, existsSync, readdirSync, readFileSync, renameSync, rmSync, statSync } from 'node:fs';
+import { appendFileSync, closeSync, existsSync, openSync, readdirSync, readFileSync, readSync, renameSync, rmSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { BOT_JOURNAL_FILENAME, assertValidBotId } from './store.js';
 import type { BotRunRecord } from './types.js';
@@ -36,8 +36,7 @@ export class BotJournal {
     assertValidBotId(botId);
     const file = join(this.dir, BOT_JOURNAL_FILENAME);
     if (!existsSync(file)) return [];
-    const lines = readLines(file);
-    return lines.slice(-limit);
+    return readTailRecords(file, limit);
   }
 
   counts(botId: string): { total: number; completed: number; failed: number; bytes: number } {
@@ -69,6 +68,50 @@ export class BotJournal {
       if (existsSync(from)) renameSync(from, to);
     }
     renameSync(file, join(this.dir, `${BOT_JOURNAL_FILENAME}.1`));
+  }
+}
+
+/** Tail-read chunk: one journal line is ~300 bytes, so 64KB ≈ 200 records —
+ * far more than any viewer asks for, without scanning a 5MB rotated file. */
+const READ_CHUNK_BYTES = 64 * 1024;
+
+/**
+ * Read the newest `limit` records from ONE file without reading it whole:
+ * a 64KB tail usually suffices; double the window until enough records (or
+ * the whole file) are covered. Used by read() — counts() still scans fully.
+ */
+function readTailRecords(file: string, limit: number): BotRunRecord[] {
+  let size: number;
+  try {
+    size = statSync(file).size;
+  } catch {
+    return [];
+  }
+  if (size === 0) return [];
+  let start = Math.max(0, size - READ_CHUNK_BYTES);
+  while (true) {
+    const records: BotRunRecord[] = [];
+    const fd = openSync(file, 'r');
+    try {
+      const buf = Buffer.alloc(size - start);
+      readSync(fd, buf, 0, buf.length, start);
+      const text = buf.toString('utf-8');
+      // A mid-file window starts inside some line — drop that partial line.
+      const lines = (start === 0 ? text : text.slice(text.indexOf('\n') + 1)).split('\n');
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        try {
+          records.push(JSON.parse(trimmed) as BotRunRecord);
+        } catch { /* skip corrupt line — never break reads on one bad row */ }
+      }
+    } catch {
+      return [];
+    } finally {
+      closeSync(fd);
+    }
+    if (records.length >= limit || start === 0) return records.slice(-limit);
+    start = Math.max(0, size - (size - start) * 2); // double the window
   }
 }
 

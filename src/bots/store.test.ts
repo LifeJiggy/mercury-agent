@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { BotStore, assertValidBotId, validateBotManifest, BOT_PERSONA_FILENAME, BOT_PERMISSIONS_FILENAME } from './store.js';
@@ -96,8 +96,11 @@ describe('BotStore', () => {
     expect(p.tools?.allow).toEqual(['read_file', 'shell']);
   });
 
-  it('update mutates and persists', () => {
+  it('update mutates and persists', async () => {
     store.create({ id: 'alpha', name: 'Alpha', manifest: { enabled: true } });
+    // updatedAt/createdAt are ms-resolution ISO stamps — nudge the clock so
+    // the two writes never land in the same millisecond (otherwise flaky).
+    await new Promise(r => setTimeout(r, 5));
     const updated = store.update('alpha', m => { m.enabled = false; m.description = 'paused'; });
     expect(updated.enabled).toBe(false);
     expect((store.get('alpha') as BotManifest).enabled).toBe(false);
@@ -259,5 +262,54 @@ describe('BotJournal', () => {
     const recent = journal.read('alpha', 10);
     expect(recent.every(r => r.runId)).toBe(true);
     expect(recent).toHaveLength(2);
+  });
+
+  it('tail-reads correctly across the 64KB window boundary', () => {
+    const journal = new BotJournal(dir);
+    // Wide records push the newest entries beyond a single 64KB tail window —
+    // the reader must grow the window, not silently miss records.
+    const wide = { ...record('pad'), summary: 'x'.repeat(2000) };
+    for (let i = 0; i < 100; i++) journal.append(wide);
+    journal.append(record('last-2'));
+    journal.append(record('last-1'));
+    expect(journal.read('alpha', 3).map(r => r.runId)).toEqual(['pad', 'last-2', 'last-1']);
+    expect(journal.read('alpha', 1).map(r => r.runId)).toEqual(['last-1']);
+  });
+});
+describe('BotStore manifest cache (mtime-validated)', () => {
+  let root: string;
+  let store: BotStore;
+
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), 'mercury-bot-cache-'));
+    store = new BotStore(join(root, 'bots'));
+  });
+
+  afterEach(() => {
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  it('reflects same-millisecond saves (write path refreshes the cache directly)', () => {
+    const manifest = store.create({ id: 'fast', name: 'Fast' });
+    manifest.name = 'Renamed';
+    store.save(manifest); // same millisecond as the create — mtime alone could alias
+    expect(store.get('fast')?.name).toBe('Renamed');
+    expect(store.list().find(b => b.id === 'fast')?.name).toBe('Renamed');
+  });
+
+  it('picks up externally edited bot.yaml (mtime invalidation)', () => {
+    store.create({ id: 'ext', name: 'Before' });
+    const file = join(root, 'bots', 'ext', 'bot.yaml');
+    writeFileSync(file, readFileSync(file, 'utf-8').replace('Before', 'After'));
+    utimesSync(file, new Date(), new Date()); // force a distinct mtime — no same-ms aliasing
+    expect(store.get('ext')?.name).toBe('After');
+  });
+
+  it('delete clears the cache (get → null afterwards)', () => {
+    store.create({ id: 'gone', name: 'Gone' });
+    expect(store.get('gone')).not.toBeNull();
+    store.delete('gone');
+    expect(store.get('gone')).toBeNull();
+    expect(store.list()).toHaveLength(0);
   });
 });
