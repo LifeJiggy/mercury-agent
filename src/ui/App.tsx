@@ -2482,10 +2482,9 @@ function MercuryLiveFeedback({ state }: { state: TuiState }): React.ReactNode {
           {stepsDone > 0 && <Text dimColor> · step {stepsDone}</Text>}
           <Text dimColor> · {timeStr}</Text>
           {detail && <Text dimColor> — {detail}</Text>}
-          {/* Long-op hint (same 90s escalation as the chat surfaces): the
-              user can background OR stop a long task right from the coding
-              TUI — no need to hunt the command picker. One row, no churn. */}
-          {elapsedSec >= 90 && <Text color="red" dimColor> · long op — /bg current to background, /stop to stop</Text>}
+          {/* No long-op hint here: Mercury Code tasks are long by design —
+              the hint is noise in the coding TUI. It stays on the chat
+              surfaces, where a long foreground op is the exception. */}
         </Box>
       )}
       {running && (
