@@ -598,6 +598,7 @@ export class BotManager {
     if (manifest.fleetRole === 'lead') {
       return {
         role: 'lead' as const,
+        leadName: manifest.parent ? this.store.get(manifest.parent)?.name : undefined,
         crew: this.store.crewOf(botId).map(c => ({
           id: c.id,
           name: c.name,
@@ -607,7 +608,7 @@ export class BotManager {
         maxCrew: this.maxCrew(),
       };
     }
-    if (manifest.fleetRole === 'crew' && manifest.parent) {
+    if (manifest.parent) {
       return {
         role: 'crew' as const,
         leadName: this.store.get(manifest.parent)?.name,
@@ -690,7 +691,8 @@ export class BotManager {
     if (manifest.fleetRole === 'lead') {
       for (const crew of this.store.crewOf(botId)) roster.add(crew.id);
     }
-    if (manifest.fleetRole === 'crew' && manifest.parent) {
+    // A mid-level lead (crew of a parent AND lead of its own crew) talks both ways.
+    if (manifest.parent) {
       roster.add(manifest.parent);
     }
     roster.delete(botId);
@@ -720,7 +722,21 @@ export class BotManager {
     const lead = this.store.get(leadId);
     if (!lead) return { ok: false, error: `No bot "${leadId}"` };
     if (lead.fleetRole !== 'lead') {
-      return { ok: false, error: `**${lead.name}** is not a fleet lead — promote it first with /bots create flow or add crew via onboarding` };
+      return { ok: false, error: `**${lead.name}** is not a fleet lead — promote it with \`/bots promote ${leadId}\` first` };
+    }
+    // Multi-level guard: no cycles, bounded depth (v1 supports 3 levels —
+    // e.g. CEO → Engineering Lead → Backend). Walk the lead's parent chain.
+    let ancestor: string | undefined = leadId;
+    let depth = 0;
+    const seen = new Set<string>();
+    while (ancestor) {
+      if (seen.has(ancestor)) return { ok: false, error: 'Fleet cycle detected in parent chain' };
+      seen.add(ancestor);
+      if (ancestor === spec.id.toLowerCase()) {
+        return { ok: false, error: `Cannot add **${spec.id}** — it would become its own ancestor` };
+      }
+      ancestor = this.store.get(ancestor)?.parent;
+      if (++depth > 3) return { ok: false, error: 'Fleet nesting is capped at 3 levels' };
     }
     const crew = this.store.crewOf(leadId);
     const cap = this.maxCrew();

@@ -1390,7 +1390,7 @@ export class Agent {
     const action = (parts[0] ?? '').toLowerCase();
 
     // All bot-targeting actions accept id OR name — resolve to the id here.
-    if (['open', 'send', 'journal', 'inbox', 'budget', 'edit', 'delete', 'enable', 'disable', 'stop', 'pause', 'start', 'run', 'persona', 'crew', 'add-crew', 'remove-crew'].includes(action) && parts[1]) {
+    if (['open', 'send', 'journal', 'inbox', 'budget', 'edit', 'delete', 'enable', 'disable', 'stop', 'pause', 'start', 'run', 'persona', 'crew', 'add-crew', 'remove-crew', 'promote', 'demote'].includes(action) && parts[1]) {
       const resolved = bm.resolveBotId(parts[1]);
       if (resolved) parts[1] = resolved;
     }
@@ -1411,31 +1411,37 @@ export class Agent {
         await channel.send('No bots configured. Use `/bots create <id> "Name" "Description"` to onboard one.', channelId);
         return;
       }
-      // Fleet tree: 👑 lead first with crew indented beneath; solos flat.
-      const leads = summaries.filter(s => s.fleetRole === 'lead');
-      const crews = summaries.filter(s => s.fleetRole === 'crew');
-      const solos = summaries.filter(s => !s.fleetRole);
+      // Fleet tree: 👑 leads first with crew nested beneath (multi-level,
+      // recursive); parentless solos flat after.
       const fmt = (s: typeof summaries[number], indent: string) => {
         const icon = stateIcons[s.state] ?? '❓';
+        const badge = s.fleetRole === 'lead' ? ' 👑' : '';
         const lastRun = s.lastRunAt ? ` · last ${(s.lastRunState ?? '')} ${formatRelative(s.lastRunAt)}` : '';
         const activity = s.activity ? `\n${indent}   ↳ ${s.activity}` : '';
         const attention = s.needsYou ? ' · ⚠ needs you' : '';
-        return `${indent}${icon} **${s.name}** (${s.id}) — ${s.state}${attention}${lastRun}${activity}`;
+        return `${indent}${icon} **${s.name}** (${s.id})${badge} — ${s.state}${attention}${lastRun}${activity}`;
       };
       const lines: string[] = [`**Bots** (${summaries.length})`, ''];
       const rendered = new Set<string>();
-      for (const lead of leads) {
-        const crew = crews.filter(c => c.parent === lead.id);
-        lines.push(fmt(lead, ''));
-        rendered.add(lead.id);
+      const renderCrew = (leadId: string, depth: number) => {
+        const crew = summaries.filter(s => s.parent === leadId);
         for (const c of crew) {
-          lines.push(fmt(c, '  '));
+          const indent = '  '.repeat(depth);
+          lines.push(fmt(c, depth > 0 ? `${indent}└─` : '  '));
           rendered.add(c.id);
+          renderCrew(c.id, depth + 1);
         }
-        if (crew.length === 0) lines.push('  (empty crew — `/bots add-crew` or the lead can bot_spawn)');
+        if (crew.length === 0 && depth === 1) {
+          lines.push(`${'  '.repeat(depth)}└─ (empty crew — \`/bots add-crew\` or the lead can bot_spawn)`);
+        }
+      };
+      for (const root of summaries.filter(s => !s.parent)) {
+        lines.push(fmt(root, ''));
+        rendered.add(root.id);
+        if (root.fleetRole === 'lead') renderCrew(root.id, 1);
       }
-      for (const s of [...crews, ...solos]) {
-        if (!rendered.has(s.id)) lines.push(fmt(s, ''));
+      for (const s of summaries) {
+        if (!rendered.has(s.id)) lines.push(fmt(s, '')); // detached crew (defensive)
       }
       const running = summaries.filter(s => s.state === 'running').length;
       lines.push('', `Running: ${running} | Queued: ${summaries.reduce((a, s) => a + (s.state === 'queued' ? 1 : 0), 0)}`);
@@ -1764,6 +1770,32 @@ export class Agent {
       return;
     }
 
+    if (action === 'promote' || action === 'demote') {
+      // /bots promote <id> — solo/crew → fleet lead (demote: lead → solo).
+      const target = parts[1]?.toLowerCase();
+      if (!target || !bm.store.exists(target)) {
+        await channel.send(`Usage: \`/bots ${action} <id>\``, channelId);
+        return;
+      }
+      try {
+        bm.store.update(target, m => {
+          if (action === 'promote') {
+            m.fleetRole = 'lead';
+          } else {
+            m.fleetRole = undefined;
+            if (bm.store.crewOf(target).length > 0) throw new Error(`**${target}** still has crew — remove-crew first`);
+          }
+        });
+        bm.invalidateRuntime(target);
+        await channel.send(action === 'promote'
+          ? `👑 **${target}** is now a fleet lead. It will self-organize: give it a setup task and it will build its own crew with bot_spawn (persona-derived), or add crew with \`/bots add-crew ${target} …\`.`
+          : `⬇ **${target}** demoted to a solo bot.`, channelId);
+      } catch (err: any) {
+        await channel.send(`Failed: ${err?.message}`, channelId);
+      }
+      return;
+    }
+
     if (action === 'crew') {
       // /bots crew <leadId> — the fleet tree + per-crew recent runs.
       const leadId = parts[1]?.toLowerCase();
@@ -1887,6 +1919,7 @@ export class Agent {
       '`/bots enable|disable|stop|start <id>` — control (stop holds queued jobs; start resumes them)\n' +
       '`/bots run <id> [routineName]` — fire a routine now, or a bare wake turn\n' +
       '`/bots crew <leadId>` — fleet tree with per-crew runs\n' +
+      '`/bots promote <id>` / demote — make a bot a fleet lead (it then self-organizes) / back to solo\n' +
       '`/bots add-crew <leadId> <id> "Name" "Desc" ["persona"]` — add a sub-bot to a fleet\n' +
       '`/bots remove-crew <leadId> <crewId>` — retire a crew member\n' +
       '`/bots delete <id> confirm` — permanently delete',

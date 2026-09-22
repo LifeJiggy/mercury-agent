@@ -734,6 +734,23 @@ describe('Bot fleets (lead + crew)', () => {
     expect(await retire.execute({ id: 'guard' }, {} as any)).toContain('is not crew');
   });
 
+  it('multi-level fleets: a crew member can lead its own nested crew', () => {
+    setupFleet();
+    // Promote researcher to a mid-level lead (crew of ceo AND lead of scouts).
+    store.update('researcher', m => { m.fleetRole = 'lead'; });
+    manager.addCrew('researcher', { id: 'scout', name: 'Scout', persona: '# Scout\n\nScouts markets.' });
+    expect(store.get('scout')?.parent).toBe('researcher');
+    expect(store.crewOf('ceo').map(c => c.id)).toContain('researcher');
+    expect(store.crewOf('researcher').map(c => c.id)).toEqual(['scout']);
+    // Mid-level lead gets fleet tools AND its parent in the comms roster
+    const rt = (manager as unknown as { getOrCreateRuntime(id: string, m: BotManifest): { tools: Record<string, any> } }).getOrCreateRuntime('researcher', store.get('researcher')!);
+    expect(rt.tools.fleet_status).toBeDefined();
+    expect(rt.tools.bot_spawn).toBeDefined();
+    // Cycle/nesting guards: depth cap and ancestor rejection
+    expect(manager.addCrew('scout', { id: 'ceo', name: 'Nope' })).toMatchObject({ ok: false });
+    expect(manager.addCrew('scout', { id: 'scout', name: 'Self' })).toMatchObject({ ok: false });
+  });
+
   it('solo bots never get fleet tools', () => {
     store.create({ id: 'loner', name: 'Loner' });
     const tools = runtimeFor('loner').tools;

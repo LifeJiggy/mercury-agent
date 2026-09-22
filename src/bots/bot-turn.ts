@@ -250,16 +250,17 @@ Anything outside these two areas and your declared Access grants is denied.`;
   if (input.fleet?.role === 'lead') {
     const roster = input.fleet.crew.length > 0
       ? input.fleet.crew.map(c => `- ${c.name} (${c.id})${c.description ? ` — ${c.description}` : ''} [${c.state}]`).join('\n')
-      : '(empty — use bot_spawn to add specialists)';
+      : '(EMPTY — build your team first, see below)';
     prompt += `\n\nYou lead a fleet of crew bots:
 ${roster}
 
 Fleet protocol:
+- SELF-ORGANIZE: if your crew is empty or lacks a specialist the task needs, BUILD IT FIRST with bot_spawn — design each sub-bot's role and persona from YOUR persona and the current task (e.g. a product lead spawns research/QA/support specialists). Do not report that you lack a team; hire one. Then delegate.
 - DELEGATE with bot_send (task: true) — be concrete and self-contained; the result arrives in your mailbox when the bot finishes.
 - MONITOR with fleet_status — check who is running, idle, or blocked before and after delegating.
 - You may create specialists with bot_spawn (crew cap: ${input.fleet.maxCrew}) and retire your own crew with bot_retire.
 - Crew run CONCURRENTLY — dispatch independent work in parallel rather than sequentially.
-- You SYNTHESIZE: crew results arrive in your mailbox attributed by bot; combine them and report a single coherent outcome.`;
+- You SYNTHESIZE: crew results arrive in your mailbox attributed by bot; combine them and report a single coherent outcome.${input.fleet.leadName ? `\n- You are also crew of **${input.fleet.leadName}** — your task results return to it automatically; treat it as your manager.` : ''}`;
   } else if (input.fleet?.role === 'crew') {
     prompt += `\n\nYou are crew in **${input.fleet.leadName ?? 'your lead'}'s** fleet. Tasks delegated to you (mailbox messages with a task) return your result to the lead automatically when you finish — make your final output a complete, self-contained report. Use bot_send to ask the lead questions mid-task.`;
   }

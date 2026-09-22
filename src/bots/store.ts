@@ -68,13 +68,10 @@ export function validateBotManifest(manifest: Partial<BotManifest>): string[] {
   for (const other of canMessage) {
     if (other === manifest.id) errors.push('canMessage cannot include the bot itself');
   }
-  // Fleet hierarchy: crew requires a parent that is a lead; leads have no
-  // parent. Single-level fleets in v1 — a lead-of-lead is a config error
-  // (nesting would need a deeper cycle check, so it is rejected outright).
+  // Fleet hierarchy: `parent` = has a lead; `fleetRole: lead` = leads a crew.
+  // Both may be set (mid-level lead, e.g. an Engineering Lead under a CEO).
+  // A bare `fleetRole: crew` with no parent is invalid; self-parent invalid.
   if (manifest.parent) {
-    if (manifest.fleetRole !== 'crew') {
-      errors.push('parent is only valid on fleetRole "crew" bots');
-    }
     if (manifest.parent === manifest.id) {
       errors.push('parent cannot be the bot itself');
     }
