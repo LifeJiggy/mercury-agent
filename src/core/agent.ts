@@ -1168,7 +1168,12 @@ export class Agent {
 
     let finalPersona = raw;
     if (choice.startsWith('Convert')) {
+      // The builder is an LLM call (10-60s on slower providers) — the user
+      // must see it is working, or onboarding reads as a hang.
+      await channel.send('⏳ Running the persona builder — structuring your text (typically 10–60s)…', `bot:${botId}`).catch(() => {});
+      (channel as any).sendHeartbeat?.('⏳ Persona builder running…');
       const refined = await refinePersona(raw, manifest.name, this.providers.getDefault());
+      (channel as any).clearHeartbeat?.();
       if (refined) {
         finalPersona = refined;
       } else {
@@ -1235,25 +1240,37 @@ export class Agent {
       return;
     }
 
-    // Auto-build: one LLM proposal, created through the standard path.
-    await channel.send(`👑 **${botName}** is now a fleet lead — proposing a crew…`, `bot:${botId}`).catch(() => {});
+    // Auto-build: one LLM proposal, created through the standard path. This
+    // is an LLM call (30-90s) — it must NOT hold onboarding hostage: run it
+    // detached with visible progress, and deliver the roster when ready.
+    await channel.send(`👑 **${botName}** is now a fleet lead — building the crew in the background…`, `bot:${botId}`).catch(() => {});
+    (channel as any).sendHeartbeat?.('⏳ Proposing fleet crew (up to ~90s)…');
     const persona = bm.store.readPersona(botId);
-    const proposals = await proposeCrew(botName, bm.store.get(botId)?.description ?? '', persona, this.providers.getDefault(), bm.maxCrew());
-    if (proposals.length === 0) {
-      await channel.send(`⚠ Crew proposal unavailable (provider) — **${botName}** is a lead with an empty crew. Add members with \`/bots add-crew ${botId} <id> "Name" "Description" "persona"\` or tell the lead to hire its own.`, `bot:${botId}`).catch(() => {});
-      return;
-    }
-    const lines: string[] = [`👑 **${botName}** fleet — ${proposals.length} crew member(s) created:`, ''];
-    for (const p of proposals) {
-      const result = bm.addCrew(botId, p);
-      if (result.ok) {
-        lines.push(`• **${p.name}** (\`${result.manifest.id}\`) — ${p.description || 'specialist'}`);
-      } else {
-        lines.push(`⚠ ${p.name} (${p.id}): ${result.error}`);
+    const leadDescription = bm.store.get(botId)?.description ?? '';
+    void (async () => {
+      try {
+        const proposals = await proposeCrew(botName, leadDescription, persona, this.providers.getDefault(), bm.maxCrew());
+        (channel as any).clearHeartbeat?.();
+        if (proposals.length === 0) {
+          await channel.send(`⚠ Crew proposal unavailable (provider) — **${botName}** is a lead with an empty crew. Add members with \`/bots add-crew ${botId} <id> "Name" "Description" "persona"\` or tell the lead to hire its own.`, `bot:${botId}`).catch(() => {});
+          return;
+        }
+        const lines: string[] = [`👑 **${botName}** fleet ready — ${proposals.length} crew member(s) created:`, ''];
+        for (const p of proposals) {
+          const result = bm.addCrew(botId, p);
+          if (result.ok) {
+            lines.push(`• **${p.name}** (\`${result.manifest.id}\`) — ${p.description || 'specialist'}`);
+          } else {
+            lines.push(`⚠ ${p.name} (${p.id}): ${result.error}`);
+          }
+        }
+        lines.push('', 'Dispatch tasks with `/bot <crewId> <task>` or tell the lead to delegate — it can also spawn more crew itself.');
+        await channel.send(lines.join('\n'), `bot:${botId}`).catch(() => {});
+      } catch (err: any) {
+        (channel as any).clearHeartbeat?.();
+        await channel.send(`⚠ Fleet auto-build failed: ${err?.message ?? err} — **${botName}** is a lead with an empty crew; add members with \`/bots add-crew ${botId} <id> "Name" "Description" "persona"\`.`, `bot:${botId}`).catch(() => {});
       }
-    }
-    lines.push('', 'Dispatch tasks with `/bot <crewId> <task>` or tell the lead to delegate — it can also spawn more crew itself.');
-    await channel.send(lines.join('\n'), `bot:${botId}`).catch(() => {});
+    })();
   }
 
   /** Apply the budget answer typed after the persona step (or a later task). */
@@ -1795,7 +1812,9 @@ export class Agent {
       try {
         let persona: string | undefined;
         if (quoted[2]) {
+          (channel as any).sendHeartbeat?.('⏳ Building the crew persona (up to ~60s)…');
           const refined = await refinePersona(quoted[2], quoted[0], this.providers.getDefault());
+          (channel as any).clearHeartbeat?.();
           persona = refined ?? quoted[2];
         }
         const result = bm.addCrew(leadId, { id, name: quoted[0], description: quoted[1], persona });
