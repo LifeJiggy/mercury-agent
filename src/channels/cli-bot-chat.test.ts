@@ -55,6 +55,32 @@ describe('CLIChannel bot chat (transcript swap + target routing)', () => {
     expect(channel.getTuiState().chatMessages.some(m => m.content.includes('publisher reply'))).toBe(true);
   });
 
+  it('hydrates a cold thread from journal history (bot worked while away)', async () => {
+    const channel = new CLIChannel();
+    const history = [
+      { content: '✅ (cron, 3h ago, 12s) Weekly digest published.', timestamp: Date.now() - 3600_000 },
+      { content: '❌ (chat, 5m ago, 2s) Provider timeout.', timestamp: Date.now() - 300_000 },
+    ];
+    channel.enterBotChat('researcher', 'Research', history);
+    const msgs = channel.getTuiState().chatMessages;
+    expect(msgs.some(m => m.content.includes('bot chat'))).toBe(true);
+    expect(msgs.some(m => m.content.includes('📜') && m.content.includes('Weekly digest published.'))).toBe(true);
+    expect(msgs.some(m => m.content.includes('Provider timeout.'))).toBe(true);
+  });
+
+  it('live in-memory transcript wins over journal history (no duplication)', async () => {
+    const channel = new CLIChannel();
+    channel.enterBotChat('researcher', 'Research');
+    await channel.send('live bot reply', 'bot:researcher');
+    channel.exitBotChat();
+    // Re-open WITH history: the in-memory transcript (which holds the live
+    // message) must be used, not merged with the journal tail.
+    channel.enterBotChat('researcher', 'Research', [{ content: 'stale journal line', timestamp: 1 }]);
+    const msgs = channel.getTuiState().chatMessages;
+    expect(msgs.some(m => m.content.includes('live bot reply'))).toBe(true);
+    expect(msgs.some(m => m.content.includes('stale journal line'))).toBe(false);
+  });
+
   it('persists a bot transcript across exit and re-entry', async () => {
     const channel = new CLIChannel();
     channel.enterBotChat('researcher', 'Research');

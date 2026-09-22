@@ -1482,7 +1482,13 @@ export class Agent {
         return;
       }
       if (typeof (channel as any).enterBotChat === 'function') {
-        (channel as any).enterBotChat(target, manifest.name);
+        // Hydrate a cold thread from the durable journal (last 10 runs,
+        // compact) — the bot may have worked unattended for hours.
+        const history = bm.getJournal(target, 10).map(r => ({
+          content: `${r.state === 'completed' ? '✅' : r.state === 'failed' ? '❌' : '⛔'} (${r.trigger}, ${formatRelative(r.startedAt)}${r.durationMs ? `, ${(r.durationMs / 1000).toFixed(0)}s` : ''}) ${r.summary?.slice(0, 300) ?? r.runId}`,
+          timestamp: r.startedAt,
+        })).reverse();
+        (channel as any).enterBotChat(target, manifest.name, history);
         return;
       }
       await channel.send(`Opening a bot chat is only supported in the TUI — use \`/bots send ${target} <message>\` here.`, channelId);

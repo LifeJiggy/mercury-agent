@@ -605,8 +605,9 @@ export class CLIChannel extends BaseChannel {
   /** useSyncExternalStore contract: read the latest immutable state snapshot. */
   // ---- Mercury Bot chat (per-bot transcripts) ------------------------------
 
-  /** Open a bot's chat: swap the on-screen transcript to the bot's thread. */
-  enterBotChat(botId: string, botName: string): void {
+  /** Open a bot's chat: swap the on-screen transcript to the bot's thread.
+   * `history` hydrates a thread with no in-memory transcript (journal tail). */
+  enterBotChat(botId: string, botName: string, history?: Array<{ content: string; timestamp: number }>): void {
     if (this.activeBotId === botId) return;
     if (this.activeBotId) {
       this.botTranscripts.set(this.activeBotId, [...this.state.chatMessages]);
@@ -614,12 +615,24 @@ export class CLIChannel extends BaseChannel {
       this.mainTranscript = [...this.state.chatMessages];
     }
     this.activeBotId = botId;
-    const seed: ChatMessage[] = this.botTranscripts.get(botId) ?? [{
-      id: `bot-open-${Date.now().toString(36)}`,
-      role: 'system',
-      content: `🤖 **${botName}** bot chat — everything you type here goes to the bot (runs outside the main conversation). \`/chat\` returns to the main transcript.`,
-      timestamp: Date.now(),
-    }];
+    // In-memory transcript wins (live session continuity); otherwise hydrate
+    // from the durable journal history the caller provides, so a thread
+    // opened after a restart (or after the bot worked unattended) shows what
+    // happened instead of an empty room. Bounded: caller passes ≤10 records.
+    const seed: ChatMessage[] = (this.botTranscripts.get(botId) ?? [
+      {
+        id: `bot-open-${Date.now().toString(36)}`,
+        role: 'system',
+        content: `🤖 **${botName}** bot chat — everything you type here goes to the bot (runs outside the main conversation). \`/chat\` returns to the main transcript.`,
+        timestamp: Date.now(),
+      },
+      ...(history ?? []).map((h, i) => ({
+        id: `bot-hist-${botId}-${i}-${h.timestamp.toString(36)}`,
+        role: 'system' as const,
+        content: `📜 ${h.content}`,
+        timestamp: h.timestamp,
+      })),
+    ]);
     this.botTranscripts.set(botId, seed);
     this.trimAndSetMessages(seed, { botChat: { botId, botName }, isThinking: false, liveActivity: null });
   }
