@@ -2566,6 +2566,8 @@ async function runAgent(isDaemon: boolean = false): Promise<void> {
           name: b.name,
           state: b.state,
           needsYou: b.needsYou,
+          fleetRole: b.fleetRole,
+          parent: b.parent,
         })) ?? [],
       });
       bootCli.startStatusPoller(2000);

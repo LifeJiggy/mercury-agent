@@ -180,6 +180,28 @@ app.post('/api/bots/:id/run', async (c: any) => {
   return c.json({ ...result, status: 'accepted' }, 202);
 });
 
+// Fleet views: crew roster of a lead + add-crew
+app.get('/api/bots/:id/crew', (c: any) => {
+  if (!botManager) return c.json({ error: 'Bots not available' }, 400);
+  const id = c.req.param('id');
+  if (!botManager.store.isLead(id)) return c.json({ error: 'Not a fleet lead' }, 400);
+  return c.json({
+    lead: botManager.store.get(id),
+    crew: botManager.store.crewOf(id),
+    maxCrew: botManager.maxCrew(),
+  });
+});
+
+app.post('/api/bots/:id/crew', async (c: any) => {
+  if (!botManager) return c.json({ error: 'Bots not available' }, 400);
+  const id = c.req.param('id');
+  const body = await c.req.json().catch(() => null) as { id?: string; name?: string; description?: string; persona?: string } | null;
+  if (!body?.id || !body?.name) return c.json({ error: 'id and name are required' }, 400);
+  const result = botManager.addCrew(id, { id: body.id, name: body.name, description: body.description, persona: body.persona });
+  if (!result.ok) return c.json({ error: result.error }, 400);
+  return c.json({ bot: result.manifest }, 201);
+});
+
 function haltedMessage(result: { halted: boolean; heldJobs: number }): string {
   const base = result.halted ? 'Halt signal sent' : 'Nothing running';
   return result.heldJobs > 0 ? `${base}; ${result.heldJobs} queued job(s) held` : base;

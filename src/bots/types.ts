@@ -88,6 +88,13 @@ export interface BotManifest {
   schedules?: BotScheduleConfig[];
   autonomy?: BotAutonomyConfig;
   retention?: BotRetentionConfig;
+  /**
+   * Fleet hierarchy (absent = solo bot, zero drift for existing bots).
+   * lead = orchestrates a crew; crew = member of a lead's fleet.
+   */
+  fleetRole?: 'lead' | 'crew';
+  /** Crew bots only: the lead's id. Leads and solos never set this. */
+  parent?: string;
   createdAt?: string;
   updatedAt?: string;
 }
@@ -143,4 +150,10 @@ export interface BotStatusSummary {
   lastRunAt?: number;
   lastRunState?: BotRunState;
   needsYou: boolean;
+  /** Fleet hierarchy: 'lead' | 'crew' | undefined (solo). */
+  fleetRole?: 'lead' | 'crew';
+  /** Crew bots: their lead's id. */
+  parent?: string;
+  /** Leads: how many crew are currently running a turn. */
+  crewWorking?: number;
 }

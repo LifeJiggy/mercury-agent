@@ -327,7 +327,7 @@ export interface TuiState {
   /** Active Mercury Bot chat — transcript is swapped to the bot's thread. */
   botChat: { botId: string; botName: string } | null;
   /** Live bot roster (drives `/bots` argument autocomplete and badges). */
-  botRoster: Array<{ id: string; name: string; state: string; needsYou: boolean }>;
+  botRoster: Array<{ id: string; name: string; state: string; needsYou: boolean; fleetRole?: 'lead' | 'crew'; parent?: string }>;
 }
 
 const defaultState: TuiState = {

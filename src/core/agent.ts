@@ -25,6 +25,7 @@ import { SkillBatcher } from '../skills/batcher.js';
 import type { SkillLoader } from '../skills/loader.js';
 import { logger } from '../utils/logger.js';
 import { refinePersona } from '../bots/persona-template.js';
+import { proposeCrew } from '../bots/fleet-onboarding.js';
 import { applyBotFieldPatch } from '../bots/edit.js';
 import { CLIChannel } from '../channels/cli.js';
 import { TelegramChannel } from '../channels/telegram.js';
@@ -505,6 +506,9 @@ export class Agent {
   private botManager?: import('../bots/bot-manager.js').BotManager;
   /** Bot awaiting a persona from the next message (post-create setup flow). */
   private pendingPersonaFor: string | null = null;
+  /** True while the pending persona capture belongs to a JUST-created bot —
+   * gates the fleet (solo vs lead) onboarding step in finalizePersona. */
+  private pendingPersonaNewlyCreated = false;
   /** Bot awaiting a daily token budget answer (final onboarding step). */
   private pendingBudgetFor: string | null = null;
   readonly programmingMode: ProgrammingMode;
@@ -1135,7 +1139,7 @@ export class Agent {
    * as-is. TUI gets a real choice prompt; other channels default to
    * template with graceful raw fallback on provider failure.
    */
-  private async finalizePersona(bm: import('../bots/bot-manager.js').BotManager, botId: string, raw: string, msg: ChannelMessage): Promise<void> {
+  private async finalizePersona(bm: import('../bots/bot-manager.js').BotManager, botId: string, raw: string, msg: ChannelMessage, newlyCreated = false): Promise<void> {
     const channel = this.channels.getChannelForMessage(msg);
     const manifest = bm.store.get(botId);
     if (!channel || !manifest) return;
@@ -1178,6 +1182,11 @@ export class Agent {
     const mode = finalPersona === raw ? 'as-is' : 'as a structured template';
     await channel.send(`✍️ Persona saved ${mode}.`, `bot:${botId}`).catch(() => {});
 
+    // New-bot onboarding: solo vs fleet step (personas edited later never ask).
+    if (newlyCreated) {
+      await this.offerFleetStep(bm, botId, manifest.name, msg, channel);
+    }
+
     // Final onboarding step: the daily token budget — optional and OFF by
     // default (no cap). "suggest" fills a generous number so heavy bots are
     // protected from runaway spend without ever being strangled.
@@ -1191,6 +1200,60 @@ export class Agent {
       `Editable anytime: \`/bots budget ${botId} <tokens|suggest|none>\`. Or just type your first task — the budget stays unset.`,
       `bot:${botId}`,
     ).catch(() => {});
+  }
+
+  /**
+   * Fleet onboarding step (new bots only): solo vs lead. Auto-build asks one
+   * LLM call for a matched crew; manual points at `/bots add-crew`. The
+   * budget step follows either way.
+   */
+  private async offerFleetStep(bm: import('../bots/bot-manager.js').BotManager, botId: string, botName: string, msg: ChannelMessage, channel: any): Promise<void> {
+    let choice = 'Solo bot';
+    try {
+      choice = await this.presentChoice(
+        `Should **${botName}** work solo, or lead a fleet of sub-bots?`,
+        ['Solo bot', 'Lead a fleet — auto-build the crew', 'Lead a fleet — I\'ll add crew myself'],
+        msg.channelId,
+        msg.channelType as any,
+      );
+    } catch {
+      choice = 'Solo bot';
+    }
+    if (choice.startsWith('Solo')) return;
+
+    // Promote to lead before any crew exists.
+    bm.store.update(botId, m => { m.fleetRole = 'lead'; });
+    bm.invalidateRuntime(botId);
+
+    if (choice.startsWith('Lead a fleet — I\'ll')) {
+      await channel.send(
+        `👑 **${botName}** is now a fleet lead. Add specialists anytime:\n` +
+        `\`/bots add-crew ${botId} <id> "Name" "Description" "persona (optional)"\`\n` +
+        `Review the fleet with \`/bots crew ${botId}\` — or just tell **${botName}** to hire its own crew (it has bot_spawn).`,
+        `bot:${botId}`,
+      ).catch(() => {});
+      return;
+    }
+
+    // Auto-build: one LLM proposal, created through the standard path.
+    await channel.send(`👑 **${botName}** is now a fleet lead — proposing a crew…`, `bot:${botId}`).catch(() => {});
+    const persona = bm.store.readPersona(botId);
+    const proposals = await proposeCrew(botName, bm.store.get(botId)?.description ?? '', persona, this.providers.getDefault(), bm.maxCrew());
+    if (proposals.length === 0) {
+      await channel.send(`⚠ Crew proposal unavailable (provider) — **${botName}** is a lead with an empty crew. Add members with \`/bots add-crew ${botId} <id> "Name" "Description" "persona"\` or tell the lead to hire its own.`, `bot:${botId}`).catch(() => {});
+      return;
+    }
+    const lines: string[] = [`👑 **${botName}** fleet — ${proposals.length} crew member(s) created:`, ''];
+    for (const p of proposals) {
+      const result = bm.addCrew(botId, p);
+      if (result.ok) {
+        lines.push(`• **${p.name}** (\`${result.manifest.id}\`) — ${p.description || 'specialist'}`);
+      } else {
+        lines.push(`⚠ ${p.name} (${p.id}): ${result.error}`);
+      }
+    }
+    lines.push('', 'Dispatch tasks with `/bot <crewId> <task>` or tell the lead to delegate — it can also spawn more crew itself.');
+    await channel.send(lines.join('\n'), `bot:${botId}`).catch(() => {});
   }
 
   /** Apply the budget answer typed after the persona step (or a later task). */
@@ -1255,7 +1318,7 @@ export class Agent {
         return;
       } else {
         // Offer the "convert to template" step before anything hits disk.
-        await this.finalizePersona(bm, botId, message.trim(), msg);
+        await this.finalizePersona(bm, botId, message.trim(), msg, this.pendingPersonaNewlyCreated);
         return;
       }
     }
@@ -1310,7 +1373,7 @@ export class Agent {
     const action = (parts[0] ?? '').toLowerCase();
 
     // All bot-targeting actions accept id OR name — resolve to the id here.
-    if (['open', 'send', 'journal', 'inbox', 'budget', 'edit', 'delete', 'enable', 'disable', 'stop', 'pause', 'start', 'run', 'persona'].includes(action) && parts[1]) {
+    if (['open', 'send', 'journal', 'inbox', 'budget', 'edit', 'delete', 'enable', 'disable', 'stop', 'pause', 'start', 'run', 'persona', 'crew', 'add-crew', 'remove-crew'].includes(action) && parts[1]) {
       const resolved = bm.resolveBotId(parts[1]);
       if (resolved) parts[1] = resolved;
     }
@@ -1331,13 +1394,31 @@ export class Agent {
         await channel.send('No bots configured. Use `/bots create <id> "Name" "Description"` to onboard one.', channelId);
         return;
       }
-      const lines = [`**Bots** (${summaries.length})`, ''];
-      for (const s of summaries) {
+      // Fleet tree: 👑 lead first with crew indented beneath; solos flat.
+      const leads = summaries.filter(s => s.fleetRole === 'lead');
+      const crews = summaries.filter(s => s.fleetRole === 'crew');
+      const solos = summaries.filter(s => !s.fleetRole);
+      const fmt = (s: typeof summaries[number], indent: string) => {
         const icon = stateIcons[s.state] ?? '❓';
         const lastRun = s.lastRunAt ? ` · last ${(s.lastRunState ?? '')} ${formatRelative(s.lastRunAt)}` : '';
-        const activity = s.activity ? `\n   ↳ ${s.activity}` : '';
+        const activity = s.activity ? `\n${indent}   ↳ ${s.activity}` : '';
         const attention = s.needsYou ? ' · ⚠ needs you' : '';
-        lines.push(`${icon} **${s.name}** (${s.id}) — ${s.state}${attention}${lastRun}${activity}`);
+        return `${indent}${icon} **${s.name}** (${s.id}) — ${s.state}${attention}${lastRun}${activity}`;
+      };
+      const lines: string[] = [`**Bots** (${summaries.length})`, ''];
+      const rendered = new Set<string>();
+      for (const lead of leads) {
+        const crew = crews.filter(c => c.parent === lead.id);
+        lines.push(fmt(lead, ''));
+        rendered.add(lead.id);
+        for (const c of crew) {
+          lines.push(fmt(c, '  '));
+          rendered.add(c.id);
+        }
+        if (crew.length === 0) lines.push('  (empty crew — `/bots add-crew` or the lead can bot_spawn)');
+      }
+      for (const s of [...crews, ...solos]) {
+        if (!rendered.has(s.id)) lines.push(fmt(s, ''));
       }
       const running = summaries.filter(s => s.state === 'running').length;
       lines.push('', `Running: ${running} | Queued: ${summaries.reduce((a, s) => a + (s.state === 'queued' ? 1 : 0), 0)}`);
@@ -1374,10 +1455,12 @@ export class Agent {
       const personaText = quoted[2];
       try {
         const manifest = bm.store.create({ id, name, description });
+        this.pendingPersonaNewlyCreated = true;
         if (personaText) {
           bm.store.writePersona(id, personaText + '\n');
           bm.invalidateRuntime(id);
           await channel.send(`🤖 Bot **${manifest.name}** (\`${id}\`) onboarded with your persona — enabled, fail-closed defaults.\nStart using it: \`/bot ${id} <task>\`, \`/bots open ${id}\`, or just \`@${id} <task>\`.`, channelId);
+          await this.offerFleetStep(bm, id, manifest.name, msg, channel);
           return;
         }
         // No persona given — open its chat and prompt for one now (TUI only).
@@ -1516,7 +1599,8 @@ export class Agent {
         return;
       }
       if (!confirmed && typeof (channel as any).askToContinue === 'function') {
-        const proceed = await (channel as any).askToContinue(`Delete bot **${target}** and its profile (persona, memory links, journal)? This cannot be undone.`);
+        const crewCount = bm.store.crewOf(target).length;
+        const proceed = await (channel as any).askToContinue(`Delete bot **${target}** and its profile (persona, memory links, journal)? This cannot be undone.${crewCount > 0 ? ` Its ${crewCount} crew member(s) will be detached and become solo bots.` : ''}`);
         if (!proceed) {
           await channel.send('Deletion cancelled.', channelId);
           return;
@@ -1663,6 +1747,93 @@ export class Agent {
       return;
     }
 
+    if (action === 'crew') {
+      // /bots crew <leadId> — the fleet tree + per-crew recent runs.
+      const leadId = parts[1]?.toLowerCase();
+      if (!leadId || !bm.store.exists(leadId)) {
+        await channel.send('Usage: `/bots crew <leadId>`', channelId);
+        return;
+      }
+      const lead = bm.store.get(leadId);
+      if (lead?.fleetRole !== 'lead') {
+        await channel.send(`**${lead?.name ?? leadId}** is not a fleet lead.`, channelId);
+        return;
+      }
+      const crew = bm.store.crewOf(leadId);
+      const lines = [`👑 **${lead.name}** fleet (${crew.length}/${bm.maxCrew()})`, ''];
+      if (crew.length === 0) {
+        lines.push('(empty — `/bots add-crew` or tell the lead to bot_spawn)');
+      }
+      const stateIcons2: Record<string, string> = { idle: '⚪', queued: '🔵', running: '🟢', paused: '🟡', disabled: '⛔' };
+      for (const c of crew) {
+        const summary = bm.getStatusSummaries().find(s => s.id === c.id);
+        const runs = bm.getJournal(c.id, 3);
+        const lastRun = runs.length > 0 ? `last: ${runs[runs.length - 1].state}` : 'no runs yet';
+        lines.push(`${stateIcons2[summary?.state ?? 'idle']} **${c.name}** (${c.id})${c.description ? ` — ${c.description}` : ''} · ${lastRun}`);
+        for (const r of runs.slice(-2).reverse()) {
+          lines.push(`   ↳ ${r.state === 'completed' ? '✅' : r.state === 'failed' ? '❌' : '⛔'} ${r.summary?.slice(0, 90) ?? r.runId}`);
+        }
+      }
+      await channel.send(lines.join('\n'), channelId);
+      return;
+    }
+
+    if (action === 'add-crew') {
+      // /bots add-crew <leadId> <id> "Name" "Description" ["persona"]
+      const leadId = parts[1]?.toLowerCase();
+      const rest = parts.slice(2).join(' ');
+      const quoted = [...rest.matchAll(/"([^"]*)"/g)].map(m => m[1]);
+      const id = quoted[0] ?? parts[2];
+      if (!leadId || !id || !quoted[0]) {
+        await channel.send('Usage: `/bots add-crew <leadId> <id> "Name" "Description" "persona (optional)"`', channelId);
+        return;
+      }
+      if (!bm.store.exists(leadId) || bm.store.get(leadId)?.fleetRole !== 'lead') {
+        await channel.send(`**${leadId}** is not a fleet lead.`, channelId);
+        return;
+      }
+      try {
+        let persona: string | undefined;
+        if (quoted[2]) {
+          const refined = await refinePersona(quoted[2], quoted[0], this.providers.getDefault());
+          persona = refined ?? quoted[2];
+        }
+        const result = bm.addCrew(leadId, { id, name: quoted[0], description: quoted[1], persona });
+        if (!result.ok) {
+          await channel.send(`⚠ ${result.error}`, channelId);
+          return;
+        }
+        await channel.send(`👑 Crew member **${quoted[0]}** (\`${result.manifest.id}\`) added to **${leadId}** — fail-closed defaults, comms linked to the lead${persona ? ', persona refined' : ''}.`, channelId);
+      } catch (err: any) {
+        await channel.send(`Failed: ${err?.message}`, channelId);
+      }
+      return;
+    }
+
+    if (action === 'remove-crew') {
+      const leadId = parts[1]?.toLowerCase();
+      const crewId = parts[2]?.toLowerCase();
+      if (!leadId || !crewId) {
+        await channel.send('Usage: `/bots remove-crew <leadId> <crewId>`', channelId);
+        return;
+      }
+      const crew = bm.store.get(crewId);
+      if (!crew || crew.parent !== leadId) {
+        await channel.send(`**${crewId}** is not crew of **${leadId}**. See \`/bots crew ${leadId}\`.`, channelId);
+        return;
+      }
+      if (typeof (channel as any).askToContinue === 'function') {
+        const proceed = await (channel as any).askToContinue(`Retire crew member **${crew.name}** (${crewId})? Profile, sandbox, and queue are removed permanently.`);
+        if (!proceed) {
+          await channel.send('Retirement cancelled.', channelId);
+          return;
+        }
+      }
+      const result = await bm.removeCrew(leadId, crewId);
+      await channel.send(result.ok ? `👑 Crew member **${crewId}** retired from **${leadId}**.` : `⚠ ${result.error}`, channelId);
+      return;
+    }
+
     if (action === 'storage') {
       const usage = bm.getStorage();
       if (usage.length === 0) {
@@ -1696,6 +1867,9 @@ export class Agent {
       '`/bots storage` — disk usage\n' +
       '`/bots enable|disable|stop|start <id>` — control (stop holds queued jobs; start resumes them)\n' +
       '`/bots run <id> [routineName]` — fire a routine now, or a bare wake turn\n' +
+      '`/bots crew <leadId>` — fleet tree with per-crew runs\n' +
+      '`/bots add-crew <leadId> <id> "Name" "Desc" ["persona"]` — add a sub-bot to a fleet\n' +
+      '`/bots remove-crew <leadId> <crewId>` — retire a crew member\n' +
       '`/bots delete <id> confirm` — permanently delete',
       channelId,
     );

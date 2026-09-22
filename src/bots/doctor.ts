@@ -61,6 +61,17 @@ export function runBotDoctor(deps: DoctorDeps): DoctorReport {
       });
     }
 
+    // Fleet hierarchy integrity: a crew bot whose lead no longer exists is
+    // orphaned — it can never be dispatched to, monitored, or retired.
+    if (manifest.parent && !manifests.some(m => m.id === manifest.parent)) {
+      findings.push({
+        botId: manifest.id,
+        severity: 'error',
+        check: 'fleet',
+        detail: `Crew bot's lead "${manifest.parent}" no longer exists — detach with /bots edit or re-point the parent`,
+      });
+    }
+
     const dlqDepth = dlqByBot.get(manifest.id) ?? 0;
     if (dlqDepth > 0) {
       findings.push({

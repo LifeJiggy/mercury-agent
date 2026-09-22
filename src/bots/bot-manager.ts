@@ -14,6 +14,8 @@ import { BotQueue, idempotencyKeyFor, LEASE_SECONDS, type DurableBotJob } from '
 import { createBotCapabilityRegistry, filterBotTools } from './registry-factory.js';
 import { createBotSendTool } from './tools/bot-send.js';
 import { createBotScheduleTool, type BotScheduler } from './tools/bot-schedule.js';
+import { createFleetStatusTool } from './tools/fleet-status.js';
+import { createBotSpawnTool } from './tools/bot-spawn.js';
 import { runBotTurn, isTransientFailure, type BotTurnMail } from './bot-turn.js';
 import { synthesizeSkill, MIN_TOOLS_FOR_SYNTHESIS } from './skill-synthesis.js';
 import { SkillLoader } from '../skills/loader.js';
@@ -37,6 +39,16 @@ export interface BotJob {
   source?: { channelType: string; channelId: string };
   createdAt: number;
   attempts: number;
+}
+
+/**
+ * Fleet delegation rule: a mailbox job WITH a prompt (fromBot set) is a TASK
+ * dispatched by another bot — its result is returned to the sender's mailbox
+ * on completion. Plain mail wakes (prompt '') never reply — no ping-pong.
+ * Derived from the job itself, so it survives restarts with zero schema.
+ */
+function replyTargetFor(job: BotJob): string | undefined {
+  return job.trigger === 'mailbox' && job.fromBot && job.prompt ? job.fromBot : undefined;
 }
 
 export interface BotSendResult {
@@ -265,6 +277,18 @@ export class BotManager {
     return { jobId: id, accepted: true };
   }
 
+  /**
+   * Fleet task dispatch: a delegated TASK from one bot to another (lead →
+   * crew, crew → lead). Durable job with the task as the prompt — on
+   * completion the result is returned to the sender's mailbox
+   * (replyTargetFor), closing the delegation loop.
+   */
+  dispatchTask(targetBotId: string, fromBot: string, task: string): BotSendResult {
+    const result = this.enqueue(targetBotId, { trigger: 'mailbox', prompt: task, fromBot });
+    if (!result.accepted) return { accepted: false, reasonCode: result.reasonCode as BotSendResult['reasonCode'] };
+    return { accepted: true, jobId: result.jobId };
+  }
+
   /** Fire-and-forget mailbox delivery from another bot. */
   sendToBot(targetBotId: string, fromBot: string, content: string): BotSendResult {
     const manifest = this.store.get(targetBotId);
@@ -478,6 +502,24 @@ export class BotManager {
             logger.warn({ e, botId }, 'Bot remote-channel result notify failed'));
         }
       }
+
+      // Fleet delegation loop: a task dispatched by another bot reports its
+      // result back to the sender's mailbox (attributed, plain mail — never a
+      // task, so results can't ping-pong). Paused runs requeue and report
+      // later; the failure/retry machinery above owns transient states.
+      const replyTarget = replyTargetFor(job);
+      if (replyTarget && (output.status === 'completed' || output.status === 'failed' || output.status === 'halted')) {
+        const icon = output.status === 'completed' ? '✅' : output.status === 'failed' ? '❌' : '⏹';
+        const reply = output.status === 'completed'
+          ? `✅ Task complete (job ${job.id}):\n${output.output.slice(0, 4000)}`
+          : output.status === 'failed'
+            ? `❌ Task FAILED (job ${job.id})${output.reasonCode ? ` [reason: ${output.reasonCode}]` : ''}: ${(output.error ?? output.output).slice(0, 1000)}`
+            : `⏹ Task halted (job ${job.id}) — it was stopped; see /bots journal ${botId}.`;
+        const sent = this.sendToBot(replyTarget, botId, reply);
+        if (!sent.accepted) {
+          logger.warn({ botId, replyTarget, reason: sent.reasonCode }, 'Fleet result reply not delivered');
+        }
+      }
     } catch (err: any) {
       logger.error({ botId, jobId: job.id, err: err?.message }, 'Bot turn crashed');
       this.queue.settle(job.id, 'dead', 'unknown_error');
@@ -539,6 +581,7 @@ export class BotManager {
         pollMail: () => this.drainMailbox(botId),
         sandbox: { workspace: this.store.sandboxDir(botId), shared: this.store.sharedSandboxDir() },
         skillsPrompt,
+        fleet: this.fleetContext(botId, manifest),
         capabilities: registry,
         tools,
         userMemory,
@@ -548,6 +591,31 @@ export class BotManager {
       },
       cleanup: () => { /* per-bot registries are persistent, nothing to restore */ },
     };
+  }
+
+  /** Fleet context for the turn prompt (undefined for solo bots). */
+  private fleetContext(botId: string, manifest: BotManifest) {
+    if (manifest.fleetRole === 'lead') {
+      return {
+        role: 'lead' as const,
+        crew: this.store.crewOf(botId).map(c => ({
+          id: c.id,
+          name: c.name,
+          description: c.description,
+          state: this.getStatusSummaries().find(s => s.id === c.id)?.state ?? 'idle',
+        })),
+        maxCrew: this.maxCrew(),
+      };
+    }
+    if (manifest.fleetRole === 'crew' && manifest.parent) {
+      return {
+        role: 'crew' as const,
+        leadName: this.store.get(manifest.parent)?.name,
+        crew: [],
+        maxCrew: 0,
+      };
+    }
+    return undefined;
   }
 
   private getOrCreateRuntime(botId: string, manifest: BotManifest): { registry: CapabilityRegistry; tools: Record<string, Tool>; skillsPrompt: string } {
@@ -588,9 +656,21 @@ export class BotManager {
     // Filter FIRST (strips interactive/global-mutation tools and applies the
     // manifest allow/deny), THEN add the bot-specific tools — otherwise the
     // filter would strip them again.
-    const filtered = filterBotTools({ ...registry.getTools() }, manifest) as Record<string, Tool>;
-    if ((manifest.comms?.canMessage ?? []).length > 0) {
-      filtered.bot_send = createBotSendTool(this, botId, manifest.comms?.canMessage ?? []);
+    const filtered = filterBotTools({ ...registry.getTools() }, manifest);
+    // Fleet relations are implicit comms: a lead can message its crew and a
+    // crew bot its lead, without anyone hand-editing canMessage.
+    const effectiveRoster = this.effectiveRoster(botId, manifest);
+    if (effectiveRoster.length > 0) {
+      filtered.bot_send = createBotSendTool(this, botId, effectiveRoster) as Tool;
+    }
+    // Fleet tools for leads: monitor the crew, spawn/retire within caps.
+    if (manifest.fleetRole === 'lead') {
+      filtered.fleet_status = createFleetStatusTool(this, botId);
+      if (this.config.bots?.fleets?.allowLeadSpawn !== false) {
+        const fleet = createBotSpawnTool(this, botId);
+        filtered.bot_spawn = fleet.spawn;
+        filtered.bot_retire = fleet.retire;
+      }
     }
     // bot_schedule: bots can schedule their own future runs (durable,
     // capped) when the main scheduler is wired.
@@ -599,6 +679,89 @@ export class BotManager {
     }
     this.registries.set(botId, { registry, tools: filtered, skillsPrompt });
     return { registry, tools: filtered, skillsPrompt };
+  }
+
+  /**
+   * Comms roster = explicit canMessage ∪ fleet relations (lead ↔ own crew).
+   * Derived per registry build; excludes the bot itself.
+   */
+  private effectiveRoster(botId: string, manifest: BotManifest): string[] {
+    const roster = new Set(manifest.comms?.canMessage ?? []);
+    if (manifest.fleetRole === 'lead') {
+      for (const crew of this.store.crewOf(botId)) roster.add(crew.id);
+    }
+    if (manifest.fleetRole === 'crew' && manifest.parent) {
+      roster.add(manifest.parent);
+    }
+    roster.delete(botId);
+    return [...roster];
+  }
+
+  // ---- fleet management (shared by onboarding, lead tools, API) -----------
+
+  /** Max crew per lead — CrewAI guidance: 3-6 for delegation accuracy. */
+  maxCrew(): number {
+    return this.config.bots?.fleets?.maxCrew ?? 6;
+  }
+
+  /** The bot's provider (public for fleet tools — persona building on spawn). */
+  resolveProviderFor(botId: string): ReturnType<typeof resolveProvider> {
+    const manifest = this.store.get(botId);
+    return resolveProvider(this.providers, manifest ?? { id: botId, name: botId, enabled: true } as BotManifest);
+  }
+
+  /**
+   * Add a crew member to a lead: validates the relationship, enforces the
+   * crew cap, creates with fail-closed defaults + comms back to the lead.
+   * Persona refinement (builder) is the caller's concern (async provider
+   * call); addCrew writes the persona text it is given.
+   */
+  addCrew(leadId: string, spec: { id: string; name: string; description?: string; persona?: string }): { ok: true; manifest: BotManifest } | { ok: false; error: string } {
+    const lead = this.store.get(leadId);
+    if (!lead) return { ok: false, error: `No bot "${leadId}"` };
+    if (lead.fleetRole !== 'lead') {
+      return { ok: false, error: `**${lead.name}** is not a fleet lead — promote it first with /bots create flow or add crew via onboarding` };
+    }
+    const crew = this.store.crewOf(leadId);
+    const cap = this.maxCrew();
+    if (crew.length >= cap) {
+      return { ok: false, error: `Fleet is at the crew cap (${crew.length}/${cap}) — retire a member first or raise BOTS_FLEET_MAX_CREW` };
+    }
+    if (this.store.exists(spec.id)) {
+      return { ok: false, error: `Bot "${spec.id}" already exists` };
+    }
+    const manifest = this.store.create({
+      id: spec.id.toLowerCase(),
+      name: spec.name,
+      description: spec.description,
+      persona: spec.persona,
+      manifest: { fleetRole: 'crew', parent: leadId, comms: { canMessage: [leadId] } },
+    });
+    this.invalidateRuntime(leadId); // lead's roster + fleet prompt change
+    logger.info({ leadId, crewId: spec.id }, 'Crew member added to fleet');
+    return { ok: true, manifest };
+  }
+
+  /** Remove a crew member (lead's own child only) and record it on the lead. */
+  async removeCrew(leadId: string, crewId: string): Promise<{ ok: true } | { ok: false; error: string }> {
+    const crew = this.store.get(crewId);
+    if (!crew) return { ok: false, error: `No bot "${crewId}"` };
+    if (crew.parent !== leadId) return { ok: false, error: `**${crewId}** is not crew of **${leadId}**` };
+    await this.delete(crewId);
+    this.invalidateRuntime(leadId);
+    this.journalFor(leadId).append({
+      runId: randomUUID().slice(0, 8),
+      botId: leadId,
+      trigger: 'chat',
+      state: 'completed',
+      startedAt: Date.now(),
+      durationMs: 0,
+      tokensIn: 0,
+      tokensOut: 0,
+      summary: `Retired crew member "${crew.name}" (${crewId})`,
+    });
+    logger.info({ leadId, crewId }, 'Crew member retired');
+    return { ok: true };
   }
 
   invalidateRuntime(botId: string): void {
@@ -613,6 +776,15 @@ export class BotManager {
    */
   async delete(botId: string): Promise<void> {
     await this.halt(botId);
+    // Fleet cleanup: a deleted LEAD's crew is detached (→ solo), never orphaned
+    // with a dangling parent. A deleted crew bot just leaves the roster.
+    if (this.store.isLead(botId)) {
+      for (const crew of this.store.crewOf(botId)) {
+        this.store.update(crew.id, m => { m.fleetRole = undefined; m.parent = undefined; });
+        this.invalidateRuntime(crew.id);
+        logger.info({ leadId: botId, crewId: crew.id }, 'Fleet lead deleted — crew member detached to solo');
+      }
+    }
     // Scheduler routines (bot:<id>:*) — both bot.yaml routines and
     // bot_schedule self-created ones; they must never fire again.
     if (this.scheduler) {
@@ -792,6 +964,11 @@ export class BotManager {
         lastRunAt: last?.at,
         lastRunState: last?.state,
         needsYou: this.needsYou.has(m.id),
+        fleetRole: m.fleetRole,
+        parent: m.parent,
+        crewWorking: m.fleetRole === 'lead'
+          ? this.store.crewOf(m.id).filter(c => (this.running.get(c.id)?.size ?? 0) > 0).length
+          : undefined,
       };
     });
   }
@@ -853,7 +1030,8 @@ export class BotManager {
     for (const m of summaries) {
       const state = this.running.get(m.id)?.size ? 'running' : ((this.queues.get(m.id)?.length ?? 0) > 0 ? 'queued' : (m.enabled ? 'idle' : 'disabled'));
       const desc = m.description ? ` — ${m.description}` : '';
-      lines.push(`- **${m.name}** (\`${m.id}\`)${desc} [${state}]`);
+      const fleetTag = m.fleetRole === 'lead' ? ' [fleet lead 👑]' : m.fleetRole === 'crew' ? ` [crew of ${m.parent}]` : '';
+      lines.push(`- **${m.name}** (\`${m.id}\`)${desc}${fleetTag} [${state}]`);
     }
     lines.push(`Bot control (never route bot work through this main conversation):
 - \`/bot <id> <message>\` or \`@<id> <message>\` — dispatch a task to a bot; the result lands ONLY in the bot's own thread (\`/bots open <id>\`), never in this chat.

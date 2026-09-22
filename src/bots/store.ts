@@ -68,6 +68,20 @@ export function validateBotManifest(manifest: Partial<BotManifest>): string[] {
   for (const other of canMessage) {
     if (other === manifest.id) errors.push('canMessage cannot include the bot itself');
   }
+  // Fleet hierarchy: crew requires a parent that is a lead; leads have no
+  // parent. Single-level fleets in v1 — a lead-of-lead is a config error
+  // (nesting would need a deeper cycle check, so it is rejected outright).
+  if (manifest.parent) {
+    if (manifest.fleetRole !== 'crew') {
+      errors.push('parent is only valid on fleetRole "crew" bots');
+    }
+    if (manifest.parent === manifest.id) {
+      errors.push('parent cannot be the bot itself');
+    }
+  }
+  if (manifest.fleetRole === 'crew' && !manifest.parent) {
+    errors.push('fleetRole "crew" requires a parent (the lead bot id)');
+  }
   return errors;
 }
 
@@ -163,6 +177,24 @@ export class BotStore {
   /** The bot's own skill library (auto-synthesized + hand-authored; bot-private). */
   skillsDir(id: string): string {
     return join(this.botDir(id), 'skills');
+  }
+
+  // ---- fleet hierarchy (derived — the child's `parent` is the only state) --
+
+  /** Crew of a lead, derived from manifests. Lead/solo → empty. */
+  crewOf(leadId: string): BotManifest[] {
+    return this.list().filter(m => m.parent === leadId);
+  }
+
+  /** The lead of a crew bot; solo/lead → null. */
+  leadOf(botId: string): BotManifest | null {
+    const m = this.get(botId);
+    if (!m?.parent) return null;
+    return this.get(m.parent);
+  }
+
+  isLead(id: string): boolean {
+    return this.get(id)?.fleetRole === 'lead';
   }
 
   /** The fleet-shared sandbox folder (one physical dir; every bot gets rw+x). */

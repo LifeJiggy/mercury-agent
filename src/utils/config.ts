@@ -206,6 +206,13 @@ export interface MercuryConfig {
     autoSkill?: {
       enabled?: boolean;
     };
+    /** Fleet hierarchies: lead bots managing a crew of sub-bots. */
+    fleets?: {
+      /** Hard cap on crew size per lead (CrewAI guidance: 3-6 for delegation accuracy). */
+      maxCrew?: number;
+      /** Lead bots may create/remove their own crew via bot_spawn/bot_retire. */
+      allowLeadSpawn?: boolean;
+    };
     /** Suggested per-bot daily token budget offered during onboarding. */
     suggestedDailyTokenBudget?: number;
     retention: {
@@ -469,6 +476,10 @@ export function getDefaultConfig(): MercuryConfig {
       webhookSecret: getEnv('BOTS_WEBHOOK_SECRET') || undefined,
       autoSkill: {
         enabled: getEnvBool('BOTS_AUTO_SKILL', false),
+      },
+      fleets: {
+        maxCrew: getEnvNum('BOTS_FLEET_MAX_CREW', 6),
+        allowLeadSpawn: getEnvBool('BOTS_FLEET_LEAD_SPAWN', true),
       },
       suggestedDailyTokenBudget: getEnvNum('BOTS_SUGGESTED_DAILY_TOKEN_BUDGET', 5_000_000),
       retention: {

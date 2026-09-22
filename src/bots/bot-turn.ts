@@ -27,6 +27,13 @@ export interface BotTurnInput {
   sandbox: { workspace: string; shared: string };
   /** Skill roster text (native + the bot's own library); empty when none. */
   skillsPrompt?: string;
+  /** Fleet hierarchy context (lead crew roster / crew membership); absent for solos. */
+  fleet?: {
+    role: 'lead' | 'crew';
+    leadName?: string;
+    crew: Array<{ id: string; name: string; description?: string; state: string }>;
+    maxCrew: number;
+  };
   capabilities: CapabilityRegistry;
   tools: Record<string, Tool>;
   userMemory: UserMemoryStore | null;
@@ -237,6 +244,24 @@ Anything outside these two areas and your declared Access grants is denied.`;
   if (input.skillsPrompt) {
     prompt += `\n\n${input.skillsPrompt}`;
     prompt += `\nSkill scripts are subject to your access grants: a skill whose scripts you cannot run from its own directory can be copied into your sandbox workspace and run from there.`;
+  }
+
+  // Fleet hierarchy: the lead orchestrates, the crew executes.
+  if (input.fleet?.role === 'lead') {
+    const roster = input.fleet.crew.length > 0
+      ? input.fleet.crew.map(c => `- ${c.name} (${c.id})${c.description ? ` — ${c.description}` : ''} [${c.state}]`).join('\n')
+      : '(empty — use bot_spawn to add specialists)';
+    prompt += `\n\nYou lead a fleet of crew bots:
+${roster}
+
+Fleet protocol:
+- DELEGATE with bot_send (task: true) — be concrete and self-contained; the result arrives in your mailbox when the bot finishes.
+- MONITOR with fleet_status — check who is running, idle, or blocked before and after delegating.
+- You may create specialists with bot_spawn (crew cap: ${input.fleet.maxCrew}) and retire your own crew with bot_retire.
+- Crew run CONCURRENTLY — dispatch independent work in parallel rather than sequentially.
+- You SYNTHESIZE: crew results arrive in your mailbox attributed by bot; combine them and report a single coherent outcome.`;
+  } else if (input.fleet?.role === 'crew') {
+    prompt += `\n\nYou are crew in **${input.fleet.leadName ?? 'your lead'}'s** fleet. Tasks delegated to you (mailbox messages with a task) return your result to the lead automatically when you finish — make your final output a complete, self-contained report. Use bot_send to ask the lead questions mid-task.`;
   }
 
   const remaining = input.tokenBudget.getRemaining();

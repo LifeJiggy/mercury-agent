@@ -645,3 +645,99 @@ describe('Bot skill access (native + own library)', () => {
     });
   });
 });
+
+describe('Bot fleets (lead + crew)', () => {
+  let root: string;
+  let store: BotStore;
+  let manager: BotManager;
+
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), 'mercury-bot-fleet-'));
+    store = new BotStore(join(root, 'bots'));
+    manager = makeManager(root);
+  });
+
+  afterEach(() => {
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  function setupFleet() {
+    store.create({ id: 'ceo', name: 'CEO', manifest: { fleetRole: 'lead' } });
+    manager.addCrew('ceo', { id: 'researcher', name: 'Researcher', description: 'Research', persona: '# Researcher\n\nStudies markets.' });
+    manager.addCrew('ceo', { id: 'writer', name: 'Writer', persona: '# Writer\n\nWrites copy.' });
+  }
+
+  function runtimeFor(id: string) {
+    return (manager as unknown as { getOrCreateRuntime(id: string, m: BotManifest): { tools: Record<string, any> } }).getOrCreateRuntime(id, store.get(id)!);
+  }
+
+  it('addCrew enforces the lead relationship, the crew cap, and fail-closed defaults', () => {
+    setupFleet();
+    expect(store.get('researcher')?.fleetRole).toBe('crew');
+    expect(store.get('researcher')?.parent).toBe('ceo');
+    expect(store.get('researcher')?.comms?.canMessage).toEqual(['ceo']);
+    for (let i = 0; i < 4; i++) manager.addCrew('ceo', { id: `extra${i}`, name: `Extra${i}` });
+    expect(manager.addCrew('ceo', { id: 'over-cap', name: 'Over' })).toMatchObject({ ok: false });
+    store.create({ id: 'solo-bot', name: 'Solo' });
+    expect(manager.addCrew('solo-bot', { id: 'x', name: 'X' })).toMatchObject({ ok: false }); // not a lead
+    expect(manager.addCrew('ceo', { id: 'researcher', name: 'Dup' })).toMatchObject({ ok: false }); // exists
+  });
+
+  it('delegated tasks return results to the lead mailbox (attributed)', async () => {
+    mockedGenerateText.mockResolvedValue({ text: 'MARKET REPORT: all clear', finishReason: 'stop', usage: { inputTokens: 5, outputTokens: 5 } } as any);
+    setupFleet();
+    // Spy on delivery: the lead's wake turn would drain the mailbox before we
+    // can peek — the sendToBot call itself is the observable contract.
+    const sendSpy = vi.spyOn(manager, 'sendToBot');
+    const dispatch = manager.dispatchTask('researcher', 'ceo', 'Study the market');
+    expect(dispatch.accepted).toBe(true);
+    await vi.waitFor(() => {
+      expect(sendSpy).toHaveBeenCalledWith('ceo', 'researcher', expect.stringContaining('MARKET REPORT'));
+    });
+    sendSpy.mockRestore();
+  });
+
+  it('plain mailbox mail never triggers a result reply (no ping-pong)', async () => {
+    mockedGenerateText.mockResolvedValue({ text: 'noted', finishReason: 'stop', usage: { inputTokens: 1, outputTokens: 1 } } as any);
+    setupFleet();
+    manager.sendToBot('researcher', 'ceo', 'fyi only, no action');
+    await vi.waitFor(() => expect(manager.getJournal('researcher').length).toBe(1));
+    await new Promise(r => setTimeout(r, 50)); // let any detached follow-up turns settle
+    expect(manager.peekMailbox('ceo')).toHaveLength(0);
+  });
+
+  it('leads get fleet tools; bot_spawn/bot_retire manage the crew within the cap', async () => {
+    mockedGenerateText.mockResolvedValue({ text: 'A meticulous QA reviewer persona.', finishReason: 'stop', usage: { inputTokens: 1, outputTokens: 1 } } as any);
+    setupFleet();
+    const tools = runtimeFor('ceo').tools;
+    expect(tools.fleet_status).toBeDefined();
+    expect(tools.bot_spawn).toBeDefined();
+    expect(tools.bot_retire).toBeDefined();
+
+    const spawn = tools.bot_spawn as any;
+    const out = await spawn.execute({ id: 'qa', name: 'QA', description: 'Reviews posts', persona: 'A meticulous QA reviewer who checks every claim.' }, {} as any);
+    expect(out).toContain('qa');
+    expect(store.get('qa')?.parent).toBe('ceo');
+
+    let last = '';
+    for (let i = 0; i < 5; i++) {
+      last = await spawn.execute({ id: `filler${i}`, name: `F${i}`, description: 'x', persona: 'Filler persona for capacity testing purposes.' }, {} as any);
+    }
+    expect(last).toContain('crew cap');
+
+    const retire = tools.bot_retire as any;
+    expect(await retire.execute({ id: 'writer' }, {} as any)).toContain('retired');
+    expect(store.get('writer')).toBeNull();
+    // Ownership: ceo cannot retire another lead's crew
+    store.create({ id: 'rival', name: 'Rival', manifest: { fleetRole: 'lead' } });
+    manager.addCrew('rival', { id: 'guard', name: 'Guard' });
+    expect(await retire.execute({ id: 'guard' }, {} as any)).toContain('is not crew');
+  });
+
+  it('solo bots never get fleet tools', () => {
+    store.create({ id: 'loner', name: 'Loner' });
+    const tools = runtimeFor('loner').tools;
+    expect(tools.fleet_status).toBeUndefined();
+    expect(tools.bot_spawn).toBeUndefined();
+  });
+});
