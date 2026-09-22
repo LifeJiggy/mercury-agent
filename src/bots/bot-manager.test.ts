@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { mkdtempSync, rmSync, existsSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, existsSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -17,6 +17,7 @@ import { generateText } from 'ai';
 import { BotManager } from './bot-manager.js';
 import { BotStore } from './store.js';
 import { createBotCapabilityRegistry, filterBotTools } from './registry-factory.js';
+import { SkillLoader } from '../skills/loader.js';
 import { getDefaultConfig, type MercuryConfig } from '../utils/config.js';
 import type { BotManifest } from './types.js';
 
@@ -472,6 +473,28 @@ describe('Per-bot permission isolation (fail-closed)', () => {
     expect(shared).toMatchObject({ read: true, write: true, execute: true });
   });
 
+  it('bot toolset gains list_skills + use_skill; install_skill stays stripped', () => {
+    const manifest = store.create({ id: 'skillful', name: 'Skillful' }) as BotManifest;
+    const loader = new SkillLoader(join(root, 'skills'), { seedDefaults: false });
+    loader.discover();
+    const registry = createBotCapabilityRegistry({
+      botId: 'skillful',
+      manifest,
+      botDir: store.botDir('skillful'),
+      permissions: store.readPermissions('skillful'),
+      skillLoader: loader,
+      userMemory: null,
+      config: getDefaultConfig() as MercuryConfig,
+    });
+    const tools = registry.getTools();
+    expect(tools.list_skills).toBeDefined();
+    expect(tools.use_skill).toBeDefined();
+    const filtered = filterBotTools({ ...tools }, manifest);
+    expect(filtered.list_skills).toBeDefined();
+    expect(filtered.use_skill).toBeDefined();
+    expect(filtered.install_skill).toBeUndefined();
+  });
+
   it('fs write outside the bot scope is denied without prompting', async () => {
     const manifest = store.create({ id: 'writer', name: 'Writer' }) as BotManifest;
     const registry = createBotCapabilityRegistry({
@@ -581,5 +604,44 @@ describe('bot_send tool scoping', () => {
     });
     const firstCall = mockedGenerateText.mock.calls[0][0] as any;
     expect(JSON.stringify(firstCall.messages)).toContain('Message from 🤖 researcher');
+  });
+});
+describe('Bot skill access (native + own library)', () => {
+  let root: string;
+  let store: BotStore;
+  let manager: BotManager;
+
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), 'mercury-bot-skills-'));
+    store = new BotStore(join(root, 'bots'));
+    manager = makeManager(root);
+  });
+
+  afterEach(() => {
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  function writeSkill(dir: string, name: string, body: string) {
+    const skillDir = join(dir, name);
+    mkdirSync(skillDir, { recursive: true });
+    writeFileSync(join(skillDir, 'SKILL.md'), `---\nname: ${name}\ndescription: ${name} skill\nallowed-tools: []\n---\n\n${body}\n`);
+  }
+
+  it('turn prompts list native skills AND the bot\'s own library', async () => {
+    // Default skills root = <botsRoot>/../skills — the native library.
+    writeSkill(join(root, 'skills'), 'shared-procedure', 'Native procedure steps.');
+    // The bot's OWN library: synthesized or hand-authored, bot-private.
+    writeSkill(store.skillsDir('skilled'), 'own-procedure', 'The bot learned this itself.');
+    seedBot(store, 'skilled');
+    let systemPrompt = '';
+    mockedGenerateText.mockImplementation(async (opts: any) => {
+      systemPrompt = opts.system ?? '';
+      return { text: 'ok', finishReason: 'stop', usage: { inputTokens: 1, outputTokens: 1 } } as any;
+    });
+    manager.enqueue('skilled', { trigger: 'chat', prompt: 'hi' });
+    await vi.waitFor(() => {
+      expect(systemPrompt).toContain('own-procedure');
+      expect(systemPrompt).toContain('shared-procedure');
+    });
   });
 });

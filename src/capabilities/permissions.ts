@@ -358,6 +358,15 @@ export class PermissionManager {
   }
 
   elevateForSkill(allowedTools: string[]): void {
+    // Fail-closed mode (bots): skill elevation must never widen the granted
+    // scopes — elevation is checked BEFORE the fail-closed gates in
+    // checkFsAccess/checkShellCommand, so honoring it here would hand any
+    // skill with allowed-tools an unrestricted bypass. Skills guide; they do
+    // not re-permission.
+    if (this.failClosed) {
+      logger.info({ allowedTools }, 'Skill elevation ignored in fail-closed mode (granted scopes rule)');
+      return;
+    }
     if (allowedTools.includes('run_command')) {
       this.elevatedCommands.add('run_command');
     }

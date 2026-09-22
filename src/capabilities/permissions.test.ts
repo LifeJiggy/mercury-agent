@@ -93,6 +93,19 @@ describe('fail-closed execute scopes (bots)', () => {
   });
 });
 
+describe('fail-closed skill elevation', () => {
+  it('elevateForSkill is a no-op in fail-closed mode (skills never re-permission a bot)', async () => {
+    const permissions = new PermissionManager();
+    permissions.getManifest().capabilities.shell.enabled = true;
+    permissions.setFailClosed(true);
+    permissions.setCurrentContext('bot', 'worker');
+    permissions.elevateForSkill(['fs_write', 'run_command', 'read_file']);
+    // Without the guard, elevation would bypass the fail-closed gates.
+    await expect(permissions.checkFsAccess('/etc/hosts', 'write')).resolves.toMatchObject({ allowed: false });
+    await expect(permissions.checkShellCommand('npm install')).resolves.toMatchObject({ allowed: false });
+  });
+});
+
 describe('PermissionManager remote safety', () => {
   it('enforces hard command blocks before Local allow-all', async () => {
     const permissions = new PermissionManager();

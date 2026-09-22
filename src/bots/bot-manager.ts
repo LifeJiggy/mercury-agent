@@ -1,5 +1,6 @@
 import { cpus } from 'node:os';
 import { randomUUID } from 'node:crypto';
+import { resolve } from 'node:path';
 import type { Tool } from 'ai';
 import type { MercuryConfig } from '../utils/config.js';
 import type { ProviderRegistry } from '../providers/registry.js';
@@ -15,6 +16,7 @@ import { createBotSendTool } from './tools/bot-send.js';
 import { createBotScheduleTool, type BotScheduler } from './tools/bot-schedule.js';
 import { runBotTurn, isTransientFailure, type BotTurnMail } from './bot-turn.js';
 import { synthesizeSkill, MIN_TOOLS_FOR_SYNTHESIS } from './skill-synthesis.js';
+import { SkillLoader } from '../skills/loader.js';
 import { logger } from '../utils/logger.js';
 import type {
   BotLiveState,
@@ -52,6 +54,8 @@ export interface BotManagerDeps {
   queue?: BotQueue;
   /** Per-bot memory factory (P0-5 wires the default: UserMemoryStore with bot:<id> key). */
   userMemoryFactory?: (botId: string, manifest: BotManifest) => UserMemoryStore | null;
+  /** Global (native) skills root; default resolves to <botsRoot>/../skills (~/.mercury/skills). */
+  skillsRoot?: string;
   /** Deliver turn output to the invoking surface (chat/telegram/api). */
   notify?: (channelType: string, channelId: string, message: string) => Promise<void>;
 }
@@ -84,6 +88,7 @@ export class BotManager {
   private readonly providers: ProviderRegistry;
   private readonly tokenBudget: TokenBudget;
   private readonly userMemoryFactory?: BotManagerDeps['userMemoryFactory'];
+  private readonly skillsRoot?: BotManagerDeps['skillsRoot'];
   private notify?: BotManagerDeps['notify'];
   private alert?: (message: string) => Promise<void>;
 
@@ -125,7 +130,7 @@ export class BotManager {
   private mailboxes: Map<string, BotTurnMail[]> = new Map();
   private running: Map<string, Set<string>> = new Map(); // botId → running job ids
   private aborts: Map<string, AbortController> = new Map(); // job key → controller
-  private registries: Map<string, { registry: CapabilityRegistry; tools: Record<string, Tool> }> = new Map();
+  private registries: Map<string, { registry: CapabilityRegistry; tools: Record<string, Tool>; skillsPrompt: string }> = new Map();
   private activity: Map<string, string> = new Map(); // botId → current activity
   private lastRun: Map<string, { at: number; state: BotRunRecord['state'] }> = new Map();
   private needsYou: Set<string> = new Set();
@@ -158,6 +163,7 @@ export class BotManager {
     });
     this.notify = deps.notify;
     this.store = deps.store ?? new BotStore();
+    this.skillsRoot = deps.skillsRoot;
     this.queue = deps.queue ?? new BotQueue(this.store.botsRoot, this.config.bots?.retention?.dlqCap);
     // Resume work a crashed predecessor left behind: pending jobs (and
     // expired-lease claimed jobs) re-enter the in-memory queues. Durable
@@ -400,7 +406,12 @@ export class BotManager {
           output: output.output,
           toolsUsed: output.toolsUsed,
           provider: resolveProvider(this.providers, manifest),
-        }).catch((err) => logger.warn({ err, botId }, 'Skill synthesis failed'));
+          // The synthesized skill lands in the BOT'S OWN library (draft:true),
+          // not the global root — it is that bot's learned procedure, usable
+          // by it on the next run (runtime invalidated on success).
+          skillsRoot: this.store.skillsDir(botId),
+        }).then((synth) => { if (synth) this.invalidateRuntime(botId); })
+          .catch((err) => logger.warn({ err, botId }, 'Skill synthesis failed'));
       }
 
       // Transient provider failures retry with backoff, bounded; permanent
@@ -510,7 +521,7 @@ export class BotManager {
   }
 
   private buildTurn(botId: string, manifest: BotManifest, job: BotJob, signal: AbortSignal): { input: Parameters<typeof runBotTurn>[0]; cleanup: () => void } {
-    const { registry, tools } = this.getOrCreateRuntime(botId, manifest);
+    const { registry, tools, skillsPrompt } = this.getOrCreateRuntime(botId, manifest);
     const userMemory = this.userMemoryFor(botId, manifest);
 
     const mail: BotTurnMail[] = [];
@@ -527,6 +538,7 @@ export class BotManager {
         mail,
         pollMail: () => this.drainMailbox(botId),
         sandbox: { workspace: this.store.sandboxDir(botId), shared: this.store.sharedSandboxDir() },
+        skillsPrompt,
         capabilities: registry,
         tools,
         userMemory,
@@ -538,9 +550,25 @@ export class BotManager {
     };
   }
 
-  private getOrCreateRuntime(botId: string, manifest: BotManifest): { registry: CapabilityRegistry; tools: Record<string, Tool> } {
+  private getOrCreateRuntime(botId: string, manifest: BotManifest): { registry: CapabilityRegistry; tools: Record<string, Tool>; skillsPrompt: string } {
     const cached = this.registries.get(botId);
-    if (cached) return cached;
+    if (cached) return cached as { registry: CapabilityRegistry; tools: Record<string, Tool>; skillsPrompt: string };
+    // Skill access: global (native) library + the bot's own skills dir
+    // (auto-synthesized + hand-authored; own-dir names win on collision).
+    // Default root = <botsRoot>/../skills — ~/.mercury/skills in production,
+    // tmp-local in tests.
+    let skillLoader: SkillLoader | undefined;
+    let skillsPrompt = '';
+    try {
+      skillLoader = new SkillLoader(this.skillsRoot ?? resolve(this.store.botsRoot, '..', 'skills'), {
+        extraDirs: [this.store.skillsDir(botId)],
+        seedDefaults: false,
+      });
+      skillLoader.discover();
+      skillsPrompt = skillLoader.getSkillSummariesText();
+    } catch (err: any) {
+      logger.warn({ botId, err: err?.message }, 'Bot skill loader unavailable — continuing without skills');
+    }
     const registry = createBotCapabilityRegistry({
       botId,
       manifest,
@@ -550,6 +578,7 @@ export class BotManager {
       // registry build, so a persona edit (invalidateRuntime on write) applies
       // to the very next turn.
       persona: this.store.readPersona(botId),
+      skillLoader,
       // Built-in work areas: private sandbox + fleet-shared folder (rw+x,
       // implicit — no permission ask, no Access declaration).
       sandbox: { workspace: this.store.sandboxDir(botId), shared: this.store.sharedSandboxDir() },
@@ -568,8 +597,8 @@ export class BotManager {
     if (this.scheduler) {
       filtered.bot_schedule = createBotScheduleTool(this.scheduler, botId);
     }
-    this.registries.set(botId, { registry, tools: filtered });
-    return { registry, tools: filtered };
+    this.registries.set(botId, { registry, tools: filtered, skillsPrompt });
+    return { registry, tools: filtered, skillsPrompt };
   }
 
   invalidateRuntime(botId: string): void {

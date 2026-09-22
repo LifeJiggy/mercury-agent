@@ -25,6 +25,8 @@ export interface BotTurnInput {
   pollMail: () => BotTurnMail[];
   /** Sandbox areas granted implicitly (rw+x): private workspace + fleet-shared folder. */
   sandbox: { workspace: string; shared: string };
+  /** Skill roster text (native + the bot's own library); empty when none. */
+  skillsPrompt?: string;
   capabilities: CapabilityRegistry;
   tools: Record<string, Tool>;
   userMemory: UserMemoryStore | null;
@@ -230,6 +232,11 @@ Anything outside these two areas and your declared Access grants is denied.`;
   const toolNames = Object.keys(input.tools);
   if (toolNames.length > 0) {
     prompt += `\n\nAvailable tools: ${toolNames.join(', ')}`;
+  }
+
+  if (input.skillsPrompt) {
+    prompt += `\n\n${input.skillsPrompt}`;
+    prompt += `\nSkill scripts are subject to your access grants: a skill whose scripts you cannot run from its own directory can be copied into your sandbox workspace and run from there.`;
   }
 
   const remaining = input.tokenBudget.getRemaining();

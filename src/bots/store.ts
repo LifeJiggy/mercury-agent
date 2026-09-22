@@ -160,6 +160,11 @@ export class BotStore {
     return join(this.botDir(id), BOT_SANDBOX_DIRNAME);
   }
 
+  /** The bot's own skill library (auto-synthesized + hand-authored; bot-private). */
+  skillsDir(id: string): string {
+    return join(this.botDir(id), 'skills');
+  }
+
   /** The fleet-shared sandbox folder (one physical dir; every bot gets rw+x). */
   sharedSandboxDir(): string {
     return resolve(this.botsRoot, BOT_SHARED_SANDBOX_DIRNAME);

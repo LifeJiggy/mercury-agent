@@ -2,6 +2,7 @@ import { homedir } from 'node:os';
 import { mkdirSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { CapabilityRegistry } from '../capabilities/registry.js';
+import type { SkillLoader } from '../skills/loader.js';
 import type { UserMemoryStore } from '../memory/user-memory.js';
 import type { MercuryConfig } from '../utils/config.js';
 import { logger } from '../utils/logger.js';
@@ -45,6 +46,11 @@ export interface BotRegistryDeps {
    */
   persona?: string;
   /**
+   * Skill access: when set, the bot gets list_skills + use_skill over the
+   * global library AND its own skills dir (install_skill stays stripped).
+   */
+  skillLoader?: SkillLoader;
+  /**
    * Sandbox areas granted implicitly (read/write/execute, no ask, no
    * persona declaration): deps.botDir/sandbox (private workspace) and the
    * fleet-shared folder next to the bots root. Unset = not granted.
@@ -63,7 +69,7 @@ export interface BotRegistryDeps {
  * - no persistent-manifest writes: interactive mutation tools are stripped
  */
 export function createBotCapabilityRegistry(deps: BotRegistryDeps): CapabilityRegistry {
-  const registry = new CapabilityRegistry();
+  const registry = new CapabilityRegistry(deps.skillLoader);
   const pm = registry.permissions;
 
   // Reshape the manifest in place (never call save() — that writes the
