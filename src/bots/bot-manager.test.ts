@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { mkdirSync, mkdtempSync, rmSync, existsSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, existsSync, writeFileSync, readFileSync, utimesSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -761,6 +761,21 @@ describe('Bot fleets (lead + crew)', () => {
     // Cycle/nesting guards: depth cap and ancestor rejection
     expect(manager.addCrew('scout', { id: 'ceo', name: 'Nope' })).toMatchObject({ ok: false });
     expect(manager.addCrew('scout', { id: 'scout', name: 'Self' })).toMatchObject({ ok: false });
+  });
+
+  it('hand-edited bot.yaml tools apply on the next build (no restart needed)', () => {
+    store.create({ id: 'handedit', name: 'Handedit' });
+    const before = runtimeFor('handedit').tools;
+    expect(before.run_command).toBeUndefined(); // fail-closed default
+    // External hand-edit: drop run_command from the deny list (explicit tools
+    // block is respected as-written) + bump mtime.
+    const file = join(root, 'bots', 'handedit', 'bot.yaml');
+    writeFileSync(file, readFileSync(file, 'utf-8')
+      .replace('    - run_command\n', ''), 'utf-8');
+    utimesSync(file, new Date(), new Date());
+    const after = runtimeFor('handedit').tools;
+    expect(after.run_command).toBeDefined();
+    expect(after.write_file).toBeUndefined(); // still denied
   });
 
   it('solo bots never get fleet tools', () => {

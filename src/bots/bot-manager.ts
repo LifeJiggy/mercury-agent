@@ -1,6 +1,7 @@
 import { cpus } from 'node:os';
 import { randomUUID } from 'node:crypto';
-import { resolve } from 'node:path';
+import { resolve, join } from 'node:path';
+import { statSync } from 'node:fs';
 import type { Tool } from 'ai';
 import type { MercuryConfig } from '../utils/config.js';
 import type { ProviderRegistry } from '../providers/registry.js';
@@ -8,7 +9,7 @@ import type { TokenBudget } from '../utils/tokens.js';
 import type { CapabilityRegistry } from '../capabilities/registry.js';
 import type { UserMemoryStore } from '../memory/user-memory.js';
 import { UserMemoryStore as UserMemoryStoreImpl } from '../memory/user-memory.js';
-import { BotStore, BOT_JOURNAL_FILENAME, isValidCronExpression } from './store.js';
+import { BotStore, BOT_JOURNAL_FILENAME, BOT_PERMISSIONS_FILENAME, isValidCronExpression } from './store.js';
 import { BotJournal } from './journal.js';
 import { BotQueue, idempotencyKeyFor, LEASE_SECONDS, type DurableBotJob } from './queue.js';
 import { createBotCapabilityRegistry, filterBotTools } from './registry-factory.js';
@@ -144,7 +145,7 @@ export class BotManager {
   private mailboxes: Map<string, BotTurnMail[]> = new Map();
   private running: Map<string, Set<string>> = new Map(); // botId → running job ids
   private aborts: Map<string, AbortController> = new Map(); // job key → controller
-  private registries: Map<string, { registry: CapabilityRegistry; tools: Record<string, Tool>; skillsPrompt: string }> = new Map();
+  private registries: Map<string, { registry: CapabilityRegistry; tools: Record<string, Tool>; skillsPrompt: string; manifest: BotManifest; permsMtimeMs: number }> = new Map();
   private activity: Map<string, string> = new Map(); // botId → current activity
   private lastRun: Map<string, { at: number; state: BotRunRecord['state'] }> = new Map();
   private needsYou: Set<string> = new Set();
@@ -628,8 +629,17 @@ export class BotManager {
   }
 
   private getOrCreateRuntime(botId: string, manifest: BotManifest): { registry: CapabilityRegistry; tools: Record<string, Tool>; skillsPrompt: string } {
+    // Staleness check: the toolset bakes in the manifest (tools.deny/allow,
+    // fleetRole) and permissions.yaml (path scopes). Hand-edits to those files
+    // must apply on the next turn — the manifest cache makes identity a
+    // reliable change signal (same object unless the file changed on disk).
+    const permsFile = join(this.store.botDir(botId), BOT_PERMISSIONS_FILENAME);
+    let permsMtimeMs = 0;
+    try { permsMtimeMs = statSync(permsFile).mtimeMs; } catch { /* no file yet */ }
     const cached = this.registries.get(botId);
-    if (cached) return cached as { registry: CapabilityRegistry; tools: Record<string, Tool>; skillsPrompt: string };
+    if (cached && cached.manifest === manifest && cached.permsMtimeMs === permsMtimeMs) {
+      return cached as { registry: CapabilityRegistry; tools: Record<string, Tool>; skillsPrompt: string };
+    }
     // Skill access: global (native) library + the bot's own skills dir
     // (auto-synthesized + hand-authored; own-dir names win on collision).
     // Default root = <botsRoot>/../skills — ~/.mercury/skills in production,
@@ -686,7 +696,7 @@ export class BotManager {
     if (this.scheduler) {
       filtered.bot_schedule = createBotScheduleTool(this.scheduler, botId);
     }
-    this.registries.set(botId, { registry, tools: filtered, skillsPrompt });
+    this.registries.set(botId, { registry, tools: filtered, skillsPrompt, manifest, permsMtimeMs });
     return { registry, tools: filtered, skillsPrompt };
   }
 
