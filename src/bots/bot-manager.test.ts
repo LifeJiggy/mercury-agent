@@ -525,6 +525,87 @@ describe('Per-bot permission isolation (fail-closed)', () => {
     expect(insideVerdict.allowed).toBe(true);
   });
 
+  describe('bot shell allow-list (autoApproveCommands)', () => {
+    it('runs an allow-listed command in fail-closed mode without prompting', async () => {
+      const manifest = store.create({ id: 'sheller', name: 'Sheller' }) as BotManifest;
+      store.writePermissions('sheller', {
+        paths: [{ scope: 'self', read: true, write: true }],
+        autoApproveCommands: ['node *', 'python3 *'],
+      });
+      const registry = createBotCapabilityRegistry({
+        botId: 'sheller',
+        manifest,
+        botDir: store.botDir('sheller'),
+        permissions: store.readPermissions('sheller'),
+        userMemory: null,
+        config: getDefaultConfig() as MercuryConfig,
+      });
+      const pm = registry.permissions;
+      await expect(pm.checkShellCommand('node script.js --flag')).resolves.toMatchObject({ allowed: true, needsApproval: false });
+      await expect(pm.checkShellCommand('python3 -m foo')).resolves.toMatchObject({ allowed: true, needsApproval: false });
+      // Not on the allow-list: still denied (fail-closed, no ask handler).
+      await expect(pm.checkShellCommand('curl evil.example')).resolves.toMatchObject({ allowed: false });
+    });
+
+    it('needsApproval patterns win over the same autoApprove pattern (deny)', async () => {
+      const manifest = store.create({ id: 'guarded', name: 'Guarded' }) as BotManifest;
+      store.writePermissions('guarded', {
+        paths: [{ scope: 'self', read: true, write: true }],
+        autoApproveCommands: ['npm *'],
+        blockedCommands: ['npm publish *'],
+      });
+      const registry = createBotCapabilityRegistry({
+        botId: 'guarded',
+        manifest,
+        botDir: store.botDir('guarded'),
+        permissions: store.readPermissions('guarded'),
+        userMemory: null,
+        config: getDefaultConfig() as MercuryConfig,
+      });
+      const pm = registry.permissions;
+      await expect(pm.checkShellCommand('npm run build')).resolves.toMatchObject({ allowed: true, needsApproval: false });
+      // blockedCommands always wins — merged into the global blocked list.
+      await expect(pm.checkShellCommand('npm publish @scope/pkg')).resolves.toMatchObject({ allowed: false });
+    });
+
+    it('segments the command: an approved base cannot launder a chained destructive command', async () => {
+      const manifest = store.create({ id: 'chained', name: 'Chained' }) as BotManifest;
+      store.writePermissions('chained', {
+        paths: [{ scope: 'self', read: true, write: true }],
+        autoApproveCommands: ['echo *'],
+      });
+      const registry = createBotCapabilityRegistry({
+        botId: 'chained',
+        manifest,
+        botDir: store.botDir('chained'),
+        permissions: store.readPermissions('chained'),
+        userMemory: null,
+        config: getDefaultConfig() as MercuryConfig,
+      });
+      const pm = registry.permissions;
+      await expect(pm.checkShellCommand('echo hello')).resolves.toMatchObject({ allowed: true, needsApproval: false });
+      await expect(pm.checkShellCommand('echo hi; reboot now')).resolves.toMatchObject({ allowed: false });
+      await expect(pm.checkShellCommand('echo $(rm -rf ~)')).resolves.toMatchObject({ allowed: false });
+    });
+
+    it('rejects a literal "*" autoApprove pattern (no allow-all for bots)', () => {
+      const manifest = store.create({ id: 'greedy', name: 'Greedy' }) as BotManifest;
+      store.writePermissions('greedy', {
+        paths: [{ scope: 'self', read: true, write: true }],
+        autoApproveCommands: ['*'],
+      });
+      const registry = createBotCapabilityRegistry({
+        botId: 'greedy',
+        manifest,
+        botDir: store.botDir('greedy'),
+        permissions: store.readPermissions('greedy'),
+        userMemory: null,
+        config: getDefaultConfig() as MercuryConfig,
+      });
+      expect(registry.permissions.getManifest().capabilities.shell.autoApproved).toEqual([]);
+    });
+  });
+
   it('strips interactive and global-mutation tools from every bot toolset', () => {
     const manifest = store.create({ id: 'writer', name: 'Writer' }) as BotManifest;
     const registry = createBotCapabilityRegistry({

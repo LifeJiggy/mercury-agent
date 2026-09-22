@@ -95,7 +95,19 @@ export function createBotCapabilityRegistry(deps: BotRegistryDeps): CapabilityRe
     );
   }
   manifest.capabilities.filesystem.scopes = buildBotScopes(granted, deps.botDir);
+  // Shell execution: instead of emptying autoApproved (which made every
+  // non-safe-read command deny, breaking browser/file tooling), bots declare
+  // their own allow-list via permissions.yaml autoApproveCommands. It is
+  // carried in a dedicated PermissionManager field (NOT the manifest list)
+  // so an ambient global autoApproved entry can never silently elevate an
+  // unattended context. Fail-closed stays intact: no ask handler,
+  // needsApproval wins, the global blocked list wins, and a literal "*"
+  // grant is dropped (allow-all stays interactive-only).
+  const approvedCommands = (deps.permissions.autoApproveCommands ?? [])
+    .map(c => c.trim())
+    .filter(c => c.length > 0 && c !== '*');
   manifest.capabilities.shell.autoApproved = [];
+  pm.setBotShellAllowList(approvedCommands);
   manifest.capabilities.shell.blocked = [
     ...new Set([...manifest.capabilities.shell.blocked, ...(deps.permissions.blockedCommands ?? [])]),
   ];

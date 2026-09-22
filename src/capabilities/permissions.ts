@@ -306,6 +306,14 @@ export class PermissionManager {
 
   private tempScopes: FileScope[] = [];
 
+  /**
+   * Bot-scoped shell allow-list (fail-closed runtimes): patterns the bot's
+   * permissions.yaml explicitly granted. Kept separate from the manifest's
+   * autoApproved so an ambient global list (e.g. a user-approved "node *")
+   * can never silently elevate an unattended context.
+   */
+  private botShellAllowList?: string[];
+
   constructor() {
     this.cwd = process.cwd();
     this.manifest = this.load();
@@ -313,6 +321,21 @@ export class PermissionManager {
 
   setFailClosed(value: boolean): void {
     this.failClosed = value;
+  }
+
+  /**
+   * Bot-only shell allow-list (fail-closed contexts): explicit grants from
+   * the bot's permissions.yaml. A literal "*" is dropped — allow-all is an
+   * interactive-mode concept, not a bot grant.
+   */
+  setBotShellAllowList(patterns: string[]): void {
+    this.botShellAllowList = (patterns ?? [])
+      .map(p => p.trim())
+      .filter(p => p.length > 0 && p !== '*');
+  }
+
+  getBotShellAllowList(): string[] {
+    return [...(this.botShellAllowList ?? [])];
   }
 
   isFailClosed(): boolean {
@@ -565,6 +588,30 @@ export class PermissionManager {
       }
     }
 
+    // Bot allow-list (fail-closed only): set explicitly by the bot runtime
+    // (registry-factory from permissions.yaml autoApproveCommands) — never
+    // the ambient global autoApproved list, which stays decorative for
+    // unattended contexts. Placement AFTER the cwd-containment gate means a
+    // broad pattern like "cat *" can never launder a path outside granted
+    // scopes; needsApproval wins (the same pattern in both lists means
+    // deny); a bare "*" is rejected at grant time — allow-all is an
+    // interactive-mode concept, not a bot grant. Safe-read commands stay
+    // fully covered by the allSegmentsSafeRead lane below.
+    if (this.failClosed && this.botShellAllowList && this.botShellAllowList.length > 0) {
+      const needsApprovalList = shell.needsApproval ?? [];
+      const botList = this.botShellAllowList;
+      const allSegmentsApproved = segments.every((segment) =>
+        botList.some((pattern) =>
+          pattern.trim() !== '*' && this.matchPattern(segment, pattern)
+        )
+        && !needsApprovalList.some((pattern) => this.matchPattern(segment, pattern))
+      );
+      if (allSegmentsApproved) {
+        logger.info({ cmd: trimmed }, 'Shell command auto-approved (bot allow-list)');
+        return { allowed: true, needsApproval: false };
+      }
+    }
+
     // In ask-me mode: only auto-approve when EVERY segment is a safe read.
     // Matching the full trimmed string would let `cat foo; rm -rf ~` slip
     // through because `cat *` matches the entire concatenation.
@@ -655,13 +702,20 @@ export class PermissionManager {
 
   private findScope(resolvedPath: string): FileScope | undefined {
     const scopes = this.manifest.capabilities.filesystem.scopes;
+    // Most-specific scope wins: a deep grant (e.g. ~/.mercury/tam rwx) must
+    // not be shadowed by a broad read-only ancestor (e.g. ~/.mercury r).
+    let best: FileScope | undefined;
+    let bestLen = -1;
     for (const scope of scopes) {
       const scopeResolved = resolve(scope.path.replace(/^~/, homedir()));
       if (resolvedPath === scopeResolved || resolvedPath.startsWith(scopeResolved + sep)) {
-        return scope;
+        if (scopeResolved.length > bestLen) {
+          best = scope;
+          bestLen = scopeResolved.length;
+        }
       }
     }
-    return undefined;
+    return best;
   }
 
   async requestScopeExternal(path: string, mode: 'read' | 'write'): Promise<{ allowed: boolean; reason?: string }> {

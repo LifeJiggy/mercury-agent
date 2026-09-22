@@ -108,6 +108,15 @@ export interface BotManifest {
 export interface BotPermissionsFile {
   paths?: BotPathScope[];
   blockedCommands?: string[];
+  /**
+   * Shell command patterns this bot may run without approval (e.g.
+   * ["node *", "python3 *"]). Each is merged into the bot registry's
+   * shell.autoApproved list and checked per pipeline segment; the global
+   * blocked-command list still wins, and patterns also present in
+   * needsApproval are treated as denied (needsApproval wins). The literal
+   * "*" (allow-all) is rejected.
+   */
+  autoApproveCommands?: string[];
 }
 
 export interface BotPathScope {

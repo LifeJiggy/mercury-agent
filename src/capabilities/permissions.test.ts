@@ -91,6 +91,20 @@ describe('fail-closed execute scopes (bots)', () => {
     const permissions = managerWithExecuteScope();
     await expect(permissions.checkShellCommand('/tmp/execdir/run.sh --serve')).resolves.toMatchObject({ allowed: true, needsApproval: false });
   });
+
+  it('an ambient global autoApproved list never elevates a fail-closed context', async () => {
+    const permissions = managerWithExecuteScope();
+    // Simulate a global permissions.yaml where the user approved "node *":
+    // an unattended bot must NOT inherit it.
+    permissions.getManifest().capabilities.shell.autoApproved = ['node *'];
+    await expect(permissions.checkShellCommand('node script.js')).resolves.toMatchObject({ allowed: false });
+    // Explicit bot grants DO apply.
+    permissions.setBotShellAllowList(['node *']);
+    await expect(permissions.checkShellCommand('node script.js')).resolves.toMatchObject({ allowed: true, needsApproval: false });
+    // needsApproval still wins over the bot list.
+    permissions.getManifest().capabilities.shell.needsApproval = ['node *'];
+    await expect(permissions.checkShellCommand('node script.js')).resolves.toMatchObject({ allowed: false });
+  });
 });
 
 describe('fail-closed skill elevation', () => {
@@ -103,6 +117,21 @@ describe('fail-closed skill elevation', () => {
     // Without the guard, elevation would bypass the fail-closed gates.
     await expect(permissions.checkFsAccess('/etc/hosts', 'write')).resolves.toMatchObject({ allowed: false });
     await expect(permissions.checkShellCommand('npm install')).resolves.toMatchObject({ allowed: false });
+  });
+});
+
+describe('most-specific scope wins', () => {
+  it('a deep grant is not shadowed by a broader read-only ancestor', async () => {
+    const permissions = new PermissionManager();
+    permissions.getManifest().capabilities.filesystem.scopes = [
+      { path: '/tmp/root', read: true, write: false },
+      { path: '/tmp/root/deep', read: true, write: true },
+    ];
+    permissions.setFailClosed(true);
+    permissions.setCurrentContext('bot', 'worker');
+    await expect(permissions.checkFsAccess('/tmp/root/deep/file.txt', 'write')).resolves.toMatchObject({ allowed: true });
+    await expect(permissions.checkFsAccess('/tmp/root/other.txt', 'write')).resolves.toMatchObject({ allowed: false });
+    await expect(permissions.checkFsAccess('/tmp/root/other.txt', 'read')).resolves.toMatchObject({ allowed: true });
   });
 });
 
