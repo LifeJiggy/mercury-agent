@@ -386,12 +386,15 @@ function journalTreeSize(dir: string): number {
 }
 
 function normalizeBotManifest(raw: Partial<BotManifest>): BotManifest {
-  // Normalize deny list: dangerous tools are denied unless explicitly allowed
-  // via tools.allow. Deny always wins over allow.
+  // Tool defaults: an unconfigured bot (no tools key) gets the fail-closed
+  // dangerous-tool deny list. A bot with an EXPLICITLY configured tools block
+  // is respected exactly as written — this is what the onboarding permission
+  // tiers write, so hand-editing the deny list is a first-class way to grant
+  // or revoke (previously the materialized defaults made hand-edits sticky).
   const allow = raw.tools?.allow ?? [];
   const explicitDeny = raw.tools?.deny ?? [];
   const deny = new Set<string>(explicitDeny);
-  if (allow.length === 0) {
+  if (!raw.tools && allow.length === 0) {
     for (const t of BOT_DANGEROUS_TOOLS) deny.add(t);
   }
   return {

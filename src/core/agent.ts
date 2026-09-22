@@ -26,6 +26,7 @@ import type { SkillLoader } from '../skills/loader.js';
 import { logger } from '../utils/logger.js';
 import { refinePersona } from '../bots/persona-template.js';
 import { proposeCrew } from '../bots/fleet-onboarding.js';
+import { PERMISSION_TIERS, applyPermissionTier, isPermissionTier, type PermissionTier } from '../bots/permission-tiers.js';
 import { applyBotFieldPatch } from '../bots/edit.js';
 import { CLIChannel } from '../channels/cli.js';
 import { TelegramChannel } from '../channels/telegram.js';
@@ -1187,8 +1188,9 @@ export class Agent {
     const mode = finalPersona === raw ? 'as-is' : 'as a structured template';
     await channel.send(`✍️ Persona saved ${mode}.`, `bot:${botId}`).catch(() => {});
 
-    // New-bot onboarding: solo vs fleet step (personas edited later never ask).
+    // New-bot onboarding: permission tier, then solo vs fleet (edits later never ask).
     if (newlyCreated) {
+      await this.offerPermissionTier(bm, botId, manifest.name, msg, channel);
       await this.offerFleetStep(bm, botId, manifest.name, msg, channel);
     }
 
@@ -1205,6 +1207,29 @@ export class Agent {
       `Editable anytime: \`/bots budget ${botId} <tokens|suggest|none>\`. Or just type your first task — the budget stays unset.`,
       `bot:${botId}`,
     ).catch(() => {});
+  }
+
+  /**
+   * Permission-tier onboarding step (new bots only): one clear question
+   * instead of silent fail-closed defaults + manual file editing. Change
+   * anytime with `/bots permissions <id> <tier>`.
+   */
+  private async offerPermissionTier(bm: import('../bots/bot-manager.js').BotManager, botId: string, botName: string, msg: ChannelMessage, channel: any): Promise<void> {
+    let choice = 'Read-only (recommended default)';
+    try {
+      choice = await this.presentChoice(
+        `What should **${botName}** be allowed to do? (Path scopes always stay fail-closed — a tool only reaches what its Access grants cover.)`,
+        Object.values(PERMISSION_TIERS).map(t => `${t.label} — ${t.description}`),
+        msg.channelId,
+        msg.channelType as any,
+      );
+    } catch {
+      choice = 'Read-only (recommended default)';
+    }
+    const tier = (Object.entries(PERMISSION_TIERS).find(([, t]) => choice.startsWith(t.label))?.[0] ?? 'readonly') as PermissionTier;
+    bm.store.update(botId, m => applyPermissionTier(m, tier));
+    bm.invalidateRuntime(botId);
+    await channel.send(`🔐 Permissions for **${botName}**: **${PERMISSION_TIERS[tier].label}**. Change anytime with \`/bots permissions ${botId} <readonly|builder|operator|full>\`.`, `bot:${botId}`).catch(() => {});
   }
 
   /**
@@ -1390,7 +1415,7 @@ export class Agent {
     const action = (parts[0] ?? '').toLowerCase();
 
     // All bot-targeting actions accept id OR name — resolve to the id here.
-    if (['open', 'send', 'journal', 'inbox', 'budget', 'edit', 'delete', 'enable', 'disable', 'stop', 'pause', 'start', 'run', 'persona', 'crew', 'add-crew', 'remove-crew', 'promote', 'demote'].includes(action) && parts[1]) {
+    if (['open', 'send', 'journal', 'inbox', 'budget', 'edit', 'delete', 'enable', 'disable', 'stop', 'pause', 'start', 'run', 'persona', 'crew', 'add-crew', 'remove-crew', 'promote', 'demote', 'permissions'].includes(action) && parts[1]) {
       const resolved = bm.resolveBotId(parts[1]);
       if (resolved) parts[1] = resolved;
     }
@@ -1770,6 +1795,33 @@ export class Agent {
       return;
     }
 
+    if (action === 'permissions') {
+      // /bots permissions <id> [tier] — show or set the capability tier.
+      const target = parts[1]?.toLowerCase();
+      const tierArg = (parts[2] ?? '').toLowerCase();
+      if (!target || !bm.store.exists(target)) {
+        await channel.send('Usage: `/bots permissions <id> [readonly|builder|operator|full]` — omit the tier to see the current one.', channelId);
+        return;
+      }
+      if (!tierArg) {
+        const m = bm.store.get(target)!;
+        const deny = new Set(m.tools?.deny ?? []);
+        const matched = Object.entries(PERMISSION_TIERS).find(([, t]) => t.deny.length === deny.size && t.deny.every(d => deny.has(d)))?.[0];
+        const current = matched ?? 'custom';
+        const effective = deny.has('run_command') ? 'no shell' : 'shell within its path scopes';
+        await channel.send(`🔐 **${target}**: ${current} (deny: ${[...deny].join(', ') || 'none'}) — ${effective}. Set with \`/bots permissions ${target} <readonly|builder|operator|full>\`.`, channelId);
+        return;
+      }
+      if (!isPermissionTier(tierArg)) {
+        await channel.send('Unknown tier — use `readonly`, `builder`, `operator`, or `full`.', channelId);
+        return;
+      }
+      bm.store.update(target, m => applyPermissionTier(m, tierArg));
+      bm.invalidateRuntime(target);
+      await channel.send(`🔐 Permissions for **${target}**: **${PERMISSION_TIERS[tierArg].label}** — ${PERMISSION_TIERS[tierArg].description}\n(Path scopes are untouched and always enforced.)`, channelId);
+      return;
+    }
+
     if (action === 'promote' || action === 'demote') {
       // /bots promote <id> — solo/crew → fleet lead (demote: lead → solo).
       const target = parts[1]?.toLowerCase();
@@ -1920,6 +1972,7 @@ export class Agent {
       '`/bots run <id> [routineName]` — fire a routine now, or a bare wake turn\n' +
       '`/bots crew <leadId>` — fleet tree with per-crew runs\n' +
       '`/bots promote <id>` / demote — make a bot a fleet lead (it then self-organizes) / back to solo\n' +
+      '`/bots permissions <id> [tier]` — capability tier: readonly | builder | operator | full\n' +
       '`/bots add-crew <leadId> <id> "Name" "Desc" ["persona"]` — add a sub-bot to a fleet\n' +
       '`/bots remove-crew <leadId> <crewId>` — retire a crew member\n' +
       '`/bots delete <id> confirm` — permanently delete',

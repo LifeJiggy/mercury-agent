@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { refinePersona } from './persona-template.js';
+import { PERMISSION_TIERS, applyPermissionTier } from './permission-tiers.js';
 
 const scriptedResponses: string[] = [];
 
@@ -164,5 +165,21 @@ Concise.
     const result = await refinePersona(longRaw, 'Research', flakyInventory);
     expect(calls).toBe(2);
     expect(result).toContain('# Research');
+  });
+});
+describe('permission tiers (onboarding question backend)', () => {
+  it('tiers produce the documented deny lists', () => {
+    const m: any = {};
+    applyPermissionTier(m, 'readonly');
+    expect(m.tools.deny).toContain('run_command');
+    expect(m.tools.deny).toContain('write_file');
+    applyPermissionTier(m, 'builder');
+    expect(m.tools.deny).toContain('run_command');
+    expect(m.tools.deny).not.toContain('write_file');
+    applyPermissionTier(m, 'operator');
+    expect(m.tools.deny).not.toContain('run_command');
+    expect(m.tools.deny).toContain('delete_file');
+    applyPermissionTier(m, 'full');
+    expect(m.tools.deny).toEqual([]);
   });
 });
