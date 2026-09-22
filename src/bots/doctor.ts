@@ -46,6 +46,21 @@ export function runBotDoctor(deps: DoctorDeps): DoctorReport {
       findings.push({ botId: manifest.id, severity: 'error', check: 'config', detail: errors.join('; ') });
     }
 
+    // Malformed permissions.yaml entries (missing/empty `scope` — typically a
+    // hand-edit typo) are skipped by the registry at build time; flag them so
+    // the grant silently NOT applying is visible (the cron-doctor class of
+    // "configured but not effective").
+    const perms = deps.store.readPermissions(manifest.id);
+    const malformed = (perms.paths ?? []).filter(p => !p || typeof p.scope !== 'string' || p.scope.trim().length === 0);
+    if (malformed.length > 0) {
+      findings.push({
+        botId: manifest.id,
+        severity: 'error',
+        check: 'permissions',
+        detail: `${malformed.length} path-scope entr(ies) missing a "scope" value in permissions.yaml — the grant is skipped (check for typos like "socpe:")`,
+      });
+    }
+
     const dlqDepth = dlqByBot.get(manifest.id) ?? 0;
     if (dlqDepth > 0) {
       findings.push({

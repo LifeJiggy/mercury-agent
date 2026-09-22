@@ -69,7 +69,14 @@ export function createBotCapabilityRegistry(deps: BotRegistryDeps): CapabilityRe
   // Reshape the manifest in place (never call save() — that writes the
   // global ~/.mercury/permissions.yaml, and bots have no path to it).
   const manifest = pm.getManifest();
-  const granted = mergeScopeGrants(deps.permissions.paths, parsePersonaAccess(deps.persona ?? ''));
+  // Malformed scope entries (missing/empty `scope` — e.g. a hand-edited
+  // permissions.yaml typo) must never crash every turn: skip + warn.
+  const fileGrants = (deps.permissions.paths ?? []).filter(isValidScopeEntry);
+  const skipped = (deps.permissions.paths?.length ?? 0) - fileGrants.length;
+  if (skipped > 0) {
+    logger.warn({ botId: deps.botId, skipped }, 'Malformed path-scope entries in permissions.yaml (missing "scope") skipped');
+  }
+  const granted = mergeScopeGrants(fileGrants, parsePersonaAccess(deps.persona ?? ''));
   // Implicit sandbox grants come LAST and are never user-configurable away:
   // the private workspace and the fleet-shared folder are the bot's built-in
   // work areas (read/write/execute, no ask, no declaration).
@@ -160,9 +167,15 @@ function normalizeScopeKey(scope: string): string {
  * (fail-closed) — but the store always writes a default self scope at
  * creation.
  */
+/** A scope entry is usable only with a non-empty string scope. */
+function isValidScopeEntry(p: BotPathScope | undefined): boolean {
+  return !!p && typeof p.scope === 'string' && p.scope.trim().length > 0;
+}
+
 function buildBotScopes(paths: BotPathScope[] | undefined, botDir: string): Array<{ path: string; read: boolean; write: boolean; execute?: boolean }> {
   const scopes: Array<{ path: string; read: boolean; write: boolean; execute?: boolean }> = [];
   for (const p of paths ?? []) {
+    if (!isValidScopeEntry(p)) continue;
     const resolved = p.scope === 'self'
       ? resolve(botDir)
       : resolve(p.scope.replace(/^~/, homedir()));

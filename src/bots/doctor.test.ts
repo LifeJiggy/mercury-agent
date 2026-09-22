@@ -103,6 +103,21 @@ describe('runBotDoctor', () => {
     expect(report.healthy).toBe(false);
   });
 
+  it('flags malformed permissions.yaml entries (missing "scope") as an error', () => {
+    store.create({ id: 'researcher', name: 'Research' });
+    store.writePermissions('researcher', {
+      paths: [
+        { scope: 'self', read: true, write: true },
+        { socpe: '/tmp/cookies', read: true } as unknown as { scope: string; read: boolean },
+      ],
+    });
+    const report = runBotDoctor({ store, queue, journalFor: () => journal });
+    const finding = report.findings.find(f => f.botId === 'researcher' && f.check === 'permissions');
+    expect(finding?.severity).toBe('error');
+    expect(finding?.detail).toContain('socpe');
+    expect(report.healthy).toBe(false);
+  });
+
   it('formatDoctorReport maps unhealthy to an actionable message', () => {
     const healthy = formatDoctorReport({ findings: [], healthy: true, checked: 2 });
     expect(healthy).toContain('healthy');

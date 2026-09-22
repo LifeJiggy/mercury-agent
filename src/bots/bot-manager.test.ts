@@ -407,6 +407,31 @@ describe('Per-bot permission isolation (fail-closed)', () => {
     expect(scopes.some(s => s.path === '/tmp/execdir' && s.execute)).toBe(true);
   });
 
+  it('a malformed permissions.yaml entry (missing "scope") is skipped, not fatal', () => {
+    // Hand-edit typo class: `socpe:` instead of `scope:` — the registry build
+    // must never crash every turn over it (the entry is just skipped).
+    const manifest = store.create({ id: 'typo', name: 'Typo' }) as BotManifest;
+    store.writePermissions('typo', {
+      paths: [
+        { scope: 'self', read: true, write: true },
+        { socpe: '/tmp/cookies', read: true } as unknown as { scope: string; read: boolean },
+      ],
+    });
+    const registry = createBotCapabilityRegistry({
+      botId: 'typo',
+      manifest,
+      botDir: store.botDir('typo'),
+      permissions: store.readPermissions('typo'),
+      persona: store.readPersona('typo'),
+      userMemory: null,
+      config: getDefaultConfig() as MercuryConfig,
+    });
+    const scopes = registry.permissions.getManifest().capabilities.filesystem.scopes;
+    // The malformed entry contributed nothing; the valid self scope survived.
+    expect(scopes).toHaveLength(1);
+    expect(scopes[0].path).toBe(store.botDir('typo'));
+  });
+
   it('a persona without an Access section changes nothing (current permissions apply)', () => {
     const manifest = store.create({ id: 'plainbot', name: 'Plainbot' }) as BotManifest;
     const registry = createBotCapabilityRegistry({
