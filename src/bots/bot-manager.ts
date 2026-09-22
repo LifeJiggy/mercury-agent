@@ -74,6 +74,8 @@ export interface BotManagerDeps {
 
 const MAX_TRANSIENT_ATTEMPTS = 3;
 const MAILBOX_CAPACITY = 100;
+/** Bot-thread result display cap — matches CLIChannel.MAX_MESSAGE_CHARS (64KB). */
+const BOT_RESULT_DISPLAY_CAP = 64 * 1024;
 
 /** Bare wake turn (`/bots run <id>` with no routine): the bot gets a real
  * turn with no task attached — it checks its mailbox and standing work. */
@@ -487,9 +489,15 @@ export class BotManager {
       if (this.notify && job.trigger !== 'mailbox') {
         const botThread = `bot:${botId}`;
         const icon = output.status === 'completed' ? '🤖' : output.status === 'failed' ? '❌' : output.status === 'halted' ? '⏹' : '⏸';
+        // Full result, matched to the channel's per-message cap (64KB) — the
+        // bot thread is the primary delivery surface, so results must arrive
+        // complete (tables, code, lists), not sliced at a pointer-era 800.
+        const body = output.output.length > BOT_RESULT_DISPLAY_CAP
+          ? output.output.slice(0, BOT_RESULT_DISPLAY_CAP) + `\n\n[…output truncated at ${Math.round(BOT_RESULT_DISPLAY_CAP / 1024)}KB — full text in the run transcripts]`
+          : output.output;
         const fullText = output.status === 'halted'
           ? `⏹ Run ${job.id} was stopped by you — no further output. It is recorded in \`/bots journal ${botId}\`.`
-          : `${icon} (${job.trigger}): ${output.output.slice(0, 800)}`;
+          : `${icon} (${job.trigger}): ${body}`;
         // 1. Full result → the bot's own thread, always.
         await this.notify('cli', botThread, fullText).catch((e) =>
           logger.warn({ e, botId }, 'Bot result deliver to bot thread failed'));

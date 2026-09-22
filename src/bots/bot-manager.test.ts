@@ -117,6 +117,18 @@ describe('BotManager queue + turn lifecycle', () => {
     expect(summary?.lastRunState).toBe('completed');
   });
 
+  it('bot-thread delivery is NOT sliced at the old 800-char cap', async () => {
+    const long = 'x'.repeat(700) + 'MIDDLE-MARKER' + 'y'.repeat(700);
+    mockedGenerateText.mockResolvedValue({ text: long, finishReason: 'stop', usage: { inputTokens: 1, outputTokens: 1 } } as any);
+    seedBot(store, 'reporter');
+    const delivered: Array<{ target: string; message: string }> = [];
+    manager['notify'] = async (_t, target, message) => { delivered.push({ target, message }); };
+    manager.enqueue('reporter', { trigger: 'chat', prompt: 'long report please' });
+    await vi.waitFor(() => {
+      expect(delivered.some(d => d.target === 'bot:reporter' && d.message.includes('MIDDLE-MARKER'))).toBe(true);
+    });
+  });
+
   it('remote source channels still receive the full result (no bot threads there)', async () => {
     mockedGenerateText.mockResolvedValue({ text: 'remote done', finishReason: 'stop', usage: { inputTokens: 10, outputTokens: 5 } } as any);
     seedBot(store, 'courier');
