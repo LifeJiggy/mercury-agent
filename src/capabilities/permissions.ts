@@ -303,6 +303,7 @@ export class PermissionManager {
    * everything else denies. Never combined with autoApproveAll.
    */
   private failClosed = false;
+  private currentSenderRole: 'admin' | 'member' | undefined;
 
   private tempScopes: FileScope[] = [];
 
@@ -353,6 +354,14 @@ export class PermissionManager {
 
   getCurrentChannelType(): string {
     return this.currentChannelType;
+  }
+
+  setCurrentSenderRole(role: 'admin' | 'member' | undefined): void {
+    this.currentSenderRole = role;
+  }
+
+  getCurrentSenderRole(): 'admin' | 'member' | undefined {
+    return this.currentSenderRole;
   }
 
   onAsk(handler: (prompt: string) => Promise<string>): void {
