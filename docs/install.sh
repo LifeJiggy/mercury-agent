@@ -163,7 +163,10 @@ maybe_update_path() {
   case ":$PATH:" in *":$bin_dir:"*) return 0 ;; esac
 
   rc=$(shell_rc_file)
-  marker='# added by mercury installer'
+  # Channel-suffixed sentinel: stable and dev installs must not shadow each
+  # other's rc entries — a shared marker made the second channel's PATH
+  # append a silent no-op ("already present" while never adding its dir).
+  marker="# added by mercury installer ($CHANNEL)"
   if [ -f "$rc" ] && grep -Fq "$marker" "$rc" 2>/dev/null; then
     info "PATH entry already present in $(basename "$rc")"
     return 0
