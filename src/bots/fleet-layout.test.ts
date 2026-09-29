@@ -15,7 +15,7 @@ vi.mock('ai', async (importOriginal) => {
 function makeManager(root: string): BotManager {
   const config = getDefaultConfig() as MercuryConfig;
   config.bots.maxConcurrent = 4;
-  return new BotManager({
+  const manager = new BotManager({
     config,
     providers: {
       get: () => undefined,
@@ -30,7 +30,13 @@ function makeManager(root: string): BotManager {
     store: new Store(join(root, 'bots')),
     userMemoryFactory: () => null,
   });
+  activeManagers.push(manager);
+  return manager;
 }
+
+// Windows EBUSY guard: every BotManager owns an open SQLite queue handle;
+// afterEach disposes all of them before the tmpdir is deleted.
+const activeManagers: Array<{ dispose: () => void }> = [];
 
 describe('fleet physical layout (crew nests under the lead)', () => {
   let root: string;
@@ -42,6 +48,7 @@ describe('fleet physical layout (crew nests under the lead)', () => {
   });
 
   afterEach(() => {
+    for (const m of activeManagers.splice(0)) m.dispose();
     rmSync(root, { recursive: true, force: true });
   });
 
@@ -190,6 +197,7 @@ describe('fleet cascade delete (manager lifecycle)', () => {
   });
 
   afterEach(() => {
+    for (const m of activeManagers.splice(0)) m.dispose();
     rmSync(root, { recursive: true, force: true });
   });
 

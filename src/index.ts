@@ -2543,8 +2543,9 @@ async function runAgent(isDaemon: boolean = false): Promise<void> {
   }
 
   // Mercury Bots: fleet manager runs outside the main message queue.
+  let botManager: BotManager | undefined;
   if (config.bots?.enabled) {
-    const botManager = new BotManager({
+    const bot = new BotManager({
       config,
       providers,
       tokenBudget,
@@ -2556,21 +2557,22 @@ async function runAgent(isDaemon: boolean = false): Promise<void> {
         return new UserMemoryStore(config, `bot:${manifest.id}`);
       },
     });
-    botManager.setScheduler(scheduler);
+    botManager = bot;
+    bot.setScheduler(scheduler);
     // Startup migrations must run before routines register: fleet layout
     // (crew nesting + orphan cascade) and permission consolidation to the
     // single permissions.yaml source.
-    void botManager.migrateFleetLayout()
-      .then(() => botManager.migratePermissions())
-      .then(() => botManager.registerRoutines(scheduler));
-    agent.setBotManager(botManager);
-    setWebBotManager(botManager);
+    void bot.migrateFleetLayout()
+      .then(() => bot.migratePermissions())
+      .then(() => bot.registerRoutines(scheduler));
+    agent.setBotManager(bot);
+    setWebBotManager(bot);
     // Real-time bot activity bus → surfaces: the CLI bot-thread live region
     // (what the bot is doing RIGHT NOW while you watch its thread) and the
     // web SSE feed (dashboards / third-party backends). The roster's activity
     // label is updated inside the manager itself.
     const botCliChannel = channels.get('cli');
-    botManager.onBotActivity((ev) => {
+    bot.onBotActivity((ev) => {
       if (botCliChannel instanceof CLIChannel) botCliChannel.setBotLiveActivity(ev.botId, ev);
       webChannel.broadcastBotActivity(ev);
     });
@@ -2579,9 +2581,9 @@ async function runAgent(isDaemon: boolean = false): Promise<void> {
     }
     // Main-agent awareness: bots section in the system prompt + dispatch tool.
     capabilities.setBotDispatchHandler((botIdOrName, message, ctx) => {
-      const botId = botManager.resolveBotId(botIdOrName);
+      const botId = bot.resolveBotId(botIdOrName);
       if (!botId) return { accepted: false, reasonCode: 'target_unknown' };
-      const result = botManager.enqueue(botId, {
+      const result = bot.enqueue(botId, {
         trigger: 'chat',
         prompt: message,
         source: { channelType: ctx.channelType, channelId: ctx.channelId },
@@ -3609,6 +3611,9 @@ async function runAgent(isDaemon: boolean = false): Promise<void> {
         } catch {}
       }
       await stopWebServer();
+      // Release the bots' SQLite queue handle — on Windows an open handle
+      // keeps queue.db locked against any later uninstall/replace.
+      try { botManager?.dispose(); } catch { /* best effort */ }
       await agent.shutdown();
       clearCloudRuntimeOnline();
       releaseRuntimeProcess(runtimeMode);

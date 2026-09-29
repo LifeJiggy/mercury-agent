@@ -160,6 +160,8 @@ export class BotManager {
   /** Per-bot daily token usage: botId → { day (UTC yyyy-mm-dd), tokens }. */
   private dailyTokens: Map<string, { day: string; tokens: number }> = new Map();
   private pausedForBudget = new Set<string>();
+  /** Periodic due-sweep interval — cleared by dispose() (tests, shutdown). */
+  private dueTimer?: ReturnType<typeof setInterval>;
 
   constructor(deps: BotManagerDeps) {
     this.config = deps.config;
@@ -212,8 +214,8 @@ export class BotManager {
     };
     // Periodic due-sweep: retry-backoff jobs re-enter the in-memory queues
     // when their run_after elapses (also covers crash-restart backoffs).
-    const dueTimer = setInterval(() => this.resumeDueJobs(), 30_000);
-    dueTimer.unref?.();
+    this.dueTimer = setInterval(() => this.resumeDueJobs(), 30_000);
+    this.dueTimer.unref?.();
     // Real-time activity consumer registration happens via onBotActivity();
     // executeTurn feeds every registered listener AND the live `activity`
     // map (rendered by the /bots roster and fleet_status).
@@ -1219,6 +1221,20 @@ export class BotManager {
 - Bots share data through the fleet-shared folder (\`${this.store.sharedSandboxDir()}\`); each also has a private sandbox next to its persona. Their outputs land in their own threads.
 - The dispatch_bot tool lets you hand a task to a bot mid-conversation and continue talking; the result is delivered when the bot finishes.`);
     return lines.join('\n');
+  }
+
+  /**
+   * Release timers and native queue handles. Idempotent — safe to call twice.
+   * Teardown MUST run this before deleting the bots root: on Windows an open
+   * SQLite handle keeps queue.db locked and its directory impossible to
+   * remove (EBUSY). Wired into the process shutdown and every test teardown.
+   */
+  dispose(): void {
+    if (this.dueTimer) {
+      clearInterval(this.dueTimer);
+      this.dueTimer = undefined;
+    }
+    this.queue.close();
   }
 }
 

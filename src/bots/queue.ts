@@ -99,6 +99,13 @@ export interface BotQueueBackend {
   /** Remove every trace of a bot: jobs, mail, DLQ rows (delete lifecycle). */
   purgeBot(botId: string): void;
   counts(): QueueCounts;
+  /**
+   * Release native handles (the SQLite connection). Idempotent — a second
+   * close is a no-op. On Windows an open handle keeps the file locked
+   * (EBUSY on delete): teardown, fleet-delete cleanup, and shutdown must
+   * close before any directory removal.
+   */
+  close(): void;
 }
 
 export const LEASE_SECONDS = 60;
@@ -149,6 +156,11 @@ export class BotQueue {
       this.backend = new JsonFileQueueBackend(path, dlqCap);
     }
     logger.info({ backend: this.backend.name, path }, 'Bot queue initialized');
+  }
+
+  /** Release native handles (the SQLite connection). Idempotent. */
+  close(): void {
+    this.backend.close();
   }
 
   enqueue(job: Omit<DurableBotJob, 'state'>): { job: DurableBotJob; duplicated: boolean } {
@@ -409,6 +421,15 @@ export class SqliteQueueBackend implements BotQueueBackend {
     const dlq = (this.db.prepare(`SELECT COUNT(*) c FROM bot_dlq`).get() as any).c as number;
     return { pending, claimed, dlq };
   }
+
+  /** WAL checkpoints on close, releasing the -wal/-shm sidecars too. Idempotent. */
+  close(): void {
+    try {
+      this.db.close();
+    } catch {
+      // Already closed (double teardown must never throw).
+    }
+  }
 }
 
 // Minimal structural type for the better-sqlite3 API we use (avoids pulling
@@ -441,6 +462,9 @@ export class JsonFileQueueBackend implements BotQueueBackend {
   private file: string;
   private data: QueueFile;
   private dlqCap: number;
+
+  /** Writes are fd-opened-and-closed per op (write-to-rename + fsync) — nothing to release. */
+  close(): void { /* no native handles */ }
 
   constructor(dir: string, dlqCap: number) {
     mkdirSync(dir, { recursive: true });
