@@ -3,6 +3,11 @@ import { readFileSync } from "node:fs";
 
 const pkg = JSON.parse(readFileSync("./package.json", "utf8"));
 
+// Dev-channel builds (scripts/publish-dev.sh) stamp a version like
+// `1.2.8-dev.20260929.abc1234` so `mercury --version` identifies a dev
+// binary. Stable builds never set MERCURY_CHANNEL_VERSION → pkg.version.
+const channelVersion = process.env.MERCURY_CHANNEL_VERSION || pkg.version;
+
 export default defineConfig({
   entry: ["src/index.ts"],
   format: ["esm"],
@@ -17,7 +22,7 @@ export default defineConfig({
   // Inject the version so standalone binaries (Bun --compile) can read it
   // without trying to load package.json from disk.
   define: {
-    "globalThis.__MERCURY_VERSION__": JSON.stringify(pkg.version),
+    "globalThis.__MERCURY_VERSION__": JSON.stringify(channelVersion),
   },
   external: [
     "ai",
