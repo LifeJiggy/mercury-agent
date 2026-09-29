@@ -4591,10 +4591,10 @@ serviceCmd
   .action(async () => {
     console.log('');
     console.log(chalk.cyan(`  Mercury ${chalk.white(`v${pkgVersion}`)}`));
-    // `upgrade` targets the npm stable track; a dev binary installed via the
-    // dev installer has its own update path (re-run install-dev.sh).
+    // A dev binary upgrades itself in place on the same channel (re-running
+    // the dev installer below); npm builds take the npm stable track.
     if (isDevBuild(pkgVersion)) {
-      console.log(chalk.yellow('  ⚠ development build — upgrade via install-dev.sh, or this installs the stable channel'));
+      console.log(chalk.yellow('  ⚠ development build — upgrading within the dev channel (rolling mercury-dev-latest)'));
       console.log('');
     }
     console.log('');
@@ -4610,8 +4610,16 @@ serviceCmd
 
     if (standalone) {
       // Standalone binary: re-run the installer script which downloads the
-      // latest release from GitHub and replaces the binary in-place.
-      console.log(chalk.dim('  Standalone binary detected — re-running installer...'));
+      // latest release from GitHub and replaces the binary in-place. A dev
+      // build re-runs the DEV installer so `upgrade` stays on its channel —
+      // running the stable installer here would silently switch installs.
+      const isDev = isDevBuild(pkgVersion);
+      const installer = isDev ? 'install-dev' : 'install';
+      console.log(
+        isDev
+          ? chalk.dim('  Development build detected — re-running the dev installer (stays on the dev channel)...')
+          : chalk.dim('  Standalone binary detected — re-running installer...'),
+      );
       console.log('');
 
       const { execSync, spawn } = await import('node:child_process');
@@ -4619,27 +4627,27 @@ serviceCmd
 
       if (platform === 'win32') {
         // Run after this process exits so Windows releases the current executable.
-        const psCmd = 'Start-Sleep -Seconds 1; irm https://mercuryagent.sh/install.ps1 | iex';
+        const psCmd = `Start-Sleep -Seconds 1; irm https://mercuryagent.sh/${installer}.ps1 | iex`;
         try {
-          const installer = spawn(
+          const installer2 = spawn(
             'powershell.exe',
             ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', psCmd],
             { detached: true, stdio: 'inherit' },
           );
-          installer.unref();
+          installer2.unref();
           console.log(chalk.green('  ✓ Upgrade installer started. Mercury will exit before installation begins.'));
         } catch {
           console.log(chalk.red('  ✗ Upgrade failed. Try manually:'));
-          console.log(chalk.dim('    irm https://mercuryagent.sh/install.ps1 | iex'));
+          console.log(chalk.dim(`    irm https://mercuryagent.sh/${installer}.ps1 | iex`));
         }
       } else {
         // macOS / Linux: use shell installer
-        const shCmd = 'curl -fsSL https://mercuryagent.sh/install.sh | sh';
+        const shCmd = `curl -fsSL https://mercuryagent.sh/${installer}.sh | sh`;
         try {
           execSync(shCmd, { stdio: 'inherit' });
         } catch {
           console.log(chalk.red('  ✗ Upgrade failed. Try manually:'));
-          console.log(chalk.dim('    curl -fsSL https://mercuryagent.sh/install.sh | sh'));
+          console.log(chalk.dim(`    curl -fsSL https://mercuryagent.sh/${installer}.sh | sh`));
         }
       }
 
