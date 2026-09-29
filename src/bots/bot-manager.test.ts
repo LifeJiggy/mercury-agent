@@ -384,7 +384,7 @@ describe('Per-bot permission isolation (fail-closed)', () => {
       botId: 'writer',
       manifest,
       botDir: store.botDir('writer'),
-      permissions: store.readPermissions('writer'),
+      permissions: store.ensurePermissions('writer'),
       userMemory: null,
       config: getDefaultConfig() as MercuryConfig,
     });
@@ -401,23 +401,25 @@ describe('Per-bot permission isolation (fail-closed)', () => {
     expect(pm.getManifest().capabilities.shell.blocked).toContain('sudo *');
   });
 
-  it('persona ## Access grants merge additively into the registry scopes', () => {
+  it('the persona is NOT a permission source — grants must come from permissions.yaml', () => {
     const manifest = store.create({ id: 'cookiebot', name: 'Cookiebot' }) as BotManifest;
+    // A persona with an Access section grants NOTHING at registry build time.
     store.writePersona('cookiebot', `# Cookiebot\n\n## Access\n\n- ~/cookies — read\n- /tmp/execdir — execute\n`);
     const registry = createBotCapabilityRegistry({
       botId: 'cookiebot',
       manifest,
       botDir: store.botDir('cookiebot'),
-      permissions: store.readPermissions('cookiebot'),
-      persona: store.readPersona('cookiebot'),
+      permissions: store.ensurePermissions('cookiebot'),
       userMemory: null,
       config: getDefaultConfig() as MercuryConfig,
     });
     const scopes = registry.permissions.getManifest().capabilities.filesystem.scopes;
-    // Own profile dir (default grant) still there, plus the persona grants.
+    // Only the materialized default (own dir) + sandbox — NO persona grants.
     expect(scopes.some(s => s.path === store.botDir('cookiebot'))).toBe(true);
-    expect(scopes.some(s => s.path.endsWith('/cookies') && s.read && !s.write)).toBe(true);
-    expect(scopes.some(s => s.path === '/tmp/execdir' && s.execute)).toBe(true);
+    expect(scopes.some(s => s.path.endsWith('/cookies'))).toBe(false);
+    expect(scopes.some(s => s.path === '/tmp/execdir')).toBe(false);
+    // The startup migration is what folds persona grants into the file.
+    expect(store.ensurePermissions('cookiebot').paths?.some(p => p.scope === '~' || p.scope.endsWith('/cookies'))).toBe(false);
   });
 
   it('a malformed permissions.yaml entry (missing "scope") is skipped, not fatal', () => {
@@ -435,7 +437,6 @@ describe('Per-bot permission isolation (fail-closed)', () => {
       manifest,
       botDir: store.botDir('typo'),
       permissions: store.readPermissions('typo'),
-      persona: store.readPersona('typo'),
       userMemory: null,
       config: getDefaultConfig() as MercuryConfig,
     });
@@ -451,8 +452,7 @@ describe('Per-bot permission isolation (fail-closed)', () => {
       botId: 'plainbot',
       manifest,
       botDir: store.botDir('plainbot'),
-      permissions: store.readPermissions('plainbot'),
-      persona: store.readPersona('plainbot'), // default template: examples only, no grant bullets
+      permissions: store.ensurePermissions('plainbot'),
       userMemory: null,
       config: getDefaultConfig() as MercuryConfig,
     });
@@ -472,8 +472,7 @@ describe('Per-bot permission isolation (fail-closed)', () => {
       botId: 'sandboxer',
       manifest,
       botDir: store.botDir('sandboxer'),
-      permissions: store.readPermissions('sandboxer'),
-      persona: store.readPersona('sandboxer'),
+      permissions: store.ensurePermissions('sandboxer'),
       sandbox: { workspace: store.sandboxDir('sandboxer'), shared: store.sharedSandboxDir() },
       userMemory: null,
       config: getDefaultConfig() as MercuryConfig,
@@ -513,7 +512,7 @@ describe('Per-bot permission isolation (fail-closed)', () => {
       botId: 'writer',
       manifest,
       botDir: store.botDir('writer'),
-      permissions: store.readPermissions('writer'),
+      permissions: store.ensurePermissions('writer'),
       userMemory: null,
       config: getDefaultConfig() as MercuryConfig,
     });

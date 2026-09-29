@@ -2487,9 +2487,23 @@ async function runAgent(isDaemon: boolean = false): Promise<void> {
       },
     });
     botManager.setScheduler(scheduler);
-    botManager.registerRoutines(scheduler);
+    // Startup migrations must run before routines register: fleet layout
+    // (crew nesting + orphan cascade) and permission consolidation to the
+    // single permissions.yaml source.
+    void botManager.migrateFleetLayout()
+      .then(() => botManager.migratePermissions())
+      .then(() => botManager.registerRoutines(scheduler));
     agent.setBotManager(botManager);
     setWebBotManager(botManager);
+    // Real-time bot activity bus → surfaces: the CLI bot-thread live region
+    // (what the bot is doing RIGHT NOW while you watch its thread) and the
+    // web SSE feed (dashboards / third-party backends). The roster's activity
+    // label is updated inside the manager itself.
+    const botCliChannel = channels.get('cli');
+    botManager.onBotActivity((ev) => {
+      if (botCliChannel instanceof CLIChannel) botCliChannel.setBotLiveActivity(ev.botId, ev);
+      webChannel.broadcastBotActivity(ev);
+    });
     if (config.bots?.webhookSecret) {
       setBotsWebhookSecret(config.bots.webhookSecret);
     }

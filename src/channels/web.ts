@@ -17,7 +17,7 @@ interface PendingInteraction {
 }
 
 export interface ChatEvent {
-  type: 'thinking' | 'provider' | 'heartbeat' | 'step_start' | 'step_done' | 'text_delta' | 'text_done' | 'permission_request' | 'permission_continue' | 'permission_mode' | 'permission_resolved' | 'choice_prompt' | 'choice_resolved' | 'loop_warning' | 'error';
+  type: 'thinking' | 'provider' | 'heartbeat' | 'step_start' | 'step_done' | 'text_delta' | 'text_done' | 'permission_request' | 'permission_continue' | 'permission_mode' | 'permission_resolved' | 'choice_prompt' | 'choice_resolved' | 'loop_warning' | 'error' | 'bot_activity';
   data?: Record<string, unknown>;
 }
 
@@ -92,6 +92,16 @@ export class WebChannel extends BaseChannel {
 
   removeSSEClient(id: string): void {
     this.sseClients.delete(id);
+  }
+
+  /**
+   * Real-time bot activity feed: what each Mercury bot is doing RIGHT NOW
+   * (step, tool calls, turn lifecycle). Broadcast to every connected web
+   * session — the dashboard / third-party backends consume these for live
+   * bot views. Bot turns never carry text deltas, only activity labels.
+   */
+  broadcastBotActivity(ev: { botId: string; jobId: string; kind: string; label: string; detail?: string; stepIndex: number; elapsedMs: number; status?: string }): void {
+    this.broadcast({ type: 'bot_activity', data: { ...ev } });
   }
 
   private broadcast(event: ChatEvent): boolean {

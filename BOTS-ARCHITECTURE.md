@@ -156,12 +156,15 @@ Cross-bot *context sharing* (the research-bot → publisher-bot case) is **not**
 
 ### 2.5 Sandboxing & permissions (fail-closed, no mid-run prompts)
 
-Bots get their **own** `PermissionManager` seeded from `bots/<id>/permissions.yaml`:
+Bots get their **own** `PermissionManager` seeded from `bots/<id>/permissions.yaml` — the **single source of truth** for what a bot may do:
 
+- **One file decides everything**: `permissions.yaml` holds the tool gate (`tools.allow/deny`), path scopes (`paths`), and shell lists (`autoApproveCommands`, `blockedCommands`). `bot.yaml` carries identity/fleet/schedules only; the persona carries **character only** (legacy `## Access` sections are folded into permissions.yaml and stripped at startup).
+- **Fleet inheritance**: a crew bot runs on its **lead's** permissions verbatim (copied into its own dir at creation / first use) unless it has an explicitly edited `permissions.yaml` — inherit-unless-edited, and `self` scopes resolve per-bot so verbatim copies are safe.
 - **Tool allow/deny**: `tools.deny` always wins (OpenClaw rule: deny can't be re-enabled). Default-deny for destructive tools (`shell`, `write_file`, `delete_file`, `git_commit`) unless explicitly allowed at setup.
+- **Onboarding tiers execute**: the permission-tier question writes the chosen tier as a full permissions.yaml — tool gate AND path scopes (operator grants execute; full grants the home directory read/write/execute). A tier choice that only flipped the tool gate left bots unable to act — chosen permissions must take effect.
 - **No interactive approval for bots, ever.** A permission prompt inside a bot turn is auto-resolved **deny** and journaled (`auto_deny` reason code). This is Hermes' fail-closed rule applied to a non-interactive worker. The owner sees denials in `/bots <id> journal` and can widen scopes at setup/review time.
 - **No allow-all inheritance**: a bot can never inherit the session's allow-all mode — mirrors and extends the existing `isGlobalAutoApproveActive` rule that web/cloud requests don't inherit local allow-all.
-- **Path scopes**: bot file access is scope-based like the main agent's manifest, defaulting to the bot's own dir + explicitly granted workspace paths. `cwdOnly`-style escape gates apply.
+- **Path scopes**: bot file access is scope-based like the main agent's manifest, defaulting to the bot's own dir + explicitly granted workspace paths. `cwdOnly`-style escape gates apply. The bot's sandbox and the fleet-shared folder are implicit, never configurable away.
 - **Dangerous-pattern denylist** reused from the main permission system for any allowed shell (plus the hardline set that survives every mode).
 - **Budgets as security**: per-bot `dailyTokenBudget` and turn caps are hard stops (pause + journal, resume next window), protecting low-end devices and wallets from runaway loops.
 
@@ -181,6 +184,7 @@ Inherited from Mercury's "always uses a solution" ethos, hardened:
 
 | Surface | How |
 |---|---|
+| **Real-time activity bus** | Every bot turn emits granular events (turn-start, step, tool start/finish, turn-end) via `BotManager.onBotActivity`. Consumed by: the open bot thread's live region (same spinner block as the main chat), the `/bots` roster `↳ activity` line and `fleet_status` (mirrored into the activity map), and the web SSE feed (`bot_activity` events — dashboards / third-party backends). |
 | **TUI** | New `/bots` slash command (fast-path, like `/agents`) → interactive panel: list bots (live states), onboard (guided, fully automatic config generation), edit config/persona, view journal, enable/disable, send a message. Also a TUI page in `cli.ts` command layer. |
 | **Local HTTP API** | Hono module `src/web/api/bots.ts`: `GET /api/bots`, `POST /api/bots` (onboard), `GET/PATCH/DELETE /api/bots/:id`, `POST /api/bots/:id/message` (enqueue; returns job id), `POST /api/bots/:id/enable|disable`, `GET /api/bots/:id/journal`, `POST /api/bots/:id/replay`. Auth: existing web auth + attach token. |
 | **Mercury Cloud** | `agent.command` envelope gains `bot.*` command types (list, message, configure) — same pattern as existing `model.select`/`task.stop`; cross-instance bot↔bot via `agent.message.relay`. |

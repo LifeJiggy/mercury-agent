@@ -1,11 +1,22 @@
 import { BOT_DANGEROUS_TOOLS } from './store.js';
+import type { BotPermissionsFile } from './types.js';
 
 /**
  * Onboarding permission tiers — one clear question instead of silent
- * fail-closed defaults + manual file editing. Each tier is an explicit
- * tools.deny list (normalizeBotManifest respects an explicitly configured
- * tools block, so these grants stick). Whatever the tier, execution still
- * obeys the fail-closed PATH scopes — tools gate ≠ paths gate.
+ * fail-closed defaults + manual file editing. A tier is THE user's choice at
+ * onboarding, so it must EXECUTE: it writes the full permissions.yaml
+ * (single source of truth) — both the tool gate AND the path scopes. The old
+ * manifest-only behavior left the path gate untouched, so a "Full access"
+ * bot still could not read anything outside its sandbox — chosen
+ * permissions that never took effect.
+ *
+ * Path grants per tier (fail-closed outside these):
+ *  - readonly: own profile dir, read-only
+ *  - builder:  own profile dir, read+write
+ *  - operator: own profile dir, read+write+execute
+ *  - full:     the whole home directory, read+write+execute — an explicit,
+ *              informed choice for trusted automation (the global blocked
+ *              list still applies; interactive tools stay stripped).
  */
 export type PermissionTier = 'readonly' | 'builder' | 'operator' | 'full';
 
@@ -27,7 +38,7 @@ export const PERMISSION_TIERS: Record<PermissionTier, { label: string; descripti
   },
   full: {
     label: 'Full access',
-    description: 'Everything, including file deletion. For trusted automation only.',
+    description: 'Everything, including file deletion and your home directory. For trusted automation only.',
     deny: [],
   },
 };
@@ -36,7 +47,27 @@ export function isPermissionTier(value: string): value is PermissionTier {
   return value in PERMISSION_TIERS;
 }
 
-/** Apply a tier to a manifest (in place). */
+/**
+ * The permissions.yaml a tier grants — tool gate + path scopes, one file.
+ * `self` resolves to the bot's own profile dir at registry build time, so
+ * tier files are identical across bots and safe to copy (fleet inheritance).
+ */
+export function tierPermissionsFile(tier: PermissionTier): BotPermissionsFile {
+  const file: BotPermissionsFile = {
+    paths: [{ scope: 'self', read: true, write: true, execute: tier === 'operator' || tier === 'full' }],
+    tools: { deny: [...PERMISSION_TIERS[tier].deny] },
+  };
+  if (tier === 'full') {
+    file.paths!.push({ scope: '~', read: true, write: true, execute: true });
+  }
+  return file;
+}
+
+/**
+ * Apply a tier to a manifest (in place) — LEGACY path kept for manifests
+ * still carrying the old bot.yaml tools block; new code writes the tier via
+ * tierPermissionsFile() into permissions.yaml instead.
+ */
 export function applyPermissionTier(manifest: { tools?: { allow?: string[]; deny?: string[] } }, tier: PermissionTier): void {
   manifest.tools = { ...(manifest.tools ?? {}), deny: [...PERMISSION_TIERS[tier].deny] };
 }

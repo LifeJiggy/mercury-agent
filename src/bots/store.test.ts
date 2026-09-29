@@ -41,7 +41,10 @@ describe('BotStore', () => {
     expect(m.enabled).toBe(true);
     expect(existsSync(join(root, 'researcher', 'bot.yaml'))).toBe(true);
     expect(existsSync(join(root, 'researcher', BOT_PERSONA_FILENAME))).toBe(true);
-    const perms = store.readPermissions('researcher');
+    // No default permissions.yaml at create — an ABSENT file means fleet
+    // inheritance (crew) or the fail-closed default (solo), materialized by
+    // ensurePermissions on first use.
+    const perms = store.ensurePermissions('researcher');
     expect(perms.paths).toEqual([{ scope: 'self', read: true, write: true }]);
     const persona = store.readPersona('researcher');
     expect(persona).toContain('# Research');

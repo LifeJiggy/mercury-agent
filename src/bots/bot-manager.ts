@@ -17,7 +17,9 @@ import { createBotSendTool } from './tools/bot-send.js';
 import { createBotScheduleTool, type BotScheduler } from './tools/bot-schedule.js';
 import { createFleetStatusTool } from './tools/fleet-status.js';
 import { createBotSpawnTool } from './tools/bot-spawn.js';
-import { runBotTurn, isTransientFailure, type BotTurnMail } from './bot-turn.js';
+import { runBotTurn, isTransientFailure, type BotTurnMail, type BotActivityEvent } from './bot-turn.js';
+import { parsePersonaAccess, stripPersonaAccessSection } from './persona-access.js';
+import { mergePathScopes } from './registry-factory.js';
 import { synthesizeSkill, MIN_TOOLS_FOR_SYNTHESIS } from './skill-synthesis.js';
 import { SkillLoader } from '../skills/loader.js';
 import { logger } from '../utils/logger.js';
@@ -201,10 +203,43 @@ export class BotManager {
       const drained = this.queue.drainMail(m.id);
       if (drained.length > 0) this.mailboxes.set(m.id, drained);
     }
+    // A profile relocation (re-parent or fleet-layout migration) invalidates
+    // the cached journal handle (it is bound to the old dir) and the bot's
+    // compiled toolset.
+    this.store.onRelocate = (botId) => {
+      this.journals.delete(botId);
+      this.invalidateRuntime(botId);
+    };
     // Periodic due-sweep: retry-backoff jobs re-enter the in-memory queues
     // when their run_after elapses (also covers crash-restart backoffs).
     const dueTimer = setInterval(() => this.resumeDueJobs(), 30_000);
     dueTimer.unref?.();
+    // Real-time activity consumer registration happens via onBotActivity();
+    // executeTurn feeds every registered listener AND the live `activity`
+    // map (rendered by the /bots roster and fleet_status).
+  }
+
+  /**
+   * Real-time bot activity bus. Every bot turn emits granular events
+   * (turn-start, step, tool start/finish, turn-end); listeners render them —
+   * the CLI bot-thread live region, the web feed, future dashboards. The
+   * manager itself also mirrors the latest label into the `activity` map so
+   * the roster goes live with no extra UI.
+   */
+  private activityListeners = new Set<(ev: BotActivityEvent) => void>();
+  onBotActivity(listener: (ev: BotActivityEvent) => void): () => void {
+    this.activityListeners.add(listener);
+    return () => this.activityListeners.delete(listener);
+  }
+  private emitBotActivity(ev: BotActivityEvent): void {
+    // Live roster label: keep the static job description until the first
+    // step arrives, then follow the actual work.
+    if (ev.kind !== 'turn-end') this.activity.set(ev.botId, ev.label);
+    for (const listener of this.activityListeners) {
+      try { listener(ev); } catch (err: any) {
+        logger.warn({ botId: ev.botId, err: err?.message }, 'Bot activity listener failed');
+      }
+    }
   }
 
   /** Pull due (backoff-elapsed) jobs from the durable queue into memory and run them. */
@@ -398,7 +433,11 @@ export class BotManager {
     try {
       this.queue.claim(job.id, LEASE_SECONDS);
       const turn = this.buildTurn(botId, manifest, job, controller.signal);
-      const output = await runBotTurn(turn.input);
+      const output = await runBotTurn({
+        ...turn.input,
+        jobId: job.id,
+        onActivity: (ev) => this.emitBotActivity(ev),
+      });
       turn.cleanup();
 
       const record: BotRunRecord = {
@@ -551,6 +590,23 @@ export class BotManager {
       running.delete(job.id);
       this.aborts.delete(`${botId}:${job.id}`);
       if (running.size === 0) this.activity.delete(botId);
+      // Mail-arrival race: a reply (e.g. a crew's task result) delivered
+      // while this turn ran can land AFTER the turn's last mailbox poll —
+      // sendToBot saw the bot running and scheduled no wake. Without this,
+      // the mail sits unconsumed and the bot idles forever. If mail is
+      // pending and nothing is queued or running, schedule a wake turn.
+      const manifestNow = this.store.get(botId);
+      if (
+        (this.running.get(botId)?.size ?? 0) === 0
+        && (this.queues.get(botId)?.length ?? 0) === 0
+        && this.peekMailbox(botId).length > 0
+        && manifestNow?.enabled && !this.disabled.has(botId)
+      ) {
+        const q = this.queues.get(botId) ?? [];
+        q.push({ id: randomUUID().slice(0, 8), botId, trigger: 'mailbox', prompt: '', createdAt: Date.now(), attempts: 0 });
+        this.queues.set(botId, q);
+        logger.info({ botId, pending: this.peekMailbox(botId).length }, 'Mail arrived mid-turn — scheduling a wake so it is consumed');
+      }
       this.pump(botId);
     }
   }
@@ -660,22 +716,20 @@ export class BotManager {
       botId,
       manifest,
       botDir: this.store.botDir(botId),
-      permissions: this.store.readPermissions(botId),
-      // The persona's `## Access` section grants extra path scopes — read at
-      // registry build, so a persona edit (invalidateRuntime on write) applies
-      // to the very next turn.
-      persona: this.store.readPersona(botId),
+      // Single source of truth; also materializes fleet inheritance (a crew
+      // without its own file gets its lead's copied in verbatim).
+      permissions: this.store.ensurePermissions(botId),
       skillLoader,
       // Built-in work areas: private sandbox + fleet-shared folder (rw+x,
-      // implicit — no permission ask, no Access declaration).
+      // implicit — no permission ask).
       sandbox: { workspace: this.store.sandboxDir(botId), shared: this.store.sharedSandboxDir() },
       userMemory: this.userMemoryFor(botId, manifest),
       config: this.config,
     });
     // Filter FIRST (strips interactive/global-mutation tools and applies the
-    // manifest allow/deny), THEN add the bot-specific tools — otherwise the
-    // filter would strip them again.
-    const filtered = filterBotTools({ ...registry.getTools() }, manifest);
+    // permissions.yaml tool gate), THEN add the bot-specific tools —
+    // otherwise the filter would strip them again.
+    const filtered = filterBotTools({ ...registry.getTools() }, manifest, this.store.ensurePermissions(botId));
     // Fleet relations are implicit comms: a lead can message its crew and a
     // crew bot its lead, without anyone hand-editing canMessage.
     const effectiveRoster = this.effectiveRoster(botId, manifest);
@@ -771,6 +825,9 @@ export class BotManager {
       persona: spec.persona,
       manifest: { fleetRole: 'crew', parent: leadId, comms: { canMessage: [leadId] } },
     });
+    // Inheritance at birth: the crew starts on its lead's permissions,
+    // copied verbatim (its own file from now on — edits diverge it).
+    this.store.ensurePermissions(manifest.id);
     this.invalidateRuntime(leadId); // lead's roster + fleet prompt change
     logger.info({ leadId, crewId: spec.id }, 'Crew member added to fleet');
     return { ok: true, manifest };
@@ -810,13 +867,17 @@ export class BotManager {
    */
   async delete(botId: string): Promise<void> {
     await this.halt(botId);
-    // Fleet cleanup: a deleted LEAD's crew is detached (→ solo), never orphaned
-    // with a dangling parent. A deleted crew bot just leaves the roster.
+    // Fleet cascade: deleting a lead deletes its crew — recursively (a crew
+    // member may itself be a mid-level lead). Each member gets the FULL
+    // lifecycle delete (halt, purge queue/mail/DLQ, remove routines) because
+    // those live outside the profile dir and would otherwise outlive the bot.
+    // The filesystem half is free: crew profiles nest inside the lead's dir,
+    // so the lead's store.delete() removes the whole tree — which is also why
+    // this cascades BEFORE the lead's own profile is wiped below.
     if (this.store.isLead(botId)) {
       for (const crew of this.store.crewOf(botId)) {
-        this.store.update(crew.id, m => { m.fleetRole = undefined; m.parent = undefined; });
-        this.invalidateRuntime(crew.id);
-        logger.info({ leadId: botId, crewId: crew.id }, 'Fleet lead deleted — crew member detached to solo');
+        logger.info({ leadId: botId, crewId: crew.id }, 'Fleet lead deleted — cascading to crew member');
+        await this.delete(crew.id);
       }
     }
     // Scheduler routines (bot:<id>:*) — both bot.yaml routines and
@@ -841,6 +902,64 @@ export class BotManager {
     this.pausedForBudget.delete(botId);
     this.held.delete(botId);
     logger.info({ botId }, 'Bot deleted: queue/mail/DLQ purged, routines removed');
+  }
+
+  /**
+   * One-shot fleet layout migration (startup, before routines register):
+   * the physical layout must mirror the manifest hierarchy — crew profiles
+   * nested under their lead's dir — so the delete cascade can never leave a
+   * crew behind. Two rules, both idempotent:
+   *  1. A crew bot whose lead no longer exists is cascade-deleted (it
+   *     outlived its lead only because a pre-cascade delete created it).
+   *  2. An existing crew profile still flat at the root moves under its
+   *     lead's directory (onRelocate refreshes journals/runtime caches).
+   */
+  async migrateFleetLayout(): Promise<void> {
+    for (const m of this.store.list()) {
+      if (!m.parent) continue;
+      if (this.store.exists(m.parent)) {
+        this.store.relocateToParent(m);
+      } else {
+        logger.warn({ botId: m.id, parent: m.parent }, 'Crew bot outlived its lead — cascading the deletion');
+        await this.delete(m.id);
+      }
+    }
+  }
+
+  /**
+   * Permission consolidation to a SINGLE source of truth (startup): every
+   * bot ends with exactly one permissions.yaml and a persona that carries
+   * character only.
+   *  1. Inheritance backfill: a crew without its own file gets its lead's
+   *     copied verbatim; a solo without one gets the fail-closed default.
+   *  2. Legacy bot.yaml tools block → permissions.yaml (the manifest copy
+   *     stays as a readable fallback but no longer decides anything).
+   *  3. Persona `## Access` grants → merged into permissions.yaml paths,
+   *     then stripped from the persona file (permissions never live there).
+   */
+  async migratePermissions(): Promise<void> {
+    for (const m of this.store.list()) {
+      try {
+        const perms = this.store.ensurePermissions(m.id);
+        // 2. Legacy tool gate out of bot.yaml.
+        const legacyTools = m.tools;
+        if (legacyTools && ((legacyTools.allow?.length ?? 0) > 0 || (legacyTools.deny?.length ?? 0) > 0) && !perms.tools) {
+          this.store.writePermissions(m.id, { ...this.store.readPermissions(m.id), tools: legacyTools });
+          logger.info({ botId: m.id }, 'Migrated bot.yaml tools gate into permissions.yaml (single source of truth)');
+        }
+        // 3. Persona Access grants out of the persona.
+        const persona = this.store.readPersona(m.id);
+        const grants = parsePersonaAccess(persona);
+        if (grants.length > 0) {
+          const current = this.store.readPermissions(m.id);
+          this.store.writePermissions(m.id, { ...current, paths: mergePathScopes(current.paths, grants) });
+          this.store.writePersona(m.id, stripPersonaAccessSection(persona));
+          logger.info({ botId: m.id, grants: grants.length }, 'Migrated persona Access grants into permissions.yaml; persona is character-only now');
+        }
+      } catch (err: any) {
+        logger.warn({ botId: m.id, err: err?.message }, 'Permission migration failed for bot — leaving as-is');
+      }
+    }
   }
 
   /**
@@ -901,31 +1020,55 @@ export class BotManager {
    * jobs stay durable-pending (survive a restart); the passive due-sweep
    * skips held bots, so nothing resumes until /bots start. Explicit new
    * triggers (send/mail/cron) still work — the bot is stopped, not disabled.
+   * FLEET: stopping a lead stops its crew too — recursively (a crew member
+   * may be a mid-level lead). Every stopped member's jobs are held the same
+   * durable way; /bots start on the lead resumes the whole subtree.
    */
-  async stop(botId: string): Promise<{ halted: boolean; heldJobs: number }> {
-    const heldJobs = (this.queues.get(botId) ?? []).length;
-    const halted = await this.halt(botId);
+  async stop(botId: string): Promise<{ halted: boolean; heldJobs: number; crewStopped: number }> {
+    let heldJobs = (this.queues.get(botId) ?? []).length;
+    let halted = await this.halt(botId);
     this.held.add(botId);
-    if (heldJobs > 0) {
-      logger.info({ botId, heldJobs }, 'Bot stopped — queued jobs held (resumable via /bots start)');
+    let crewStopped = 0;
+    if (this.store.isLead(botId)) {
+      for (const crew of this.store.crewOf(botId)) {
+        const r = await this.stop(crew.id);
+        halted = halted || r.halted;
+        heldJobs += r.heldJobs;
+        crewStopped += 1 + r.crewStopped;
+      }
     }
-    return { halted, heldJobs };
+    if (heldJobs > 0) {
+      logger.info({ botId, heldJobs, crewStopped }, 'Bot stopped — queued jobs held (resumable via /bots start)');
+    }
+    return { halted, heldJobs, crewStopped };
   }
 
   /**
    * User-facing resume (the counterpart of stop): clear the stop-hold,
    * re-enter held/pending durable jobs, and kick the queue. A disabled bot
    * is enabled first — "start" is unambiguous. Safe on an already-running bot.
+   * FLEET: starting a lead resumes its crew subtree too (recursively) —
+   * except crew the user individually disabled, which stay off.
    */
   start(botId: string): { resumed: number } {
     const manifest = this.store.get(botId);
     if (!manifest) throw new Error(`Bot "${botId}" does not exist`);
     this.held.delete(botId);
-    const resumed = this.rehydratePending(botId);
+    let resumed = this.rehydratePending(botId);
     if (!manifest.enabled || this.disabled.has(botId)) {
       this.setEnabled(botId, true); // persists enabled + pumps
     } else {
       this.pump(botId);
+    }
+    if (this.store.isLead(botId)) {
+      for (const crew of this.store.crewOf(botId)) {
+        const m = this.store.get(crew.id);
+        if (!m?.enabled || this.disabled.has(crew.id)) continue; // explicitly disabled crew stay off
+        this.held.delete(crew.id);
+        resumed += this.rehydratePending(crew.id);
+        this.pump(crew.id);
+        resumed += this.start(crew.id).resumed;
+      }
     }
     return { resumed };
   }
@@ -1071,6 +1214,7 @@ export class BotManager {
 - \`/bot <id> <message>\` or \`@<id> <message>\` — dispatch a task to a bot; the result lands ONLY in the bot's own thread (\`/bots open <id>\`), never in this chat.
 - \`/bots open <id>\` — open the bot's own chat; \`/bots\` — roster with live states.
 - \`/bots create <id> "Name" "Description"\` — onboard; \`/bots persona <id> <text>\` — set its character.
+- \`/bots export <id> [path]\` — shareable bundle (manifests + personas + permissions + skills; a lead's bundle carries its whole crew); \`/bots import <path>\` — recreate bots from a bundle (imported bots start disabled). Sandbox, journals, and .env never travel.
 - \`/bots journal <id>\` — recent runs; \`/bots dlq\` — failed jobs (replayable); \`/bots stop|start|enable|disable <id>\`; \`/bots run <id> [routine]\` — fire a routine now (or a bare wake).
 - Bots share data through the fleet-shared folder (\`${this.store.sharedSandboxDir()}\`); each also has a private sandbox next to its persona. Their outputs land in their own threads.
 - The dispatch_bot tool lets you hand a task to a bot mid-conversation and continue talking; the result is delivered when the bot finishes.`);

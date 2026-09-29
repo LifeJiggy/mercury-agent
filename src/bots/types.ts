@@ -101,9 +101,10 @@ export interface BotManifest {
 
 /**
  * Per-bot permission manifest — `~/.mercury/bots/<id>/permissions.yaml`.
- * Deliberately minimal: bots are fail-closed, so only explicit grants exist.
- * There are no auto-approve lists for bots by design (P0-4 wires this into a
- * bot-local PermissionManager).
+ * THE single source of truth for what a bot may do (tool gate + path scopes
+ * + shell lists) — bot.yaml carries identity/fleet/schedules only, and the
+ * persona carries character only. Deliberately minimal: bots are
+ * fail-closed, so only explicit grants exist.
  */
 export interface BotPermissionsFile {
   paths?: BotPathScope[];
@@ -117,6 +118,13 @@ export interface BotPermissionsFile {
    * "*" (allow-all) is rejected.
    */
   autoApproveCommands?: string[];
+  /**
+   * The tool gate — which capability tools the bot sees at all. Deny wins
+   * over allow; a non-empty allow restricts the toolset to exactly that
+   * list. Interactive/global-mutation tools are stripped for bots regardless.
+   * (Formerly bot.yaml's tools block — migrated here; bot.yaml is legacy.)
+   */
+  tools?: { allow?: string[]; deny?: string[] };
 }
 
 export interface BotPathScope {

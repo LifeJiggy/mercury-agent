@@ -1,5 +1,6 @@
 import { generateText, streamText, stepCountIs } from 'ai';
 import path from 'node:path';
+import { homedir } from 'node:os';
 import { existsSync, readdirSync } from 'node:fs';
 import { getHeapStatistics } from 'node:v8';
 import type { ChannelMessage, ChannelType } from '../types/channel.js';
@@ -26,7 +27,8 @@ import type { SkillLoader } from '../skills/loader.js';
 import { logger } from '../utils/logger.js';
 import { refinePersona } from '../bots/persona-template.js';
 import { proposeCrew } from '../bots/fleet-onboarding.js';
-import { PERMISSION_TIERS, applyPermissionTier, isPermissionTier, type PermissionTier } from '../bots/permission-tiers.js';
+import { PERMISSION_TIERS, tierPermissionsFile, isPermissionTier, type PermissionTier } from '../bots/permission-tiers.js';
+import { buildBotBundle, writeBundle, readBundle, importBotBundle } from '../bots/bundle.js';
 import { applyBotFieldPatch } from '../bots/edit.js';
 import { CLIChannel } from '../channels/cli.js';
 import { TelegramChannel } from '../channels/telegram.js';
@@ -1227,7 +1229,12 @@ export class Agent {
       choice = 'Read-only (recommended default)';
     }
     const tier = (Object.entries(PERMISSION_TIERS).find(([, t]) => choice.startsWith(t.label))?.[0] ?? 'readonly') as PermissionTier;
-    bm.store.update(botId, m => applyPermissionTier(m, tier));
+    // The tier must EXECUTE: write the full permission file (tool gate +
+    // path scopes) — the single source of truth. The old manifest-only write
+    // left the path gate at fail-closed defaults, so a "full access" bot
+    // still could not read anything outside its sandbox.
+    bm.store.writePermissions(botId, tierPermissionsFile(tier));
+    bm.store.update(botId, m => { delete (m as any).tools; });
     bm.invalidateRuntime(botId);
     await channel.send(`🔐 Permissions for **${botName}**: **${PERMISSION_TIERS[tier].label}**. Change anytime with \`/bots permissions ${botId} <readonly|builder|operator|full>\`.`, `bot:${botId}`).catch(() => {});
   }
@@ -1441,10 +1448,16 @@ export class Agent {
       const fmt = (s: typeof summaries[number], indent: string) => {
         const icon = stateIcons[s.state] ?? '❓';
         const badge = s.fleetRole === 'lead' ? ' 👑' : '';
-        const lastRun = s.lastRunAt ? ` · last ${(s.lastRunState ?? '')} ${formatRelative(s.lastRunAt)}` : '';
+        // Crew runs are short and asynchronous — a snapshot rarely catches
+        // them green. Make activity legible anyway: leads show how many crew
+        // are working right now, every bot shows its last run outcome.
+        const crewNote = s.fleetRole === 'lead' && s.crewWorking
+          ? ` · 🟢 ${s.crewWorking} crew working`
+          : '';
+        const lastRun = s.lastRunAt ? ` · last run ${s.lastRunState ?? '?'} ${formatRelative(s.lastRunAt)}` : '';
         const activity = s.activity ? `\n${indent}   ↳ ${s.activity}` : '';
         const attention = s.needsYou ? ' · ⚠ needs you' : '';
-        return `${indent}${icon} **${s.name}** (${s.id})${badge} — ${s.state}${attention}${lastRun}${activity}`;
+        return `${indent}${icon} **${s.name}** (${s.id})${badge} — ${s.state}${crewNote}${attention}${lastRun}${activity}`;
       };
       const lines: string[] = [`**Bots** (${summaries.length})`, ''];
       const rendered = new Set<string>();
@@ -1654,7 +1667,7 @@ export class Agent {
       }
       if (!confirmed && typeof (channel as any).askToContinue === 'function') {
         const crewCount = bm.store.crewOf(target).length;
-        const proceed = await (channel as any).askToContinue(`Delete bot **${target}** and its profile (persona, memory links, journal)? This cannot be undone.${crewCount > 0 ? ` Its ${crewCount} crew member(s) will be detached and become solo bots.` : ''}`);
+        const proceed = await (channel as any).askToContinue(`Delete bot **${target}** and its profile (persona, memory links, journal)? This cannot be undone.${crewCount > 0 ? ` Its ${crewCount} crew member(s) will be deleted with it (fleet cascade).` : ''}`);
         if (!proceed) {
           await channel.send('Deletion cancelled.', channelId);
           return;
@@ -1674,6 +1687,49 @@ export class Agent {
       return;
     }
 
+    if (action === 'export') {
+      // /bots export <id> [path] — a shareable bundle: manifests + personas +
+      // permissions + skills (single JSON; a lead's bundle carries its whole
+      // crew tree). Sandbox, journal, and .env never travel.
+      const target = parts[1]?.toLowerCase();
+      if (!target || !bm.store.exists(target)) {
+        await channel.send('Usage: `/bots export <id> [outPath]` — writes a shareable JSON bundle (fleet leads include their crew).', channelId);
+        return;
+      }
+      try {
+        const bundle = buildBotBundle(bm.store, target);
+        const outPath = parts.slice(2).join(' ') || undefined;
+        const path = writeBundle(bundle, outPath?.trim() || undefined);
+        const crewNote = bundle.kind === 'fleet' ? ` (fleet — ${bundle.bots.length} bots incl. crew)` : '';
+        await channel.send(`📦 Exported **${target}**${crewNote} → \`${path}\`\nIncluded: manifests, personas, permissions, skills. Never included: sandbox, journals, .env (local state + secrets).`, channelId);
+      } catch (err: any) {
+        await channel.send(`Export failed: ${err?.message}`, channelId);
+      }
+      return;
+    }
+
+    if (action === 'import') {
+      // /bots import <path> — recreate bots from a bundle. Imported bots
+      // start DISABLED (fail-closed); enable each one consciously.
+      const rawPath = parts.slice(1).join(' ').trim();
+      if (!rawPath) {
+        await channel.send('Usage: `/bots import <bundlePath>` — recreates bots from a `.bot.json` bundle. Imported bots start disabled; enable with `/bots enable <id>`.', channelId);
+        return;
+      }
+      try {
+        const bundle = readBundle(rawPath.startsWith('~') ? rawPath.replace(/^~/, homedir()) : rawPath);
+        const report = importBotBundle(bm.store, bundle, { overwrite: parts.includes('--overwrite') });
+        const lines: string[] = [];
+        if (report.created.length > 0) lines.push(`✅ Created: ${report.created.map(id => `\`${id}\``).join(', ')} (disabled — enable with \`/bots enable <id>\`)`);
+        for (const s of report.skipped) lines.push(`⏭ \`${s.id}\`: ${s.reason}`);
+        if (lines.length === 0) lines.push('Nothing to import.');
+        await channel.send(`📥 Import from \`${rawPath}\`:\n${lines.join('\n')}`, channelId);
+      } catch (err: any) {
+        await channel.send(`Import failed: ${err?.message}`, channelId);
+      }
+      return;
+    }
+
     if (action === 'stop' || action === 'pause') {
       const target = parts[1]?.toLowerCase();
       if (!target) {
@@ -1681,11 +1737,11 @@ export class Agent {
         return;
       }
       const result = await bm.stop(target);
-      const heldNote = result.heldJobs > 0 ? `\n↩ ${result.heldJobs} queued job(s) held — resume with \`/bots start ${target}\`.` : '';
+      const crewNote = result.crewStopped > 0 ? `\n🛑 Fleet cascade: ${result.crewStopped} crew bot(s) stopped with it.` : '';
+      const heldNote = result.heldJobs > 0 ? `\n↩ ${result.heldJobs} queued job(s) held fleet-wide — resume with \`/bots start ${target}\`.` : '';
       await channel.send(result.halted
-        ? `⛔ Halt signal sent to **${target}** — it will stop after the current tool step.${heldNote}`
-        : `⛔ **${target}** stopped — nothing was running.${heldNote}`, channelId);
-      return;
+        ? `⛔ Halt signal sent to **${target}** — it will stop after the current tool step.${crewNote}${heldNote}`
+        : `⛔ **${target}** stopped — nothing was running.${crewNote}${heldNote}`, channelId);
     }
 
     if (action === 'start') {
@@ -1810,21 +1866,23 @@ export class Agent {
         return;
       }
       if (!tierArg) {
-        const m = bm.store.get(target)!;
-        const deny = new Set(m.tools?.deny ?? []);
+        const perms = bm.store.readPermissions(target);
+        const deny = new Set(perms.tools?.deny ?? bm.store.get(target)?.tools?.deny ?? []);
         const matched = Object.entries(PERMISSION_TIERS).find(([, t]) => t.deny.length === deny.size && t.deny.every(d => deny.has(d)))?.[0];
         const current = matched ?? 'custom';
         const effective = deny.has('run_command') ? 'no shell' : 'shell within its path scopes';
-        await channel.send(`🔐 **${target}**: ${current} (deny: ${[...deny].join(', ') || 'none'}) — ${effective}. Set with \`/bots permissions ${target} <readonly|builder|operator|full>\`.`, channelId);
+        const scopeCount = perms.paths?.length ?? 0;
+        await channel.send(`🔐 **${target}**: ${current} (deny: ${[...deny].join(', ') || 'none'}, path scopes: ${scopeCount}) — ${effective}. Source: its permissions.yaml. Set with \`/bots permissions ${target} <readonly|builder|operator|full>\`.`, channelId);
         return;
       }
       if (!isPermissionTier(tierArg)) {
         await channel.send('Unknown tier — use `readonly`, `builder`, `operator`, or `full`.', channelId);
         return;
       }
-      bm.store.update(target, m => applyPermissionTier(m, tierArg));
+      bm.store.writePermissions(target, tierPermissionsFile(tierArg));
+      bm.store.update(target, m => { delete (m as any).tools; });
       bm.invalidateRuntime(target);
-      await channel.send(`🔐 Permissions for **${target}**: **${PERMISSION_TIERS[tierArg].label}** — ${PERMISSION_TIERS[tierArg].description}\n(Path scopes are untouched and always enforced.)`, channelId);
+      await channel.send(`🔐 Permissions for **${target}**: **${PERMISSION_TIERS[tierArg].label}** — ${PERMISSION_TIERS[tierArg].description}\n(Written to its permissions.yaml — the single source of truth.)`, channelId);
       return;
     }
 

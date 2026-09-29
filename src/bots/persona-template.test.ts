@@ -118,8 +118,12 @@ Concise.
 `);
     const raw = 'Research bot; may read ~/cookies for cookie context.';
     const result = await refinePersona(raw, 'R', stubProvider());
-    expect(result).toContain('~/cookies');
-    expect(result).not.toContain('~/some/dir');
+    // The persona is character-only now: NO Access section survives, not
+    // even user-stated grants — those belong in permissions.yaml (the
+    // migration folds them there).
+    expect(result).not.toContain('## Access');
+    expect(result).not.toContain('~/cookies');
+    expect(result).toContain('## Standing instructions');
   });
 
   it('drops the whole Access section when no user-stated grant survives', async () => {

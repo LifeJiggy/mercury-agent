@@ -1264,6 +1264,14 @@ function ChatBody({ state, maxDynamicLines }: { state: TuiState; maxDynamicLines
         <ChatMessagesView messages={dynamicMessages} agentName={state.agentName} maxLines={maxDynamicLines} />
         {state.toolSteps.length > 0 && !state.isThinking && <ToolStepsView steps={state.toolSteps} viewMode={state.viewMode} idle />}
         {state.isThinking && <ThinkingIndicator agentName={state.agentName} steps={state.toolSteps} mode={state.mode} liveActivity={state.liveActivity} thinkingPreview={state.thinkingPreview} />}
+        {state.botChat && !state.isThinking && (
+          <BotFleetLiveRegion
+            botId={state.botChat.botId}
+            botName={state.botChat.botName}
+            botLiveActivity={state.botLiveActivity ?? {}}
+            botRoster={state.botRoster}
+          />
+        )}
         {state.subAgents.length > 0 && <AgentPanelView agents={state.subAgents} />}
       </Box>
     </Box>
@@ -1314,6 +1322,14 @@ function CodingBody({ state, maxDynamicLines }: { state: TuiState; maxDynamicLin
         <ChatMessagesView messages={dynamicMessages} agentName={state.agentName} maxLines={maxDynamicLines} />
         {state.toolSteps.length > 0 && !state.isThinking && <ToolStepsView steps={state.toolSteps} viewMode={state.viewMode} idle />}
         {state.isThinking && <ThinkingIndicator agentName={state.agentName} steps={state.toolSteps} mode={state.mode} liveActivity={state.liveActivity} thinkingPreview={state.thinkingPreview} />}
+        {state.botChat && !state.isThinking && (
+          <BotFleetLiveRegion
+            botId={state.botChat.botId}
+            botName={state.botChat.botName}
+            botLiveActivity={state.botLiveActivity ?? {}}
+            botRoster={state.botRoster}
+          />
+        )}
         <Box paddingX={1} marginTop={1}>
           <Text dimColor>Mode shortcuts: Ctrl+P Plan · Ctrl+X Execute (Auto runs by default)</Text>
         </Box>
@@ -2017,7 +2033,7 @@ function ToolStepsView({ steps, viewMode, idle }: { steps: ToolStep[]; viewMode:
   );
 }
 
-function ThinkingIndicator({ agentName, steps, mode, liveActivity, thinkingPreview, frozen }: { agentName: string; steps: ToolStep[]; mode: AppMode; liveActivity?: LiveActivityState | null; thinkingPreview?: string | null; frozen?: boolean }) {
+function ThinkingIndicator({ agentName, steps, mode, liveActivity, thinkingPreview, frozen, title, longOpHint }: { agentName: string; steps: ToolStep[]; mode: AppMode; liveActivity?: LiveActivityState | null; thinkingPreview?: string | null; frozen?: boolean; title?: string; longOpHint?: boolean }) {
   const frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
   const [frame, setFrame] = React.useState(0);
   const [elapsed, setElapsed] = React.useState(0);
@@ -2067,12 +2083,14 @@ function ThinkingIndicator({ agentName, steps, mode, liveActivity, thinkingPrevi
       <Box>
         <Text color={actionTone === 'white' ? 'cyan' : actionTone}>{spinner}</Text>
         <Text> </Text>
-        <Text color="cyan" bold>Processing</Text>
+        <Text color="cyan" bold>{title ?? 'Processing'}</Text>
         <Text dimColor>{totalSteps > 0 ? ` · step ${totalSteps} · ${timeStr}` : ` · ${timeStr}`}</Text>
       </Box>
       <Box marginLeft={4}>
         <Text color={actionTone} bold>{currentAction}</Text>
-        {displayElapsed >= 90 && <Text color="red" dimColor> · long op (/bg current to background, /stop to stop)</Text>}
+        {/* The /bg·/stop hint is main-agent only — bot threads have their own
+            controls, and long tasks are the norm for bots. */}
+        {(longOpHint ?? true) && displayElapsed >= 90 && <Text color="red" dimColor> · long op (/bg current to background, /stop to stop)</Text>}
       </Box>
       {thinkLine && (
         <Box marginLeft={4}>
@@ -2090,6 +2108,60 @@ function ThinkingIndicator({ agentName, steps, mode, liveActivity, thinkingPrevi
           ))}
         </Box>
       )}
+    </Box>
+  );
+}
+
+/**
+ * Fleet live region for an open bot thread: what this bot is doing RIGHT
+ * NOW, and — for a lead — exactly which sub-bot is doing what, recursively
+ * (CEO → Eng Lead → Backend). One self-ticker drives all rows; the rows
+ * also refresh on every activity event.
+ */
+function BotFleetLiveRegion({ botId, botName, botLiveActivity, botRoster }: {
+  botId: string;
+  botName: string;
+  botLiveActivity: Record<string, LiveActivityState>;
+  botRoster: Array<{ id: string; name: string; state: string; fleetRole?: 'lead' | 'crew'; parent?: string }>;
+}) {
+  const own = botLiveActivity[botId];
+  const crew = botRoster.filter(b => b.parent === botId);
+  const crewLive = crew.filter(c => botLiveActivity[c.id]);
+  if (!own && crewLive.length === 0) return null;
+
+  const frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+  const [tick, setTick] = React.useState(0);
+  React.useEffect(() => {
+    const timer = setInterval(() => setTick(v => v + 1), 250);
+    return () => clearInterval(timer);
+  }, []);
+
+  const row = (id: string, name: string, label: string, indent: string): React.ReactNode => {
+    return (
+      <Box key={id}>
+        <Text>{indent}</Text>
+        <Text color="cyan">{frames[tick % frames.length]}</Text>
+        <Text bold> {name} ({id})</Text>
+        <Text dimColor> · {label}</Text>
+      </Box>
+    );
+  };
+
+  const renderCrewTree = (leadId: string, depth: number): React.ReactNode[] => {
+    const out: React.ReactNode[] = [];
+    for (const member of botRoster.filter(b => b.parent === leadId)) {
+      const act = botLiveActivity[member.id];
+      if (act) out.push(row(member.id, member.name, act.detail || act.phase, '  '.repeat(depth)));
+      out.push(...renderCrewTree(member.id, depth + 1));
+    }
+    return out;
+  };
+
+  return (
+    <Box marginTop={1} marginLeft={4} flexDirection="column">
+      {own && row(botId, botName, own.detail || own.phase, '')}
+      {crewLive.length > 0 && <Text dimColor>  └ crew working ({crewLive.length}):</Text>}
+      {renderCrewTree(botId, 1)}
     </Box>
   );
 }

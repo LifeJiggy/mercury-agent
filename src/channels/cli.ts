@@ -326,6 +326,9 @@ export interface TuiState {
   updateAvailable: string | null;
   /** Active Mercury Bot chat — transcript is swapped to the bot's thread. */
   botChat: { botId: string; botName: string } | null;
+  /** Per-bot real-time activity (what each bot is doing RIGHT NOW) — rendered
+   * as a live region in an open bot thread, keyed by bot id. */
+  botLiveActivity: Record<string, LiveActivityState>;
   /** Live bot roster (drives `/bots` argument autocomplete and badges). */
   botRoster: Array<{ id: string; name: string; state: string; needsYou: boolean; fleetRole?: 'lead' | 'crew'; parent?: string }>;
 }
@@ -363,6 +366,7 @@ const defaultState: TuiState = {
   tuiFrozen: false,
   updateAvailable: null,
   botChat: null,
+  botLiveActivity: {},
   botRoster: [],
 };
 
@@ -1774,6 +1778,39 @@ export class CLIChannel extends BaseChannel {
   bumpLiveActivitySteps(): void {
     const existing = this.state.liveActivity;
     if (existing) this.update({ liveActivity: { ...existing, stepsDone: existing.stepsDone + 1 } });
+  }
+
+  /**
+   * Per-bot real-time activity: what a bot is doing RIGHT NOW, rendered as a
+   * live region inside its open thread (same spinner block the main chat
+   * gets). Events arrive from the bot activity bus (BotManager.onBotActivity).
+   * Mapping: turn-start → "Working on: <task>"; step/tool labels follow the
+   * actual work; tool finishes keep the last running label (less churn);
+   * turn-end clears the region.
+   */
+  setBotLiveActivity(botId: string, ev: { kind: 'turn-start' | 'step' | 'tool' | 'turn-end'; label: string; detail?: string; status?: string }): void {
+    const map = { ...this.state.botLiveActivity };
+    if (ev.kind === 'turn-end') {
+      if (!map[botId]) return;
+      delete map[botId];
+      this.update({ botLiveActivity: map });
+      return;
+    }
+    // A finished tool keeps its label until the next event — the region
+    // should not flicker to an intermediate state and back.
+    if (ev.kind === 'tool' && ev.status === 'done' && map[botId]) return;
+    const existing = map[botId];
+    map[botId] = {
+      phase: ev.kind === 'turn-start' ? 'Working' : ev.label,
+      detail: ev.kind === 'turn-start'
+        ? ev.label.slice(0, 80)
+        : ev.status === 'error'
+          ? `✗ ${ev.label}${ev.detail ? ` — ${ev.detail}` : ''}`
+          : undefined,
+      stepsDone: ev.kind === 'step' ? (existing?.stepsDone ?? 0) + 1 : (existing?.stepsDone ?? 0),
+      startedAt: existing?.startedAt ?? Date.now(),
+    };
+    this.update({ botLiveActivity: map });
   }
 
   /** Clear the live activity block (task finished or idle). */

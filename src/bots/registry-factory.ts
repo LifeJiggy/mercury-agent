@@ -7,8 +7,7 @@ import type { UserMemoryStore } from '../memory/user-memory.js';
 import type { MercuryConfig } from '../utils/config.js';
 import { logger } from '../utils/logger.js';
 import type { BotManifest, BotPermissionsFile, BotPathScope } from './types.js';
-import { parsePersonaAccess } from './persona-access.js';
-import { BOT_SANDBOX_DIRNAME, BOT_SHARED_SANDBOX_DIRNAME } from './store.js';
+import { BOT_DANGEROUS_TOOLS, BOT_SANDBOX_DIRNAME, BOT_SHARED_SANDBOX_DIRNAME } from './store.js';
 
 /**
  * Tools a bot must never see, regardless of manifest. These are the tools
@@ -36,15 +35,15 @@ export interface BotRegistryDeps {
   botId: string;
   manifest: BotManifest;
   botDir: string;
+  /**
+   * The bot's permissions.yaml — THE single source of truth for what this
+   * bot may do: tool gate (tools), path scopes (paths), shell lists. The
+   * persona is NOT a permission source (character only).
+   */
   permissions: BotPermissionsFile;
   config: MercuryConfig;
   /** Per-bot memory store (P0-5); null until memory scoping is wired. */
   userMemory?: UserMemoryStore | null;
-  /**
-   * Persona text — a `## Access` section grants extra path scopes (merged
-   * with permissions.yaml). Absent or empty section = no change.
-   */
-  persona?: string;
   /**
    * Skill access: when set, the bot gets list_skills + use_skill over the
    * global library AND its own skills dir (install_skill stays stripped).
@@ -82,7 +81,7 @@ export function createBotCapabilityRegistry(deps: BotRegistryDeps): CapabilityRe
   if (skipped > 0) {
     logger.warn({ botId: deps.botId, skipped }, 'Malformed path-scope entries in permissions.yaml (missing "scope") skipped');
   }
-  const granted = mergeScopeGrants(fileGrants, parsePersonaAccess(deps.persona ?? ''));
+  const granted = fileGrants;
   // Implicit sandbox grants come LAST and are never user-configurable away:
   // the private workspace and the fleet-shared folder are the bot's built-in
   // work areas (read/write/execute, no ask, no declaration).
@@ -121,7 +120,7 @@ export function createBotCapabilityRegistry(deps: BotRegistryDeps): CapabilityRe
   registry.setCwd(process.cwd());
   registry.registerAll();
 
-  const tools = filterBotTools(registry.getTools(), deps.manifest);
+  const tools = filterBotTools(registry.getTools(), deps.manifest, deps.permissions);
   logger.info(
     { botId: deps.botId, tools: Object.keys(tools).length, scopes: manifest.capabilities.filesystem.scopes.length },
     'Bot capability registry built (fail-closed, isolated)',
@@ -130,13 +129,22 @@ export function createBotCapabilityRegistry(deps: BotRegistryDeps): CapabilityRe
 }
 
 /**
- * Tool-set filter: interactive/global-mutation tools always stripped, then
- * the manifest's allow/deny applied (deny wins; a non-empty allow restricts
- * the toolset to exactly that list).
+ * Tool-set filter. The gate comes from the bot's permissions.yaml
+ * (`tools.allow/deny`) — the single source of truth. Legacy fallback: a
+ * manifest that still carries an explicit tools block (pre-migration
+ * bot.yaml) is honored; with NEITHER source configured, the fail-closed
+ * dangerous-tool deny list applies (same default as manifest
+ * normalization). Interactive/global-mutation tools are always stripped;
+ * deny wins over allow; a non-empty allow restricts the toolset to exactly
+ * that list.
  */
-export function filterBotTools(all: Record<string, any>, manifest: BotManifest): Record<string, any> {
-  const allow = manifest.tools?.allow ?? [];
-  const deny = new Set(manifest.tools?.deny ?? []);
+export function filterBotTools(all: Record<string, any>, manifest: BotManifest, permissions?: BotPermissionsFile): Record<string, any> {
+  const explicitManifestTools = (manifest as any).tools !== undefined;
+  const gate = permissions?.tools
+    ?? (explicitManifestTools ? manifest.tools : undefined)
+    ?? { deny: [...BOT_DANGEROUS_TOOLS] };
+  const allow = gate.allow ?? [];
+  const deny = new Set(gate.deny ?? []);
   const out: Record<string, any> = {};
   for (const [name, tool] of Object.entries(all)) {
     if (ALWAYS_STRIPPED.has(name)) continue;
@@ -148,18 +156,29 @@ export function filterBotTools(all: Record<string, any>, manifest: BotManifest):
 }
 
 /**
- * Merge raw scope grants from permissions.yaml and the persona's `## Access`
- * section. Additive by design: the persona can only WIDEN what
- * permissions.yaml already grants, and the same path granted twice unions
- * its modes. No persona Access section = permissions.yaml alone (unchanged).
+ * Bot path scopes from permissions.yaml + persona Access grants. 'self'
+ * resolves to the bot's own profile dir; everything else resolves against
+ * cwd or home (~). An unconfigured bot gets NO filesystem access
+ * (fail-closed) — but the store always writes a default self scope at
+ * creation.
  */
-function mergeScopeGrants(
-  fileScopes: BotPathScope[] | undefined,
-  personaScopes: BotPathScope[],
+/** A scope entry is usable only with a non-empty string scope. */
+function isValidScopeEntry(p: BotPathScope | undefined): boolean {
+  return !!p && typeof p.scope === 'string' && p.scope.trim().length > 0;
+}
+
+/**
+ * Union of path-scope grants keyed by resolved path: the same path granted
+ * twice unions its modes. Used by the permission migration to fold legacy
+ * persona Access grants into the permissions.yaml paths block.
+ */
+export function mergePathScopes(
+  baseScopes: BotPathScope[] | undefined,
+  extraScopes: BotPathScope[],
 ): BotPathScope[] {
-  if (personaScopes.length === 0) return fileScopes ?? [];
-  const merged = [...(fileScopes ?? [])];
-  for (const grant of personaScopes) {
+  if (extraScopes.length === 0) return baseScopes ?? [];
+  const merged = [...(baseScopes ?? [])];
+  for (const grant of extraScopes) {
     const key = normalizeScopeKey(grant.scope);
     const existing = merged.find(p => normalizeScopeKey(p.scope) === key);
     if (existing) {
@@ -176,18 +195,6 @@ function mergeScopeGrants(
 /** Key for grant de-duplication: resolved absolute path ('self' resolved later). */
 function normalizeScopeKey(scope: string): string {
   return scope === 'self' ? 'self' : resolve(scope.replace(/^~/, homedir())).toLowerCase();
-}
-
-/**
- * Bot path scopes from permissions.yaml + persona Access grants. 'self'
- * resolves to the bot's own profile dir; everything else resolves against
- * cwd or home (~). An unconfigured bot gets NO filesystem access
- * (fail-closed) — but the store always writes a default self scope at
- * creation.
- */
-/** A scope entry is usable only with a non-empty string scope. */
-function isValidScopeEntry(p: BotPathScope | undefined): boolean {
-  return !!p && typeof p.scope === 'string' && p.scope.trim().length > 0;
 }
 
 function buildBotScopes(paths: BotPathScope[] | undefined, botDir: string): Array<{ path: string; read: boolean; write: boolean; execute?: boolean }> {

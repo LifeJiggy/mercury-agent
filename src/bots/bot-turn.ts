@@ -5,6 +5,9 @@ import type { UserMemoryStore } from '../memory/user-memory.js';
 import type { TokenBudget } from '../utils/tokens.js';
 import type { BaseProvider } from '../providers/base.js';
 import { classifyStreamCompletion } from '../core/stream-completion.js';
+import { stepsExhaustedPrompt } from '../core/completion-verdict.js';
+import { MAX_AUTOMATIC_CONTINUATIONS } from '../core/execution-limits.js';
+import { formatToolStep } from '../utils/tool-label.js';
 import { logger } from '../utils/logger.js';
 import type { BotManifest, BotTrigger } from './types.js';
 
@@ -14,9 +17,28 @@ export interface BotTurnMail {
   content: string;
 }
 
+/**
+ * Real-time bot activity event — what the bot is doing RIGHT NOW. Emitted at
+ * AI SDK callback granularity (step start, tool call start/finish) so the
+ * surfaces can show live work instead of the coarse idle/running states.
+ */
+export type BotActivityEvent = {
+  botId: string;
+  jobId: string;
+  kind: 'turn-start' | 'step' | 'tool' | 'turn-end';
+  /** Human-readable: "read_file ~/cookies" / "step 4 · 12.3k tok in". */
+  label: string;
+  detail?: string;
+  stepIndex: number;
+  elapsedMs: number;
+  status?: 'running' | 'done' | 'error';
+};
+
 export interface BotTurnInput {
   manifest: BotManifest;
   trigger: BotTrigger;
+  /** Durable job id — correlates activity events with the run. */
+  jobId?: string;
   prompt: string;
   persona: string;
   /** Pending mailbox messages at turn start (attributed bot-to-bot handoffs). */
@@ -40,6 +62,8 @@ export interface BotTurnInput {
   provider: BaseProvider;
   tokenBudget: TokenBudget;
   abortSignal: AbortSignal;
+  /** Real-time activity consumer (roster, live regions, web feed). */
+  onActivity?: (ev: BotActivityEvent) => void;
 }
 
 export interface BotTurnOutput {
@@ -82,9 +106,29 @@ export async function runBotTurn(input: BotTurnInput): Promise<BotTurnOutput> {
   let tokensOut = 0;
   let lastResult: any = null;
   let stepsRemaining = maxSteps;
+  let budgetContinuations = 0;
+  let stepIndex = 0;
+  const turnStartedAt = Date.now();
   const toolsUsed = new Set<string>();
+  const onActivity = input.onActivity;
+  const emit = (ev: { kind: BotActivityEvent['kind']; label: string; detail?: string; stepIndex: number; status?: BotActivityEvent['status']; elapsedMs?: number }): void => {
+    if (!onActivity) return;
+    try {
+      onActivity({
+        botId: manifest.id,
+        jobId: input.jobId ?? '',
+        elapsedMs: ev.elapsedMs ?? Date.now() - turnStartedAt,
+        kind: ev.kind,
+        label: ev.label,
+        detail: ev.detail,
+        stepIndex: ev.stepIndex,
+        status: ev.status,
+      });
+    } catch { /* activity feedback must never break a turn */ }
+  };
 
   try {
+    emit({ kind: 'turn-start', stepIndex: 0, label: input.prompt ? input.prompt.slice(0, 80) : 'Checking inbox' });
     while (stepsRemaining > 0 && !abortSignal.aborted) {
       const result = await generateText({
         model: provider.getModelInstance(),
@@ -94,6 +138,25 @@ export async function runBotTurn(input: BotTurnInput): Promise<BotTurnOutput> {
         stopWhen: stepCountIs(stepsRemaining),
         abortSignal,
         experimental_include: { requestBody: false, responseBody: false },
+        experimental_onStepStart: () => {
+          stepIndex++;
+          emit({ kind: 'step', stepIndex, label: `step ${stepIndex}` });
+        },
+        experimental_onToolCallStart: ({ toolCall }: any) => {
+          const label = formatToolStep(String(toolCall?.toolName ?? 'tool'), (toolCall?.input ?? {}) as Record<string, any>);
+          emit({ kind: 'tool', stepIndex, label, status: 'running' });
+        },
+        experimental_onToolCallFinish: ({ toolCall, success, error, durationMs }: any) => {
+          const label = formatToolStep(String(toolCall?.toolName ?? 'tool'), (toolCall?.input ?? {}) as Record<string, any>);
+          emit({
+            kind: 'tool',
+            stepIndex,
+            label,
+            detail: error != null ? String(error?.message ?? error).slice(0, 200) : undefined,
+            status: success ? 'done' : 'error',
+            elapsedMs: typeof durationMs === 'number' ? durationMs : undefined,
+          });
+        },
         onStepFinish: ({ usage, toolCalls }) => {
           if (abortSignal.aborted) return;
           stepsRemaining--;
@@ -104,6 +167,8 @@ export async function runBotTurn(input: BotTurnInput): Promise<BotTurnOutput> {
           for (const tc of toolCalls ?? []) {
             if (tc?.toolName) toolsUsed.add(String(tc.toolName));
           }
+          const kIn = Math.round(tokensIn / 100) / 10;
+          emit({ kind: 'step', stepIndex, label: `step ${stepIndex} · ${kIn}k tok in` });
         },
       });
       lastResult = result;
@@ -119,6 +184,28 @@ export async function runBotTurn(input: BotTurnInput): Promise<BotTurnOutput> {
 
       if (result.text) {
         messages.push({ role: 'assistant', content: result.text });
+      }
+
+      // Step budget exhausted with tool calls still pending is a PAUSE, never
+      // a completion (sub-agent completion contract). Mirror the main agent's
+      // bounded auto-continuation: refill the budget and resume the SAME
+      // conversation in-process — the old path requeued the job and rebuilt
+      // the turn from scratch, discarding every completed step and re-burning
+      // the budget redoing the first 25 steps. The per-bot daily token
+      // budget remains the runaway guard; past the continuation bound the
+      // paused return below still applies.
+      if (stepsRemaining <= 0 && (lastResult as any)?.finishReason === 'tool-calls') {
+        if (!abortSignal.aborted && budgetContinuations < MAX_AUTOMATIC_CONTINUATIONS) {
+          budgetContinuations++;
+          logger.warn(
+            { botId: manifest.id, rounds: budgetContinuations, budget: maxSteps },
+            'Bot step budget exhausted mid-turn — continuing with a fresh budget',
+          );
+          messages.push({ role: 'user', content: stepsExhaustedPrompt(input.prompt) });
+          stepsRemaining = maxSteps;
+          continue;
+        }
+        break;
       }
 
       // Consume newly arrived mailbox messages before finishing, so a
@@ -141,7 +228,9 @@ export async function runBotTurn(input: BotTurnInput): Promise<BotTurnOutput> {
 
     // Step budget exhausted with tool calls still pending — pause, never
     // report success on half-done work (sub-agent completion contract).
+    // Last resort only: reached past the in-process continuation bound.
     if (stepsRemaining <= 0 && (lastResult as any)?.finishReason === 'tool-calls') {
+      emit({ kind: 'turn-end', stepIndex, label: 'paused — step budget', status: 'done' });
       return {
         status: 'paused',
         output: 'Step budget reached before the turn completed — remaining work continues next turn.',
@@ -163,11 +252,14 @@ export async function runBotTurn(input: BotTurnInput): Promise<BotTurnOutput> {
       channelType: 'bot',
     });
 
+    emit({ kind: 'turn-end', stepIndex, label: 'completed', status: 'done' });
     return { status: 'completed', output, tokensIn, tokensOut, toolsUsed: [...toolsUsed] };
   } catch (err: any) {
     if (abortSignal.aborted) {
+      emit({ kind: 'turn-end', stepIndex, label: 'halted', status: 'done' });
       return { status: 'halted', output: 'Turn was halted.', tokensIn, tokensOut, toolsUsed: [...toolsUsed] };
     }
+    emit({ kind: 'turn-end', stepIndex, label: `failed: ${String(err?.message ?? err).slice(0, 80)}`, status: 'error' });
     return {
       status: 'failed',
       output: `Turn failed: ${err?.message ?? String(err)}`,
@@ -184,7 +276,11 @@ export async function runBotTurn(input: BotTurnInput): Promise<BotTurnOutput> {
 export function classifyFailure(err: any): string {
   const msg = String(err?.message ?? err ?? '').toLowerCase();
   if (/rate.?limit|429|too many requests/.test(msg)) return 'provider_rate_limit';
-  if (/timeout|etimedout|econnaborted|socket hang up/.test(msg)) return 'provider_timeout';
+  // Network blips ARE transient — ECONNRESET (connection dropped mid-read)
+  // and friends used to fall through to unknown_error, so a plain
+  // connection blip went straight to the DLQ with a needs-you flag instead
+  // of retrying like every other transient failure.
+  if (/timeout|etimedout|econnaborted|econnreset|econnrefused|epipe|enotfound|eai_again|getaddrinfo|fetch failed|socket hang up|network/.test(msg)) return 'provider_timeout';
   if (/permission denied|blocked command|no permission/.test(msg)) return 'permission_denied';
   if (/api key|unauthorized|401|authentication/.test(msg)) return 'provider_auth';
   if (/quota|billing|402/.test(msg)) return 'provider_quota';

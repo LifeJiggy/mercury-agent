@@ -19,6 +19,9 @@ export const BOT_SANDBOX_DIRNAME = 'sandbox';
 export const BOT_ENV_FILENAME = '.env';
 export const BOT_JOURNAL_FILENAME = 'journal.jsonl';
 
+/** Fleet nesting cap — mirrors addCrew's 3-level guard (CEO → Lead → Crew). */
+export const MAX_FLEET_DEPTH = 3;
+
 /** Lowercase alphanumeric ids — same discipline as skill ids (traversal guard). */
 const BOT_ID_PATTERN = /^[a-z0-9][a-z0-9-]{0,47}$/;
 
@@ -114,20 +117,10 @@ falls outside it.
 - You never ask the user questions mid-run: if a required input is missing,
   state the assumption you are proceeding with.
 - If you lack permission for an action, stop and report it in your summary
-  instead of attempting a workaround.
-
-## Access
-
-You always have three work areas — never ask permission for these, and do
-not declare them here: your private \`sandbox/\` folder (next to this
-persona file), the fleet \`_shared/\` folder (shared with all bots —
-publish reusable data there even when not asked), and your own profile
-directory. Anything else is denied until it is granted here — one bullet
-per directory (the forms below are examples only; write real bullets to
-grant access):
-\`- ~/some/dir — read\` · \`- ~/other/dir — read, write\` · \`- /usr/local/bin/tool — execute\`.
-A granted directory covers everything inside it. Outside these grants you
-do not act — you stop and report which access you would have needed.
+  instead of attempting a workaround. Permissions are NOT declared here —
+  they live exclusively in your permissions.yaml file (the single source of
+  truth); your private \`sandbox/\`, the fleet \`_shared/\` folder and your
+  own profile directory are always yours.
 
 ## Output
 
@@ -142,7 +135,11 @@ function atomicWrite(filePath: string, content: string, mode: number = 0o600): v
 }
 
 /**
- * Filesystem store for bot profiles: `~/.mercury/bots/<id>/`.
+ * Filesystem store for bot profiles. Fleet structure is PHYSICAL: a crew
+ * bot's whole profile lives inside its lead's directory —
+ * `~/.mercury/bots/<lead>/[<mid-lead>/...]/<crew-id>/` — so removing a lead
+ * removes its crew tree with it, and the layout mirrors the hierarchy the
+ * manifests already describe. Solos and leads live at the root.
  * Mirrors SkillStore's dependency-injected-root testability and traversal
  * guards, and SessionRepository's atomic tmp+rename writes.
  */
@@ -150,6 +147,12 @@ export class BotStore {
   readonly botsRoot: string;
   /** mtime-validated manifest cache (see get()) — write paths keep it fresh. */
   private manifestCache = new Map<string, { mtimeMs: number; manifest: BotManifest }>();
+  /** id → absolute profile dir; populated on first resolution (scan), kept
+   * fresh by every write path. Cleared on delete/relocate. */
+  private locationCache = new Map<string, string>();
+  /** Wired by BotManager: a bot's profile dir moved (re-parent or migration) —
+   * open journal handles and registry caches for that id are stale. */
+  onRelocate: ((id: string, oldDir: string, newDir: string) => void) | null = null;
 
   constructor(botsRoot?: string) {
     this.botsRoot = resolve(botsRoot ?? join(getMercuryHome(), 'bots'));
@@ -158,12 +161,45 @@ export class BotStore {
   /** Bot directory for an id, with traversal guard. Throws on invalid ids. */
   botDir(id: string): string {
     assertValidBotId(id);
-    const dir = resolve(this.botsRoot, id);
-    const root = resolve(this.botsRoot);
-    if (!dir.startsWith(root + sep)) {
-      throw new Error(`Invalid bot id "${id}": escapes the bots root`);
-    }
+    const cached = this.locationCache.get(id);
+    if (cached) return cached;
+    const dir = this.resolveBotDir(id);
+    this.locationCache.set(id, dir);
     return dir;
+  }
+
+  /**
+   * Resolve a bot's profile dir. Flat-first (solos/leads + any legacy crew
+   * dirs), then a depth-bounded scan for the nested crew profile — the
+   * parent id lives INSIDE the crew's manifest, so the directory is the
+   * only place the location can be discovered from.
+   */
+  private resolveBotDir(id: string): string {
+    const root = resolve(this.botsRoot);
+    const flat = resolve(root, id);
+    if (existsSync(join(flat, BOT_MANIFEST_FILENAME))) return flat;
+    const nested = this.scanForBotDir(root, id, 0);
+    return nested ?? flat;
+  }
+
+  private scanForBotDir(dir: string, id: string, depth: number): string | undefined {
+    if (depth >= MAX_FLEET_DEPTH) return undefined;
+    let entries;
+    try {
+      entries = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return undefined;
+    }
+    const root = resolve(this.botsRoot);
+    for (const entry of entries) {
+      if (!entry.isDirectory() || entry.name.startsWith('.') || entry.name.startsWith('_')) continue;
+      const sub = join(dir, entry.name);
+      if (!resolve(sub).startsWith(root + sep)) continue;
+      if (entry.name === id && existsSync(join(sub, BOT_MANIFEST_FILENAME))) return sub;
+      const deeper = this.scanForBotDir(sub, id, depth + 1);
+      if (deeper) return deeper;
+    }
+    return undefined;
   }
 
   /** The bot's private sandbox workspace (inside its profile dir — purged on delete). */
@@ -208,22 +244,90 @@ export class BotStore {
   list(): BotManifest[] {
     if (!existsSync(this.botsRoot)) return [];
     const manifests: BotManifest[] = [];
-    for (const entry of readdirSync(this.botsRoot, { withFileTypes: true })) {
-      if (!entry.isDirectory() || entry.name.startsWith('.') || entry.name.startsWith('_')) continue;
+    // Fleet layout is physical: crew profiles nest inside their lead's dir,
+    // so walk the tree (bounded by the fleet depth cap). Data dirs without a
+    // bot.yaml (sandbox/, skills/, rotations) are descended harmlessly but
+    // never counted as bots.
+    const visit = (dir: string, depth: number): void => {
+      let entries;
       try {
-        const m = this.get(entry.name);
-        if (m) manifests.push(m);
+        entries = readdirSync(dir, { withFileTypes: true });
+      } catch {
+        return;
+      }
+      for (const entry of entries) {
+        if (!entry.isDirectory() || entry.name.startsWith('.') || entry.name.startsWith('_')) continue;
+        const sub = join(dir, entry.name);
+        try {
+          const m = this.get(entry.name);
+          if (m) manifests.push(m);
+        } catch (err: any) {
+          logger.warn({ dir: sub, err: err?.message }, 'Skipping unreadable bot profile');
+        }
+        if (depth < MAX_FLEET_DEPTH) visit(sub, depth + 1);
+      }
+    };
+    visit(this.botsRoot, 1);
+    this.reconcileFleetPlacement(manifests);
+    return manifests.sort((a, b) => a.id.localeCompare(b.id));
+  }
+
+  /**
+   * Strict fleet layout reconciliation: the folder tree and the manifests
+   * must agree, and BOTH hand-authoring paths converge (this is what makes
+   * manually created fleet folders first-class):
+   *  - A bot.yaml dropped manually inside a lead's directory is ADOPTED as
+   *    that lead's crew (manifest gains parent, fleetRole, comms back).
+   *  - A manifest that names a parent (hand-edited or manager-written)
+   *    has its profile dir MOVED under that lead.
+   * When both disagree (folder under A, manifest says B), the manifest is
+   * the newer intent and wins — same rule as every other live hand-edit.
+   * Deleting crews whose lead vanished stays a startup-migration rule: a
+   * transient hand-edit must not cascade-delete bots mid-session.
+   */
+  private reconcileFleetPlacement(manifests: BotManifest[]): void {
+    for (const m of manifests) {
+      try {
+        const physical = this.physicalFleetParent(m.id);
+        if (m.parent && m.parent !== physical) {
+          if (this.exists(m.parent)) {
+            this.relocateToParent(m);
+          }
+          // Missing lead: migrateFleetLayout cascade-deletes at startup.
+        } else if (!m.parent && physical && physical !== m.id) {
+          const lead = this.get(physical);
+          if (lead) {
+            this.update(m.id, mm => {
+              mm.parent = physical;
+              mm.fleetRole = 'crew';
+              mm.comms = { ...mm.comms, canMessage: [...new Set([...(mm.comms?.canMessage ?? []), physical])] };
+            });
+            logger.info({ botId: m.id, leadId: physical }, 'Manually created fleet folder adopted into the lead\'s crew');
+          }
+        }
       } catch (err: any) {
-        logger.warn({ botId: entry.name, err: err?.message }, 'Skipping unreadable bot profile');
+        logger.warn({ botId: m.id, err: err?.message }, 'Fleet placement reconciliation failed — leaving profile as-is');
       }
     }
-    return manifests.sort((a, b) => a.id.localeCompare(b.id));
+  }
+
+  /** The bot id owning the directory this profile lives in (undefined at the bots root). */
+  private physicalFleetParent(id: string): string | undefined {
+    const parentDir = resolve(this.botDir(id), '..');
+    if (parentDir === resolve(this.botsRoot)) return undefined;
+    if (!existsSync(join(parentDir, BOT_MANIFEST_FILENAME))) return undefined;
+    const owner = parentDir.split(sep).pop()!;
+    assertValidBotId(owner);
+    return owner;
   }
 
   get(id: string): BotManifest | null {
     const file = join(this.botDir(id), BOT_MANIFEST_FILENAME);
     if (!existsSync(file)) {
       this.manifestCache.delete(id);
+      // A cached location whose manifest has vanished is a dead entry (the
+      // id may have been deleted, or never existed) — force a fresh scan.
+      this.locationCache.delete(id);
       return null;
     }
     // mtime-validated cache: getStatusSummaries() runs on the TUI's 2s status
@@ -272,8 +376,11 @@ export class BotStore {
     if (errors.length > 0) {
       throw new Error(`Invalid bot manifest: ${errors.join('; ')}`);
     }
-
-    const dir = this.botDir(id);
+    // Fleet layout: a crew bot's profile is created INSIDE its lead's
+    // directory. The lead must exist — fail closed rather than placing a
+    // profile the hierarchy cannot account for.
+    const dir = manifest.parent ? this.resolveNestedDir(manifest.parent, id) : this.botDir(id);
+    this.locationCache.set(id, dir);
     mkdirSync(dir, { recursive: true });
     this.ensureSandboxes(id);
     this.save(manifest);
@@ -281,18 +388,16 @@ export class BotStore {
     if (!existsSync(personaFile)) {
       writeFileSync(personaFile, input.persona ?? DEFAULT_PERSONA_TEMPLATE(input.name, input.description), 'utf-8');
     }
-    const permFile = join(dir, BOT_PERMISSIONS_FILENAME);
-    if (!existsSync(permFile)) {
-      // Fail-closed default: only the bot's own dir, read+write.
-      this.writePermissions(id, {
-        paths: [{ scope: 'self', read: true, write: true }],
-      });
-    }
+    // NO default permissions.yaml here: an ABSENT file is meaningful — a
+    // crew bot inherits its lead's file verbatim (ensurePermissions), and a
+    // solo falls back to the fail-closed default. A tier choice, fleet
+    // inheritance, or the startup migration materializes the file.
     return manifest;
   }
 
   save(manifest: BotManifest): void {
     assertValidBotId(manifest.id);
+    this.assertFleetParentValid(manifest);
     const dir = this.botDir(manifest.id);
     if (!existsSync(dir)) {
       throw new Error(`Bot "${manifest.id}" does not exist`);
@@ -313,6 +418,9 @@ export class BotStore {
     if (!manifest) throw new Error(`Bot "${id}" does not exist`);
     mutator(manifest);
     manifest.updatedAt = new Date().toISOString();
+    // Re-parent moves the profile dir to keep the physical layout in sync
+    // (crew nested under its lead; promote/detach moves back to the root).
+    this.relocateToParent(manifest);
     this.save(manifest);
     return manifest;
   }
@@ -324,10 +432,70 @@ export class BotStore {
   delete(id: string): void {
     const dir = this.botDir(id);
     if (existsSync(dir)) {
+      // Fleet layout is physical: crew profiles live INSIDE their lead's
+      // dir, so this removes the whole crew tree with the lead.
       rmSync(dir, { recursive: true, force: true });
       this.manifestCache.delete(id);
+      this.locationCache.delete(id);
       logger.info({ botId: id }, 'Bot profile deleted');
     }
+  }
+
+  // ---- fleet placement ------------------------------------------------------
+
+  /**
+   * The profile dir a bot with this manifest should occupy: nested under its
+   * lead's dir, or at the root for solos/leads. Fails closed if the lead is
+   * unknown. Pure computation — no filesystem writes.
+   */
+  private resolveNestedDir(parentId: string, id: string): string {
+    assertValidBotId(parentId);
+    if (!this.exists(parentId)) {
+      throw new Error(`Parent bot "${parentId}" does not exist`);
+    }
+    return join(this.botDir(parentId), id);
+  }
+
+  /** Fail closed on dangling parents and hierarchy cycles before any write. */
+  private assertFleetParentValid(manifest: BotManifest): void {
+    if (!manifest.parent) return;
+    assertValidBotId(manifest.parent);
+    if (!this.exists(manifest.parent)) {
+      throw new Error(`Parent bot "${manifest.parent}" does not exist`);
+    }
+    let ancestor: string | undefined = manifest.parent;
+    const seen = new Set([manifest.id]);
+    let depth = 0;
+    while (ancestor) {
+      if (seen.has(ancestor)) {
+        throw new Error(`Fleet cycle detected at "${ancestor}"`);
+      }
+      seen.add(ancestor);
+      if (++depth > MAX_FLEET_DEPTH) {
+        throw new Error(`Fleet nesting exceeds ${MAX_FLEET_DEPTH} levels`);
+      }
+      const next: string | undefined = this.get(ancestor)?.parent;
+      ancestor = next ?? undefined;
+    }
+  }
+
+  /**
+   * Move a bot's profile to where its manifest's parent says it belongs
+   * (idempotent no-op when it is already there). Used by re-parenting
+   * updates and the startup migration. Fires onRelocate so open journal
+   * handles and runtime caches for the id are refreshed.
+   */
+  relocateToParent(manifest: BotManifest): boolean {
+    const current = this.botDir(manifest.id);
+    const target = manifest.parent ? this.resolveNestedDir(manifest.parent, manifest.id) : resolve(this.botsRoot, manifest.id);
+    if (resolve(current) === resolve(target)) return false;
+    if (!existsSync(current)) return false;
+    mkdirSync(resolve(target, '..'), { recursive: true });
+    renameSync(current, target);
+    this.locationCache.set(manifest.id, resolve(target));
+    this.onRelocate?.(manifest.id, current, resolve(target));
+    logger.info({ botId: manifest.id, from: current, to: resolve(target) }, 'Bot profile relocated to its fleet parent');
+    return true;
   }
 
   readPersona(id: string): string {
@@ -349,6 +517,35 @@ export class BotStore {
     return (parseYaml(readFileSync(file, 'utf-8')) ?? {}) as BotPermissionsFile;
   }
 
+  /**
+   * Fleet permission inheritance — the crew rule: a crew bot runs on its
+   * LEAD's permissions verbatim unless it has an explicitly edited file of
+   * its own. Resolution:
+   *  - permissions.yaml exists → that file (explicit; edits stick).
+   *  - absent + the bot has a lead → the lead's file is COPIED into the
+   *    crew's dir (copy-paste semantics: from then on the crew owns it and
+   *    later lead changes do not propagate — exactly "inherit unless the
+   *    user edits"). `self` scopes resolve per-bot at registry build, so a
+   *    verbatim copy is safe.
+   *  - absent + no lead (solo) → the fail-closed default is materialized
+   *    (own profile dir, read+write).
+   */
+  ensurePermissions(id: string): BotPermissionsFile {
+    const file = join(this.botDir(id), BOT_PERMISSIONS_FILENAME);
+    if (existsSync(file)) return this.readPermissions(id);
+    const manifest = this.get(id);
+    const leadId = manifest?.parent;
+    if (leadId && this.exists(leadId)) {
+      const leadPerms = this.readPermissions(leadId);
+      const inherited = Object.keys(leadPerms).length > 0 ? leadPerms : DEFAULT_BOT_PERMISSIONS;
+      this.writePermissions(id, inherited);
+      logger.info({ botId: id, leadId }, 'Crew permissions inherited from its lead (copied verbatim)');
+      return inherited;
+    }
+    this.writePermissions(id, DEFAULT_BOT_PERMISSIONS);
+    return DEFAULT_BOT_PERMISSIONS;
+  }
+
   writePermissions(id: string, permissions: BotPermissionsFile): void {
     atomicWrite(join(this.botDir(id), BOT_PERMISSIONS_FILENAME), stringifyYaml(permissions));
   }
@@ -364,6 +561,11 @@ export class BotStore {
     return out;
   }
 }
+
+/** Fail-closed baseline for a bot with no permissions.yaml and no lead. */
+const DEFAULT_BOT_PERMISSIONS: BotPermissionsFile = {
+  paths: [{ scope: 'self', read: true, write: true }],
+};
 
 function treeSize(dir: string): number {
   let total = 0;

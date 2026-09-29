@@ -3,20 +3,16 @@ import type { BotPathScope } from './types.js';
 /**
  * Persona-declared access grants (`## Access` section in persona.md).
  *
- * The persona is where users describe their bot in their own words — so it is
- * also where they grant directory access. One bullet per grant:
- *
- *   ## Access
- *   - ~/cookies — read
- *   - ~/projects/site — read, write
- *   - /usr/local/bin/tool — execute
- *   - self — read, write
+ * DEPRECATED as a permission source: permissions.yaml is the single source
+ * of truth, and the persona carries character only. This parser survives for
+ * ONE purpose — the one-shot startup migration that moves legacy `## Access`
+ * grants into the bot's permissions.yaml and strips the section from the
+ * persona file (stripPersonaAccessSection). Nothing at runtime reads grants
+ * from a persona anymore.
  *
  * Parsing is deliberately conservative: only list bullets inside the section
  * count, the path must look like a path (or `self`), and prose/example text
- * that isn't a bullet is ignored — so a template's inline example can never
- * grant anything. An absent or empty section changes nothing: the bot keeps
- * exactly the scopes from its permissions.yaml (fail-closed default).
+ * that isn't a bullet is ignored.
  */
 export function parsePersonaAccess(persona: string): BotPathScope[] {
   if (!persona) return [];
@@ -34,6 +30,29 @@ export function parsePersonaAccess(persona: string): BotPathScope[] {
     if (grant) grants.push(grant);
   }
   return grants;
+}
+
+/**
+ * Migration companion: remove the `## Access` section (and any trailing
+ * prose that belonged to it) from a persona, leaving the rest intact.
+ */
+export function stripPersonaAccessSection(persona: string): string {
+  if (!persona) return persona;
+  const lines = persona.split('\n');
+  const start = lines.findIndex(l => /^##\s+Access\b/i.test(l));
+  if (start === -1) return persona;
+  let end = lines.length;
+  for (let i = start + 1; i < lines.length; i++) {
+    if (/^#{1,2}\s/.test(lines[i])) { end = i; break; }
+  }
+  const replacement = [
+    '## Permissions',
+    '',
+    'Permissions live exclusively in your permissions.yaml file (the single',
+    'source of truth). Your private `sandbox/`, the fleet `_shared/` folder',
+    'and your own profile directory are always yours.',
+  ];
+  return [...lines.slice(0, start), ...replacement, ...lines.slice(end)].join('\n').replace(/\n{3,}/g, '\n\n');
 }
 
 function parseGrant(bullet: string): BotPathScope | null {
