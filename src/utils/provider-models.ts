@@ -89,6 +89,7 @@ const MIMO_TOKEN_PLAN_PREFERRED_MODELS = MIMO_PREFERRED_MODELS;
 
 const OPENAI_COMPAT_PREFERRED_MODELS = [] as const;
 const LM_STUDIO_PREFERRED_MODELS = [] as const;
+const ATOMIC_CHAT_PREFERRED_MODELS = [] as const;
 
 const CHATGPT_WEB_PREFERRED_MODELS = [
   'gpt-5.6-sol',
@@ -136,6 +137,7 @@ export function getPreferredModelsForProvider(provider: ProviderName): string[] 
     atlascloud: ATLASCLOUD_PREFERRED_MODELS,
     ollamaCloud: OLLAMA_CLOUD_PREFERRED_MODELS,
     ollamaLocal: OLLAMA_LOCAL_PREFERRED_MODELS,
+    atomicChat: ATOMIC_CHAT_PREFERRED_MODELS,
     openaiCompat: OPENAI_COMPAT_PREFERRED_MODELS,
     litellm: OPENAI_COMPAT_PREFERRED_MODELS,
     lmStudio: LM_STUDIO_PREFERRED_MODELS,
@@ -260,6 +262,7 @@ function chooseRecommendedModel(
     atlascloud: ATLASCLOUD_PREFERRED_MODELS,
     ollamaCloud: OLLAMA_CLOUD_PREFERRED_MODELS,
     ollamaLocal: OLLAMA_LOCAL_PREFERRED_MODELS,
+    atomicChat: ATOMIC_CHAT_PREFERRED_MODELS,
     openaiCompat: OPENAI_COMPAT_PREFERRED_MODELS,
     mimo: MIMO_PREFERRED_MODELS,
     mimoTokenPlan: MIMO_TOKEN_PLAN_PREFERRED_MODELS,
@@ -303,6 +306,7 @@ export function buildModelCatalog(
     atlascloud: ATLASCLOUD_PREFERRED_MODELS,
     ollamaCloud: OLLAMA_CLOUD_PREFERRED_MODELS,
     ollamaLocal: OLLAMA_LOCAL_PREFERRED_MODELS,
+    atomicChat: ATOMIC_CHAT_PREFERRED_MODELS,
     openaiCompat: OPENAI_COMPAT_PREFERRED_MODELS,
     mimo: MIMO_PREFERRED_MODELS,
     mimoTokenPlan: MIMO_TOKEN_PLAN_PREFERRED_MODELS,
@@ -336,7 +340,7 @@ async function fetchOpenAICompatModels(provider: ProviderName, config: ProviderC
     errorMessage = 'Mercury could not fetch models for this DeepSeek key. Please re-enter it.';
   } else if (provider === 'aimlapi') {
     errorMessage = 'Mercury could not fetch models for this AI/ML API key. Please re-enter it.';
-  } else if (provider === 'openaiCompat') {
+  } else if (provider === 'openaiCompat' || provider === 'atomicChat' || provider === 'lmStudio') {
     errorMessage = 'Mercury could not fetch models from this server. Please check the base URL and try again.';
   } else if (provider === 'litellm') {
     errorMessage = 'Mercury could not fetch models from the LiteLLM proxy. Please check the base URL and ensure the proxy is running.';
@@ -363,7 +367,7 @@ async function fetchOpenAICompatModels(provider: ProviderName, config: ProviderC
       if (provider === 'deepseek') {
         return id.startsWith('deepseek-');
       }
-      if (provider === 'openaiCompat' || provider === 'litellm') {
+      if (provider === 'openaiCompat' || provider === 'litellm' || provider === 'atomicChat' || provider === 'lmStudio') {
         return id.length > 0;
       }
       if (provider === 'atlascloud') {
@@ -576,7 +580,7 @@ export async function fetchProviderModelCatalog(
     return fetchOllamaLocalModels(config);
   }
 
-  if (provider === 'openaiCompat' || provider === 'litellm') {
+  if (provider === 'openaiCompat' || provider === 'litellm' || provider === 'atomicChat') {
     return fetchOpenAICompatModels(provider, config);
   }
 

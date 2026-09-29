@@ -1,4 +1,7 @@
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, symlinkSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { PermissionManager, splitShellSegments } from './permissions.js';
 
 describe('splitShellSegments', () => {
@@ -233,5 +236,74 @@ describe('PermissionManager remote safety', () => {
     await expect(permissions.checkShellCommand('find . -maxdepth 1')).resolves.toMatchObject({ allowed: true });
     await expect(permissions.checkShellCommand('du -sh .')).resolves.toMatchObject({ allowed: true });
     expect(ask).toHaveBeenCalledTimes(4);
+  });
+
+  it('requires approval for safe-read commands that rely on shell expansion', async () => {
+    const permissions = new PermissionManager();
+    const manifest = permissions.getManifest();
+    manifest.capabilities.shell.enabled = true;
+    manifest.capabilities.shell.blocked = [];
+    const ask = vi.fn().mockResolvedValue('no');
+    permissions.onAsk(ask);
+    permissions.setCurrentContext('web', 'cloud-request-1');
+
+    // $HOME/… expands to a path the literal gate never saw (CVE-2026-28463).
+    await expect(permissions.checkShellCommand('head $HOME/secret.txt')).resolves.toMatchObject({ allowed: false });
+    // ${…} and command substitution are the same class.
+    await expect(permissions.checkShellCommand('cat ${HOME}/secret.txt')).resolves.toMatchObject({ allowed: false });
+    // $VAR discloses environment values (issue #76/#80).
+    await expect(permissions.checkShellCommand('echo $TOKEN')).resolves.toMatchObject({ allowed: false });
+    // Home shorthands expand after the check too.
+    await expect(permissions.checkShellCommand('cat ~/secret.txt')).resolves.toMatchObject({ allowed: false });
+    // ANSI-C quoting expands hex/unicode escapes post-check (same class as #95).
+    await expect(permissions.checkShellCommand("head $'\\x2fetc\\x2fpasswd'")).resolves.toMatchObject({ allowed: false });
+    // A plain read relative to cwd stays auto-approved.
+    await expect(permissions.checkShellCommand('head file.txt')).resolves.toMatchObject({ allowed: true });
+  });
+});
+
+describe('PermissionManager symlink write confinement', () => {
+  let root: string;
+  let ws: string;
+  let outside: string;
+
+  function makePermissions(): PermissionManager {
+    const permissions = new PermissionManager();
+    const manifest = permissions.getManifest();
+    manifest.capabilities.filesystem.enabled = true;
+    manifest.capabilities.filesystem.scopes.push({ path: ws, read: true, write: true });
+    permissions.setAutoApproveAll(true);
+    return permissions;
+  }
+
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), 'mercury-fs-'));
+    ws = join(root, 'ws');
+    outside = join(root, 'outside');
+    mkdirSync(ws);
+    mkdirSync(outside);
+    writeFileSync(join(outside, 'secret.txt'), 'x');
+    symlinkSync(join(outside, 'secret.txt'), join(ws, 'alias.txt'));
+  });
+
+  afterEach(() => {
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  it('denies a write that escapes the scope through an in-scope symlink', async () => {
+    const permissions = makePermissions();
+    await expect(permissions.checkFsAccess(join(ws, 'alias.txt'), 'write')).resolves.toMatchObject({ allowed: false });
+  });
+
+  it('still allows a plain write inside the scope', async () => {
+    const permissions = makePermissions();
+    await expect(permissions.checkFsAccess(join(ws, 'new.txt'), 'write')).resolves.toMatchObject({ allowed: true });
+  });
+
+  it('allows a symlink whose target stays inside the scope', async () => {
+    const permissions = makePermissions();
+    writeFileSync(join(ws, 'inner.txt'), 'x');
+    symlinkSync(join(ws, 'inner.txt'), join(ws, 'inner-alias.txt'));
+    await expect(permissions.checkFsAccess(join(ws, 'inner-alias.txt'), 'write')).resolves.toMatchObject({ allowed: true });
   });
 });

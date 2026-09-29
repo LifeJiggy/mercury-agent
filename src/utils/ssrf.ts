@@ -5,28 +5,69 @@
  * be validated: scheme, literal hosts, DNS-resolved addresses, and every
  * redirect hop (redirect: 'manual' — a public URL must not be able to hop
  * into a private one).
+ *
+ * Validation and connection are kept on the same address: the hostname is
+ * resolved here, any answer containing a non-global address is rejected
+ * (fail closed on DNS mixed answers), and the connection is pinned to the
+ * exact address that was validated so a hostile resolver cannot swap in a
+ * private address between the check and the fetch (TOCTOU / DNS rebinding).
  */
 
 import { lookup } from 'node:dns';
 import { isIP } from 'node:net';
+import { Agent } from 'undici';
 
-export function isPrivateAddress(ip: string): boolean {
-  if (isIP(ip) === 0) return false;
-  if (ip === '::1' || ip === '::') return true;
-  if (ip.startsWith('fe80:') || ip.startsWith('fc') || ip.startsWith('fd')) return true;
+const DEFAULT_HEADERS = {
+  'User-Agent': 'Mercury-Agent/0.1.0',
+  'Accept': 'text/html,application/json,text/plain',
+};
+
+const ALLOW_PRIVATE_FETCH = process.env.MERCURY_ALLOW_PRIVATE_FETCH === '1';
+
+export const MAX_REDIRECTS = 5;
+
+function isPrivateIpv4(ip: string): boolean {
   const v4 = ip.split('.').map((p) => parseInt(p, 10));
-  if (v4.length !== 4 || v4.some((p) => Number.isNaN(p))) return Boolean(ip.startsWith('::ffff:'));
-  const [a, b] = v4;
+  if (v4.length !== 4 || v4.some((p) => Number.isNaN(p) || p < 0 || p > 255)) return false;
+  const [a, b, c] = v4;
   if (a === 0 || a === 10 || a === 127) return true;
   if (a === 169 && b === 254) return true; // link-local incl. cloud metadata
   if (a === 172 && b >= 16 && b <= 31) return true;
   if (a === 192 && b === 168) return true;
   if (a === 100 && b >= 64 && b <= 127) return true; // CGNAT
+  // Special-use / non-global blocks (RFC 6890): benchmarking, IETF protocol
+  // assignments and the TEST-NET ranges. Not globally routable, so not valid
+  // fetch targets.
+  if (a === 198 && (b === 18 || b === 19)) return true; // 198.18.0.0/15 benchmark
+  if (a === 192 && b === 0 && (c === 0 || c === 2)) return true; // 192.0.0.0/24, 192.0.2.0/24
+  if (a === 198 && b === 51 && c === 100) return true; // 198.51.100.0/24 TEST-NET-2
+  if (a === 203 && b === 0 && c === 113) return true; // 203.0.113.0/24 TEST-NET-3
   if (a >= 224) return true; // multicast + reserved
   return false;
 }
 
-const ALLOW_PRIVATE_FETCH = process.env.MERCURY_ALLOW_PRIVATE_FETCH === '1';
+function isPrivateIpv6(ip: string): boolean {
+  const lower = ip.toLowerCase();
+  if (lower === '::' || lower === '::1') return true;
+  if (lower.startsWith('::ffff:')) {
+    const mapped = lower.slice('::ffff:'.length);
+    return isIP(mapped) === 4 ? isPrivateIpv4(mapped) : true;
+  }
+  const head = lower.split(':')[0] ?? '';
+  if (/^fe[89ab]/.test(head)) return true; // fe80::/10 link-local
+  if (/^fe[c-f]/.test(head)) return true; // fec0::/10 site-local (deprecated)
+  if (/^f[cd]/.test(head)) return true; // fc00::/7 unique local
+  if (/^ff/.test(head)) return true; // ff00::/8 multicast
+  if (lower.startsWith('2001:db8')) return true; // 2001:db8::/32 documentation
+  return false;
+}
+
+export function isPrivateAddress(ip: string): boolean {
+  const family = isIP(ip);
+  if (family === 4) return isPrivateIpv4(ip);
+  if (family === 6) return isPrivateIpv6(ip);
+  return false;
+}
 
 function urlHostIsPrivate(hostname: string): boolean {
   // Literal IP in the URL — no DNS needed.
@@ -34,6 +75,13 @@ function urlHostIsPrivate(hostname: string): boolean {
   const lower = hostname.toLowerCase().replace(/\.$/, '');
   if (lower === 'localhost' || lower.endsWith('.localhost') || lower.endsWith('.local') || lower.endsWith('.internal')) return true;
   return false;
+}
+
+function privateBlockReason(host: string): Error {
+  return new Error(
+    `Blocked: ${host} is a private/internal address (SSRF protection). ` +
+      'Set MERCURY_ALLOW_PRIVATE_FETCH=1 to allow fetching internal hosts.',
+  );
 }
 
 function lookupHost(hostname: string): Promise<string[]> {
@@ -48,8 +96,10 @@ function lookupHost(hostname: string): Promise<string[]> {
   });
 }
 
-/** Throws with a human-readable reason when the URL must not be fetched. */
-export async function assertFetchableTarget(rawUrl: string): Promise<URL> {
+type PinnedAddress = { address: string; family: number };
+type ResolvedTarget = { url: URL; pinned?: PinnedAddress };
+
+async function resolveAndValidate(rawUrl: string): Promise<ResolvedTarget> {
   let parsed: URL;
   try {
     parsed = new URL(rawUrl);
@@ -62,48 +112,86 @@ export async function assertFetchableTarget(rawUrl: string): Promise<URL> {
   if (urlHostIsPrivate(parsed.hostname)) {
     throw privateBlockReason(parsed.hostname);
   }
-  if (!ALLOW_PRIVATE_FETCH) {
-    const addresses = await lookupHost(parsed.hostname);
-    if (addresses.length > 0 && addresses.every((ip) => isPrivateAddress(ip))) {
-      throw privateBlockReason(parsed.hostname);
-    }
-    // Mixed answers with at least one public address are allowed through
-    // (CDNs occasionally return internal-looking extras).
+  if (ALLOW_PRIVATE_FETCH) {
+    return { url: parsed };
   }
-  return parsed;
+  const literalFamily = isIP(parsed.hostname);
+  if (literalFamily !== 0) {
+    return { url: parsed, pinned: { address: parsed.hostname, family: literalFamily } };
+  }
+  const addresses = await lookupHost(parsed.hostname);
+  if (addresses.length === 0) {
+    // Nothing resolved — let the fetch fail on its own rather than guessing.
+    return { url: parsed };
+  }
+  // Fail closed on DNS mixed answers: one non-global record is enough to
+  // refuse the target, because we cannot know which record a re-resolving
+  // connection would have picked.
+  const offending = addresses.find((ip) => isPrivateAddress(ip));
+  if (offending) {
+    throw privateBlockReason(parsed.hostname);
+  }
+  const chosen = addresses[0]!;
+  return { url: parsed, pinned: { address: chosen, family: isIP(chosen) } };
 }
 
-function privateBlockReason(host: string): Error {
-  return new Error(
-    `Blocked: ${host} is a private/internal address (SSRF protection). ` +
-    'Set MERCURY_ALLOW_PRIVATE_FETCH=1 to allow fetching internal hosts.',
-  );
+/** Throws with a human-readable reason when the URL must not be fetched. */
+export async function assertFetchableTarget(rawUrl: string): Promise<URL> {
+  return (await resolveAndValidate(rawUrl)).url;
 }
 
-export const MAX_REDIRECTS = 5;
+// Pinned lookups for the current in-flight requests, keyed by hostname. The
+// guarded agent consults this table so its connection goes to the exact
+// address that was validated instead of re-resolving.
+const pinnedByHost = new Map<string, PinnedAddress>();
+
+const guardedAgent = new Agent({
+  connect: {
+    // undici types this hook against its internal LookupFunction; the shape
+    // below matches what it invokes at connect time.
+    lookup: ((hostname: string, options: { all?: boolean } | undefined, callback: (...args: unknown[]) => void) => {
+      const pinned = pinnedByHost.get(hostname);
+      if (!pinned) {
+        (lookup as unknown as (host: string, opts: unknown, cb: unknown) => void)(hostname, options, callback);
+        return;
+      }
+      if (options?.all) callback(null, [{ address: pinned.address, family: pinned.family }]);
+      else callback(null, pinned.address, pinned.family);
+    }) as never,
+  },
+});
+
+type FetchInitWithDispatcher = RequestInit & { dispatcher?: unknown };
 
 /** Fetch with SSRF validation on the initial URL AND every redirect hop. */
 export async function guardedFetch(rawUrl: string, signal: AbortSignal, headers?: Record<string, string>): Promise<Response> {
   let target = rawUrl;
   for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
-    const validated = await assertFetchableTarget(target);
-    const resp = await fetch(validated, {
-      signal,
-      redirect: 'manual',
-      headers: headers ?? {
-        'User-Agent': 'Mercury-Agent/0.1.0',
-        'Accept': 'text/html,application/json,text/plain',
-      },
-    });
-    if (resp.status >= 300 && resp.status < 400) {
-      const location = resp.headers.get('location');
-      if (location) {
-        try { void resp.body?.cancel(); } catch { /* best effort */ }
-        target = new URL(location, validated).href;
-        continue;
+    const { url, pinned } = await resolveAndValidate(target);
+    const host = url.hostname;
+    if (pinned) pinnedByHost.set(host, pinned);
+    try {
+      const init: FetchInitWithDispatcher = {
+        signal,
+        redirect: 'manual',
+        headers: headers ?? DEFAULT_HEADERS,
+        dispatcher: guardedAgent,
+      };
+      const resp = await fetch(url, init);
+      if (resp.status >= 300 && resp.status < 400) {
+        const location = resp.headers.get('location');
+        if (location) {
+          try { void resp.body?.cancel(); } catch { /* best effort */ }
+          target = new URL(location, url).href;
+          continue;
+        }
+      }
+      return resp;
+    } finally {
+      if (pinned && pinnedByHost.get(host)?.address === pinned.address) {
+        pinnedByHost.delete(host);
       }
     }
-    return resp;
   }
   throw new Error('Blocked: too many redirects');
 }

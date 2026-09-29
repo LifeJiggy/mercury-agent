@@ -13,7 +13,7 @@ export async function createProvider(pc: ProviderConfig, tokenStore?: import('..
   } else if (pc.name === 'deepseek') {
     const { DeepSeekProvider } = await import('./deepseek.js');
     return new DeepSeekProvider(pc);
-  } else if (pc.name === 'ollamaLocal') {
+  } else if (pc.name === 'ollamaLocal' || pc.name === 'atomicChat') {
     // Route through OpenAI-compatible provider — local Ollama exposes
     // /v1/chat/completions since v0.1.14. The ollama-ai-provider package
     // declares specificationVersion = "v1" which is incompatible with
@@ -73,6 +73,7 @@ export class ProviderRegistry {
       config.providers.atlascloud,
       config.providers.ollamaCloud,
       config.providers.ollamaLocal,
+      config.providers.atomicChat,
       config.providers.openaiCompat,
       config.providers.mimo,
       config.providers.mimoTokenPlan,

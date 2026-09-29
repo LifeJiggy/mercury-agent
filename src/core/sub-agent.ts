@@ -14,6 +14,7 @@ import type { SaverMode } from './saver-mode.js';
 import { getHeapStatistics } from 'node:v8';
 import { memoryGovernorThresholds, memoryGovernorVerdict, CONVERSATION_TOOL_BUDGET_CHARS, TOOL_RESULT_KEEP_RECENT, summarizeToolResult } from './memory-governor.js';
 import { classifyStreamCompletion } from './stream-completion.js';
+import { filterToolsByAllowlist } from '../utils/tool-filter.js';
 import { logger } from '../utils/logger.js';
 
 export type ProgressCallback = (agentId: string, progress: string) => void;
@@ -206,7 +207,7 @@ export class SubAgent {
             model: provider.getModelInstance(),
             system: systemPrompt,
             messages,
-            tools: this.capabilities.getTools(),
+            tools: this.resolveTools(),
             stopWhen: stepCountIs(stepsRemaining),
             abortSignal: this.abortController.signal,
             // Stop the SDK retaining raw HTTP bodies in every step's result
@@ -484,6 +485,15 @@ export class SubAgent {
 
       return this.result;
     }
+  }
+
+  /**
+   * Tools handed to the model. `allowedTools` is a real runtime restriction:
+   * when set, the child never sees tools outside the list even though the
+   * shared registry would otherwise expose them (e.g. list_agents/stop_agent).
+   */
+  private resolveTools() {
+    return filterToolsByAllowlist(this.capabilities.getTools(), this.config.allowedTools);
   }
 
   private buildSystemPrompt(): string {

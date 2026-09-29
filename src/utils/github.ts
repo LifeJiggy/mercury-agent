@@ -23,13 +23,46 @@ interface GitHubRequestOptions {
   headers?: Record<string, string>;
 }
 
+const GITHUB_API_HOST = 'api.github.com';
+
+/**
+ * Resolve a `github_api` request target, confining it to GitHub so the bearer
+ * token is never attached to a caller-chosen host (#81). Relative API paths
+ * and absolute `https://api.github.com/...` URLs are allowed; any other
+ * absolute URL is rejected.
+ */
+export function resolveGitHubApiUrl(path: string): string {
+  const trimmed = path.trim();
+  if (/^https?:\/\//i.test(trimmed)) {
+    let url: URL;
+    try {
+      url = new URL(trimmed);
+    } catch {
+      throw new Error(`Invalid GitHub API URL: ${path}`);
+    }
+    if (url.protocol !== 'https:') {
+      throw new Error(`github_api requires https; refusing ${url.protocol}//${url.hostname}`);
+    }
+    if (url.hostname.toLowerCase() !== GITHUB_API_HOST) {
+      throw new Error(
+        `github_api is restricted to ${GITHUB_API_HOST}; refusing to send the GitHub token to ${url.hostname}`,
+      );
+    }
+    return url.toString();
+  }
+  if (!trimmed.startsWith('/')) {
+    throw new Error('github_api path must start with "/" (e.g. /repos/owner/repo/issues).');
+  }
+  return `${GITHUB_API}${trimmed}`;
+}
+
 export async function githubRequest(path: string, options: GitHubRequestOptions = {}): Promise<any> {
   const token = getGitHubToken();
   if (!token) {
     throw new Error('GITHUB_TOKEN not configured. Run mercury doctor to set it up.');
   }
 
-  const url = path.startsWith('http') ? path : `${GITHUB_API}${path}`;
+  const url = resolveGitHubApiUrl(path);
   const headers: Record<string, string> = {
     'Authorization': `Bearer ${token}`,
     'Accept': 'application/vnd.github.v3+json',

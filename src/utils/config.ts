@@ -64,6 +64,7 @@ export type ProviderName =
   | 'atlascloud'
   | 'ollamaCloud'
   | 'ollamaLocal'
+  | 'atomicChat'
   | 'openaiCompat'
   | 'mimo'
   | 'mimoTokenPlan'
@@ -102,6 +103,7 @@ export interface MercuryConfig {
     atlascloud: ProviderConfig;
     ollamaCloud: ProviderConfig;
     ollamaLocal: ProviderConfig;
+    atomicChat: ProviderConfig;
     openaiCompat: ProviderConfig;
     mimo: ProviderConfig;
     mimoTokenPlan: ProviderConfig;
@@ -346,6 +348,13 @@ export function getDefaultConfig(): MercuryConfig {
         model: getEnv('OLLAMA_LOCAL_MODEL', ''),
         enabled: getEnvBool('OLLAMA_LOCAL_ENABLED', false),
       },
+      atomicChat: {
+        name: 'atomicChat',
+        apiKey: '',
+        baseUrl: getEnv('ATOMIC_CHAT_BASE_URL', 'http://127.0.0.1:1337/v1'),
+        model: getEnv('ATOMIC_CHAT_MODEL', ''),
+        enabled: getEnvBool('ATOMIC_CHAT_ENABLED', false),
+      },
       openaiCompat: {
         name: 'openaiCompat',
         apiKey: getEnv('OPENAI_COMPAT_API_KEY', ''),
@@ -367,13 +376,13 @@ export function getDefaultConfig(): MercuryConfig {
         model: getEnv('MIMO_TOKEN_PLAN_MODEL', 'mimo-v2.5-pro'),
         enabled: getEnvBool('MIMO_TOKEN_PLAN_ENABLED', false),
       },
-       lmStudio: {
-         name: 'lmStudio',
-         apiKey: getEnv('LM_STUDIO_API_KEY', ''),
-         baseUrl: getEnv('LM_STUDIO_BASE_URL', 'http://127.0.0.1:1234/v1'),
-         model: getEnv('LM_STUDIO_MODEL', ''),
-         enabled: getEnvBool('LM_STUDIO_ENABLED', false),
-       },
+      lmStudio: {
+        name: 'lmStudio',
+        apiKey: getEnv('LM_STUDIO_API_KEY', ''),
+        baseUrl: getEnv('LM_STUDIO_BASE_URL', 'http://127.0.0.1:1234/v1'),
+        model: getEnv('LM_STUDIO_MODEL', ''),
+        enabled: getEnvBool('LM_STUDIO_ENABLED', false),
+      },
       chatgptWeb: {
         name: 'chatgptWeb',
         apiKey: '', // not used — auth is via OAuth
@@ -724,7 +733,7 @@ export function isProviderConfigured(provider: ProviderConfig): boolean {
   if (provider.name === 'mercuryCloud') {
     return provider.model.length > 0;
   }
-  if (provider.name === 'ollamaLocal') {
+  if (provider.name === 'ollamaLocal' || provider.name === 'atomicChat') {
     return provider.baseUrl.length > 0 && provider.model.length > 0;
   }
   if (provider.name === 'ollamaCloud') {

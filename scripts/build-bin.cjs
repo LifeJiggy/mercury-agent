@@ -179,7 +179,15 @@ function createWebArchive(versionDir, { required }) {
   }
 
   copyDirSync(webSrc, webDest);
-  execFileSync('tar', ['-czf', webTarPath, '-C', versionDir, 'web'], { cwd: root, stdio: 'pipe' });
+  // COPYFILE_DISABLE stops macOS tar from emitting AppleDouble (._*) entries
+  // for xattr-bearing files. Those entries are invisible to bsdtar's `-tzf`
+  // but visible to GNU tar, where they fail install.sh's `^web/` path check
+  // ("web.tar.gz contains an unsafe path" — see #122).
+  execFileSync('tar', ['-czf', webTarPath, '-C', versionDir, 'web'], {
+    cwd: root,
+    stdio: 'pipe',
+    env: { ...process.env, COPYFILE_DISABLE: '1' },
+  });
   if (required) fs.rmSync(webDest, { recursive: true, force: true });
   const sizeKB = (fs.statSync(webTarPath).size / 1024).toFixed(0);
   console.log(`  ✓ web.tar.gz (${sizeKB} KB)`);
