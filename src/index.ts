@@ -46,6 +46,7 @@ import {
 import type { MercuryConfig } from './utils/config.js';
 import type { ProviderName } from './utils/config.js';
 import { logger } from './utils/logger.js';
+import { devBuildLabel, isDevBuild } from './utils/dev-build.js';
 import { redactPhone } from './utils/redact.js';
 import { Identity } from './soul/identity.js';
 import { ShortTermMemory, LongTermMemory, EpisodicMemory, migrateLegacyMemory } from './memory/store.js';
@@ -87,8 +88,16 @@ import { isWebAuthInitialized, setWebPassword, writeAttachToken } from './web/au
 const __dirname = dirname(fileURLToPath(import.meta.url));
 let pkgVersion: string;
 try {
-  // Normal (npm) install: package.json sits one level above dist/.
-  pkgVersion = JSON.parse(readFileSync(join(__dirname, '..', 'package.json'), 'utf8')).version;
+  // Dev-channel builds are stamped at compile time (MERCURY_CHANNEL_VERSION →
+  // tsup define). This wins over whatever version happens to sit on disk —
+  // a dev binary run from a checkout must still report its dev stamp.
+  const channelVersion = (globalThis as any).__MERCURY_CHANNEL_VERSION__ as string | undefined;
+  if (channelVersion) {
+    pkgVersion = channelVersion;
+  } else {
+    // Normal (npm) install: package.json sits one level above dist/.
+    pkgVersion = JSON.parse(readFileSync(join(__dirname, '..', 'package.json'), 'utf8')).version;
+  }
 } catch {
   // Standalone binary (Bun --compile / pkg / SEA): package.json is not on
   // disk next to the embedded bundle. Use the version injected at build
@@ -116,6 +125,11 @@ function banner() {
   console.log(chalk.bold.cyan('  MERCURY'));
   console.log(chalk.white('  Your soul-driven AI agent'));
   console.log(chalk.dim(`  v${pkgVersion} · by Cosmic Stack · mercuryagent.sh`));
+  // Dev-channel builds announce themselves on EVERY launch — a preview
+  // binary must never be mistaken for the stable distribution.
+  if (isDevBuild(pkgVersion)) {
+    console.log(chalk.yellow(`  ⚠ ${devBuildLabel(pkgVersion)} · not for production`));
+  }
   console.log('');
 }
 
@@ -129,6 +143,9 @@ function splashScreen() {
   console.log(chalk.dim('  Your soul-driven AI agent'));
   console.log(chalk.cyan('  by Cosmic Stack'));
   console.log(chalk.dim('  mercuryagent.sh'));
+  if (isDevBuild(pkgVersion)) {
+    console.log(chalk.yellow(`  ⚠ ${devBuildLabel(pkgVersion)}`));
+  }
   console.log('');
 }
 
@@ -4574,6 +4591,12 @@ serviceCmd
   .action(async () => {
     console.log('');
     console.log(chalk.cyan(`  Mercury ${chalk.white(`v${pkgVersion}`)}`));
+    // `upgrade` targets the npm stable track; a dev binary installed via the
+    // dev installer has its own update path (re-run install-dev.sh).
+    if (isDevBuild(pkgVersion)) {
+      console.log(chalk.yellow('  ⚠ development build — upgrade via install-dev.sh, or this installs the stable channel'));
+      console.log('');
+    }
     console.log('');
 
     const daemon = getDaemonStatus();

@@ -8,6 +8,11 @@ const pkg = JSON.parse(readFileSync("./package.json", "utf8"));
 // binary. Stable builds never set MERCURY_CHANNEL_VERSION → pkg.version.
 const channelVersion = process.env.MERCURY_CHANNEL_VERSION || pkg.version;
 
+// Separate marker for the dev stamp: dev builds set it; stable builds get ''
+// so runtime precedence never changes for them (disk package.json remains the
+// source of truth when no channel version was baked at compile time).
+const channelStamp = process.env.MERCURY_CHANNEL_VERSION || '';
+
 export default defineConfig({
   entry: ["src/index.ts"],
   format: ["esm"],
@@ -23,6 +28,7 @@ export default defineConfig({
   // without trying to load package.json from disk.
   define: {
     "globalThis.__MERCURY_VERSION__": JSON.stringify(channelVersion),
+    "globalThis.__MERCURY_CHANNEL_VERSION__": JSON.stringify(channelStamp),
   },
   external: [
     "ai",
