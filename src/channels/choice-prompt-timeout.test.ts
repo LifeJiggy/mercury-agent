@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { readFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { CLIChannel } from './cli.js';
@@ -52,5 +53,32 @@ describe('choice prompt timeout / dismissal', () => {
     expect(agentSrc).toMatch(/remembered === 'code'[\s\S]*?you chose it for coding tasks earlier this session/s);
     // Timeout is NOT a choice — nothing remembered when nobody answers.
     expect(agentSrc).toContain('not remembered — nobody answered');
+  });
+
+  it('agent: the RESEARCH prompt also has a time-weighted default (never blocks forever)', () => {
+    // The research prompt historically used a bare presentChoice with NO
+    // timeout — an unanswered question held the chat message indefinitely.
+    // It must use the same time-weighted contract, defaulting to Quick answer.
+    expect(agentSrc).toMatch(/promptResearchMode[\s\S]*?this\.presentChoiceWithTimeout\(/s);
+    expect(agentSrc).toMatch(/MERCURY_CODE_HANDOFF_TIMEOUT_MS,\s*\n\s*1, \/\/ unanswered = Quick answer/);
+  });
+
+  it('enterMercuryCode tears down a stranded bot chat (no parked sends afterwards)', async () => {
+    const channel = new CLIChannel();
+    channel.enterBotChat('researcher', 'Researcher');
+    expect(channel.getActiveBotChat()).not.toBeNull();
+    // While a bot chat is open, main-agent sends park into the HIDDEN main
+    // transcript. After entering Mercury Code they must land visibly again.
+    const tmpDir = mkdtempSync(join(tmpdir(), 'mercury-code-entry-'));
+    try {
+      const entered = channel.enterMercuryCode(tmpDir, 'test');
+      expect(entered.ok).toBe(true);
+      expect(channel.getActiveBotChat()).toBeNull();
+      await channel.send('visible reply');
+      const messages = channel.getTuiState().chatMessages;
+      expect(messages.some(m => m.role === 'agent' && m.content === 'visible reply')).toBe(true);
+    } finally {
+      rmSync(tmpDir, { recursive: true, force: true });
+    }
   });
 });

@@ -49,6 +49,95 @@ describe('splitShellSegments', () => {
   });
 });
 
+describe('fail-closed execute scopes (bots)', () => {
+  function managerWithExecuteScope() {
+    const permissions = new PermissionManager();
+    const manifest = permissions.getManifest();
+    manifest.capabilities.shell.enabled = true;
+    manifest.capabilities.filesystem.scopes = [
+      { path: '/tmp/execdir', read: true, write: false, execute: true },
+      { path: '/tmp/readonlydir', read: true, write: false },
+    ];
+    permissions.setAutoApproveAll(false);
+    permissions.setFailClosed(true);
+    permissions.setCurrentContext('bot', 'worker');
+    return permissions;
+  }
+
+  it('runs a command whose path arguments all lie inside an execute scope', async () => {
+    const permissions = managerWithExecuteScope();
+    await expect(permissions.checkShellCommand('node /tmp/execdir/tool.js --flag')).resolves.toMatchObject({ allowed: true, needsApproval: false });
+  });
+
+  it('denies a command that reaches outside the execute scope', async () => {
+    const permissions = managerWithExecuteScope();
+    await expect(permissions.checkShellCommand('node /tmp/execdir/tool.js /etc/passwd')).resolves.toMatchObject({ allowed: false });
+  });
+
+  it('does not treat a read-only (non-execute) scope as execute', async () => {
+    const permissions = managerWithExecuteScope();
+    await expect(permissions.checkShellCommand('node /tmp/readonlydir/tool.js')).resolves.toMatchObject({ allowed: false });
+  });
+
+  it('blocked commands win over execute scopes', async () => {
+    const permissions = managerWithExecuteScope();
+    permissions.getManifest().capabilities.shell.blocked = ['rm *'];
+    await expect(permissions.checkShellCommand('rm -rf /tmp/execdir')).resolves.toMatchObject({ allowed: false });
+  });
+
+  it('commands without path arguments stay approval-gated (cwd is not a grant)', async () => {
+    const permissions = managerWithExecuteScope();
+    await expect(permissions.checkShellCommand('npm install')).resolves.toMatchObject({ allowed: false });
+  });
+
+  it('a bare script path inside the execute scope runs without approval', async () => {
+    const permissions = managerWithExecuteScope();
+    await expect(permissions.checkShellCommand('/tmp/execdir/run.sh --serve')).resolves.toMatchObject({ allowed: true, needsApproval: false });
+  });
+
+  it('an ambient global autoApproved list never elevates a fail-closed context', async () => {
+    const permissions = managerWithExecuteScope();
+    // Simulate a global permissions.yaml where the user approved "node *":
+    // an unattended bot must NOT inherit it.
+    permissions.getManifest().capabilities.shell.autoApproved = ['node *'];
+    await expect(permissions.checkShellCommand('node script.js')).resolves.toMatchObject({ allowed: false });
+    // Explicit bot grants DO apply.
+    permissions.setBotShellAllowList(['node *']);
+    await expect(permissions.checkShellCommand('node script.js')).resolves.toMatchObject({ allowed: true, needsApproval: false });
+    // needsApproval still wins over the bot list.
+    permissions.getManifest().capabilities.shell.needsApproval = ['node *'];
+    await expect(permissions.checkShellCommand('node script.js')).resolves.toMatchObject({ allowed: false });
+  });
+});
+
+describe('fail-closed skill elevation', () => {
+  it('elevateForSkill is a no-op in fail-closed mode (skills never re-permission a bot)', async () => {
+    const permissions = new PermissionManager();
+    permissions.getManifest().capabilities.shell.enabled = true;
+    permissions.setFailClosed(true);
+    permissions.setCurrentContext('bot', 'worker');
+    permissions.elevateForSkill(['fs_write', 'run_command', 'read_file']);
+    // Without the guard, elevation would bypass the fail-closed gates.
+    await expect(permissions.checkFsAccess('/etc/hosts', 'write')).resolves.toMatchObject({ allowed: false });
+    await expect(permissions.checkShellCommand('npm install')).resolves.toMatchObject({ allowed: false });
+  });
+});
+
+describe('most-specific scope wins', () => {
+  it('a deep grant is not shadowed by a broader read-only ancestor', async () => {
+    const permissions = new PermissionManager();
+    permissions.getManifest().capabilities.filesystem.scopes = [
+      { path: '/tmp/root', read: true, write: false },
+      { path: '/tmp/root/deep', read: true, write: true },
+    ];
+    permissions.setFailClosed(true);
+    permissions.setCurrentContext('bot', 'worker');
+    await expect(permissions.checkFsAccess('/tmp/root/deep/file.txt', 'write')).resolves.toMatchObject({ allowed: true });
+    await expect(permissions.checkFsAccess('/tmp/root/other.txt', 'write')).resolves.toMatchObject({ allowed: false });
+    await expect(permissions.checkFsAccess('/tmp/root/other.txt', 'read')).resolves.toMatchObject({ allowed: true });
+  });
+});
+
 describe('PermissionManager remote safety', () => {
   it('enforces hard command blocks before Local allow-all', async () => {
     const permissions = new PermissionManager();

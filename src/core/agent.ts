@@ -1,5 +1,6 @@
 import { generateText, streamText, stepCountIs } from 'ai';
 import path from 'node:path';
+import { homedir } from 'node:os';
 import { existsSync, readdirSync } from 'node:fs';
 import { getHeapStatistics } from 'node:v8';
 import type { ChannelMessage, ChannelType } from '../types/channel.js';
@@ -24,6 +25,11 @@ import { BackgroundTaskManager } from './background-tasks.js';
 import { SkillBatcher } from '../skills/batcher.js';
 import type { SkillLoader } from '../skills/loader.js';
 import { logger } from '../utils/logger.js';
+import { refinePersona } from '../bots/persona-template.js';
+import { proposeCrew } from '../bots/fleet-onboarding.js';
+import { PERMISSION_TIERS, tierPermissionsFile, isPermissionTier, type PermissionTier } from '../bots/permission-tiers.js';
+import { buildBotBundle, writeBundle, readBundle, importBotBundle } from '../bots/bundle.js';
+import { applyBotFieldPatch } from '../bots/edit.js';
 import { CLIChannel } from '../channels/cli.js';
 import { TelegramChannel } from '../channels/telegram.js';
 import { SignalChannel } from '../channels/signal.js';
@@ -415,6 +421,17 @@ function looksResearchy(text: string): boolean {
 export const MERCURY_CODE_HANDOFF_TIMEOUT_MS = 45_000;
 
 /**
+ * Fleet-control verbs: `/bot <verb> …` where the first token resolves to NO
+ * configured bot is a control command typed on the message slash — it is
+ * routed to the /bots surface instead of failing as an unknown target.
+ * (A bot actually named e.g. "start" always wins — bot resolution first.)
+ */
+export const BOT_CONTROL_VERBS = new Set([
+  'start', 'stop', 'pause', 'enable', 'disable', 'run', 'open', 'send',
+  'journal', 'inbox', 'budget', 'edit', 'delete', 'replay', 'list', 'dlq', 'storage',
+]);
+
+/**
  * Whitelabel a provider error into one short, respectful line for the chat:
  * the user gets the real reason (token expired, rate limit, server error) —
  * never a stack trace or raw HTTP dump.
@@ -489,6 +506,14 @@ export class Agent {
   private completedStepCount = 0;
   private stepNarrative: import('../utils/tool-label.js').NarrativeStep[] = [];
   private supervisor?: import('../core/supervisor.js').SubAgentSupervisor;
+  private botManager?: import('../bots/bot-manager.js').BotManager;
+  /** Bot awaiting a persona from the next message (post-create setup flow). */
+  private pendingPersonaFor: string | null = null;
+  /** True while the pending persona capture belongs to a JUST-created bot —
+   * gates the fleet (solo vs lead) onboarding step in finalizePersona. */
+  private pendingPersonaNewlyCreated = false;
+  /** Bot awaiting a daily token budget answer (final onboarding step). */
+  private pendingBudgetFor: string | null = null;
   readonly programmingMode: ProgrammingMode;
   readonly researchMode: ResearchMode;
   readonly saverMode: SaverMode;
@@ -558,6 +583,30 @@ export class Agent {
     }
   }
 
+  /** Wire the Mercury Bots runtime (see bots/bot-manager.ts, BOTS-ARCHITECTURE.md). */
+  setBotManager(botManager: import('../bots/bot-manager.js').BotManager): void {
+    this.botManager = botManager;
+    botManager.setNotify(async (channelType, channelId, message) => {
+      const channel = this.channels.get(channelType as any);
+      if (channel) {
+        await channel.send(message, channelId).catch((e) => logger.warn({ e }, 'bot notify channel send failed'));
+      }
+    });
+    botManager.setAlert(async (message) => {
+      const channel = this.channels.getNotificationChannel();
+      // The CLI is NOT a needs-you surface: an alert printed there lands in
+      // the main chat (bot thread leak) — the bot's own thread already
+      // carries the event via botManager's own notify.
+      if (channel && channel.type !== 'cli') {
+        await channel.send(message).catch((e) => logger.warn({ e }, 'bot alert send failed'));
+      }
+    });
+  }
+
+  getBotManager(): import('../bots/bot-manager.js').BotManager | undefined {
+    return this.botManager;
+  }
+
   setSessionSyncEnabled(enabled: boolean): void {
     this.sessionSyncEnabled = enabled;
   }
@@ -613,6 +662,64 @@ export class Agent {
     logger.info({ from: msg.channelType, content: msg.content.slice(0, 50) }, 'Message enqueued');
 
     const trimmed = msg.content.trim();
+
+    // Mercury Bots never touch the main message queue — /bots is always
+    // fast-path, whether the main loop is busy or idle.
+    if (trimmed.startsWith('/bots')) {
+      const channel = this.channels.getChannelForMessage(msg);
+      if (channel) {
+        this.handleBotsCommand(trimmed, msg, channel).catch((err) => {
+          logger.error({ err: (err as any)?.message ?? err, content: trimmed.slice(0, 50) }, '/bots command failed');
+        });
+      }
+      return;
+    }
+
+    // /bot <id> <message> — talk to a named bot from ANY channel (TUI,
+    // Telegram, web). Durable enqueue; the run's output is delivered back
+    // to the requesting chat via the job's source (Telegram first).
+    if (trimmed.startsWith('/bot ')) {
+      if (!this.botManager) {
+        // Bots disabled: do NOT swallow the message — tell the user and stop.
+        const channel = this.channels.getChannelForMessage(msg);
+        void channel?.send('Bots are not enabled on this instance (set `bots.enabled: true` in mercury.yaml).', msg.channelId)
+          .catch((err) => logger.warn({ err }, 'bots-disabled notice failed'));
+        return;
+      }
+      const rest = trimmed.slice('/bot '.length).trim();
+      const spaceIndex = rest.indexOf(' ');
+      const rawTarget = (spaceIndex === -1 ? rest : rest.slice(0, spaceIndex)).toLowerCase();
+      const message = spaceIndex === -1 ? '' : rest.slice(spaceIndex + 1).trim();
+      // `/bot start <id>` etc. — a fleet-control verb typed on the message
+      // slash: the first token resolves to NO bot, so it was never a target.
+      // Route it to /bots (the control surface) instead of failing with a
+      // confusing "Could not message start: target_unknown".
+      if (BOT_CONTROL_VERBS.has(rawTarget) && !this.botManager.resolveBotId(rawTarget)) {
+        const channel = this.channels.getChannelForMessage(msg);
+        if (channel) {
+          this.handleBotsCommand(trimmed.replace(/^\/bot\b/, '/bots'), msg, channel).catch((err) => {
+            logger.error({ err: (err as any)?.message ?? err, content: trimmed.slice(0, 50) }, '/bots command failed');
+          });
+          return;
+        }
+      }
+      const botId = this.botManager.resolveBotId(rawTarget) ?? rawTarget;
+      if (botId && message) {
+        void this.dispatchToBot(botId, message, msg);
+      }
+      return;
+    }
+
+    // @<botId|name> <message> — mention-style routing (Telegram groups, etc.).
+    // Only intercepts when the first token resolves to a configured bot, so
+    // ordinary @-messages are never hijacked.
+    if (trimmed.startsWith('@') && this.botManager) {
+      const mention = this.parseBotMention(trimmed);
+      if (mention) {
+        void this.dispatchToBot(mention.botId, mention.message, msg);
+        return;
+      }
+    }
 
     if (this.processing && trimmed.startsWith('/')) {
       this.handleFastPathCommand(msg).catch((err) => {
@@ -808,11 +915,17 @@ export class Agent {
     const explanation =
       'Research mode will search the web, cross-check multiple sources, gather images, and produce a full research article as rich markdown. It runs longer than a quick answer and will not be killed early.';
 
-    const choice = await this.presentChoice(
+    // Time-weighted default (same contract as the Mercury Code hand-off): an
+    // unanswered prompt must never hold a chat message hostage. No answer
+    // within the window → "Quick answer", nothing remembered, and the next
+    // research-shaped question asks again.
+    const choice = await this.presentChoiceWithTimeout(
       `This looks like a research question. ${explanation}\n\nHow do you want to proceed?`,
       ['Full research mode (deep, multi-source article)', 'Quick answer (normal conversation)'],
       msg.channelId,
       msg.channelType,
+      MERCURY_CODE_HANDOFF_TIMEOUT_MS,
+      1, // unanswered = Quick answer (not remembered — nobody chose)
     );
 
     if (choice.toLowerCase().startsWith('full')) {
@@ -888,6 +1001,12 @@ export class Agent {
 
     if (trimmed === '/halt' || trimmed === '/stop') {
       await channel.send(await this.stopAllWork(trimmed === '/stop' ? 'stopped' : 'halted'), msg.channelId);
+      return;
+    }
+
+    // Bots run outside the main queue — /bots commands are always fast-path.
+    if (trimmed.startsWith('/bots')) {
+      await this.handleBotsCommand(trimmed, msg, channel);
       return;
     }
 
@@ -1015,6 +1134,914 @@ export class Agent {
       return;
     }
     await channel.send('Agent is busy. Programming mode changes will be available after current task completes.', msg.channelId);
+  }
+
+  /**
+   * Persona finalization: before anything is written to persona.md, offer
+   * "Convert to template" (LLM-restructured, restructure-only) vs save
+   * as-is. TUI gets a real choice prompt; other channels default to
+   * template with graceful raw fallback on provider failure.
+   */
+  private async finalizePersona(bm: import('../bots/bot-manager.js').BotManager, botId: string, raw: string, msg: ChannelMessage, newlyCreated = false): Promise<void> {
+    const channel = this.channels.getChannelForMessage(msg);
+    const manifest = bm.store.get(botId);
+    if (!channel || !manifest) return;
+    const channelType = msg.channelType as any;
+
+    let choice = 'template';
+    try {
+      choice = await this.presentChoice(
+        `Persona for **${manifest.name}** — how should it be saved?`,
+        ['Convert to template (recommended — structured, precise)', 'Save as-is', 'Cancel — that was a task, not a persona'],
+        msg.channelId,
+        channelType,
+      );
+    } catch {
+      choice = 'template';
+    }
+
+    if (choice.startsWith('Cancel')) {
+      // Escape hatch (review K1): the text was a real task — dispatch it,
+      // touch nothing on disk, and drop the pending capture.
+      this.pendingPersonaFor = null;
+      this.pendingBudgetFor = null;
+      await this.dispatchToBot(botId, raw, msg);
+      return;
+    }
+
+    let finalPersona = raw;
+    if (choice.startsWith('Convert')) {
+      // The builder is an LLM call (10-60s on slower providers) — the user
+      // must see it is working, or onboarding reads as a hang.
+      await channel.send('⏳ Running the persona builder — structuring your text (typically 10–60s)…', `bot:${botId}`).catch(() => {});
+      (channel as any).sendHeartbeat?.('⏳ Persona builder running…');
+      const refined = await refinePersona(raw, manifest.name, this.providers.getDefault());
+      (channel as any).clearHeartbeat?.();
+      if (refined) {
+        finalPersona = refined;
+      } else {
+        await channel.send('⚠ Template conversion unavailable (provider) — saving your text as-is. Edit `persona.md` anytime.', msg.channelId).catch(() => {});
+      }
+    }
+
+    bm.store.writePersona(botId, finalPersona.endsWith('\n') ? finalPersona : finalPersona + '\n');
+    bm.invalidateRuntime(botId);
+    this.pendingPersonaFor = null;
+    const mode = finalPersona === raw ? 'as-is' : 'as a structured template';
+    await channel.send(`✍️ Persona saved ${mode}.`, `bot:${botId}`).catch(() => {});
+
+    // New-bot onboarding: permission tier, then solo vs fleet (edits later never ask).
+    if (newlyCreated) {
+      await this.offerPermissionTier(bm, botId, manifest.name, msg, channel);
+      await this.offerFleetStep(bm, botId, manifest.name, msg, channel);
+    }
+
+    // Final onboarding step: the daily token budget — optional and OFF by
+    // default (no cap). "suggest" fills a generous number so heavy bots are
+    // protected from runaway spend without ever being strangled.
+    const suggested = this.config.bots?.suggestedDailyTokenBudget ?? 5_000_000;
+    this.pendingBudgetFor = botId;
+    await channel.send(
+      `Final setup step — **daily token budget** for **${manifest.name}** (tokens/day):\n` +
+      `• \`suggest\` — recommended, generous: ${suggested.toLocaleString()}/day\n` +
+      `• a number — set your own cap\n` +
+      `• \`none\` (or \`skip\`) — no cap (default)\n` +
+      `Editable anytime: \`/bots budget ${botId} <tokens|suggest|none>\`. Or just type your first task — the budget stays unset.`,
+      `bot:${botId}`,
+    ).catch(() => {});
+  }
+
+  /**
+   * Permission-tier onboarding step (new bots only): one clear question
+   * instead of silent fail-closed defaults + manual file editing. Change
+   * anytime with `/bots permissions <id> <tier>`.
+   */
+  private async offerPermissionTier(bm: import('../bots/bot-manager.js').BotManager, botId: string, botName: string, msg: ChannelMessage, channel: any): Promise<void> {
+    let choice = 'Read-only (recommended default)';
+    try {
+      choice = await this.presentChoice(
+        `What should **${botName}** be allowed to do? (Path scopes always stay fail-closed — a tool only reaches what its Access grants cover.)`,
+        Object.values(PERMISSION_TIERS).map(t => `${t.label} — ${t.description}`),
+        msg.channelId,
+        msg.channelType as any,
+      );
+    } catch {
+      choice = 'Read-only (recommended default)';
+    }
+    const tier = (Object.entries(PERMISSION_TIERS).find(([, t]) => choice.startsWith(t.label))?.[0] ?? 'readonly') as PermissionTier;
+    // The tier must EXECUTE: write the full permission file (tool gate +
+    // path scopes) — the single source of truth. The old manifest-only write
+    // left the path gate at fail-closed defaults, so a "full access" bot
+    // still could not read anything outside its sandbox.
+    bm.store.writePermissions(botId, tierPermissionsFile(tier));
+    bm.store.update(botId, m => { delete (m as any).tools; });
+    bm.invalidateRuntime(botId);
+    await channel.send(`🔐 Permissions for **${botName}**: **${PERMISSION_TIERS[tier].label}**. Change anytime with \`/bots permissions ${botId} <readonly|builder|operator|full>\`.`, `bot:${botId}`).catch(() => {});
+  }
+
+  /**
+   * Fleet onboarding step (new bots only): solo vs lead. Auto-build asks one
+   * LLM call for a matched crew; manual points at `/bots add-crew`. The
+   * budget step follows either way.
+   */
+  private async offerFleetStep(bm: import('../bots/bot-manager.js').BotManager, botId: string, botName: string, msg: ChannelMessage, channel: any): Promise<void> {
+    let choice = 'Solo bot';
+    try {
+      choice = await this.presentChoice(
+        `Should **${botName}** work solo, or lead a fleet of sub-bots?`,
+        ['Solo bot', 'Lead a fleet — auto-build the crew', 'Lead a fleet — I\'ll add crew myself'],
+        msg.channelId,
+        msg.channelType as any,
+      );
+    } catch {
+      choice = 'Solo bot';
+    }
+    if (choice.startsWith('Solo')) return;
+
+    // Promote to lead before any crew exists.
+    bm.store.update(botId, m => { m.fleetRole = 'lead'; });
+    bm.invalidateRuntime(botId);
+
+    if (choice.startsWith('Lead a fleet — I\'ll')) {
+      await channel.send(
+        `👑 **${botName}** is now a fleet lead. Add specialists anytime:\n` +
+        `\`/bots add-crew ${botId} <id> "Name" "Description" "persona (optional)"\`\n` +
+        `Review the fleet with \`/bots crew ${botId}\` — or just tell **${botName}** to hire its own crew (it has bot_spawn).`,
+        `bot:${botId}`,
+      ).catch(() => {});
+      return;
+    }
+
+    // Auto-build: one LLM proposal, created through the standard path. This
+    // is an LLM call (30-90s) — it must NOT hold onboarding hostage: run it
+    // detached with visible progress, and deliver the roster when ready.
+    await channel.send(`👑 **${botName}** is now a fleet lead — building the crew in the background…`, `bot:${botId}`).catch(() => {});
+    (channel as any).sendHeartbeat?.('⏳ Proposing fleet crew (up to ~90s)…');
+    const persona = bm.store.readPersona(botId);
+    const leadDescription = bm.store.get(botId)?.description ?? '';
+    void (async () => {
+      try {
+        const proposals = await proposeCrew(botName, leadDescription, persona, this.providers.getDefault(), bm.maxCrew());
+        (channel as any).clearHeartbeat?.();
+        if (proposals.length === 0) {
+          await channel.send(`⚠ Crew proposal unavailable (provider) — **${botName}** is a lead with an empty crew. Add members with \`/bots add-crew ${botId} <id> "Name" "Description" "persona"\` or tell the lead to hire its own.`, `bot:${botId}`).catch(() => {});
+          return;
+        }
+        const lines: string[] = [`👑 **${botName}** fleet ready — ${proposals.length} crew member(s) created:`, ''];
+        for (const p of proposals) {
+          const result = bm.addCrew(botId, p);
+          if (result.ok) {
+            lines.push(`• **${p.name}** (\`${result.manifest.id}\`) — ${p.description || 'specialist'}`);
+          } else {
+            lines.push(`⚠ ${p.name} (${p.id}): ${result.error}`);
+          }
+        }
+        lines.push('', 'Dispatch tasks with `/bot <crewId> <task>` or tell the lead to delegate — it can also spawn more crew itself.');
+        await channel.send(lines.join('\n'), `bot:${botId}`).catch(() => {});
+      } catch (err: any) {
+        (channel as any).clearHeartbeat?.();
+        await channel.send(`⚠ Fleet auto-build failed: ${err?.message ?? err} — **${botName}** is a lead with an empty crew; add members with \`/bots add-crew ${botId} <id> "Name" "Description" "persona"\`.`, `bot:${botId}`).catch(() => {});
+      }
+    })();
+  }
+
+  /** Apply the budget answer typed after the persona step (or a later task). */
+  private async applyBudgetAnswer(bm: import('../bots/bot-manager.js').BotManager, botId: string, message: string, msg: ChannelMessage): Promise<boolean> {
+    const value = message.trim().toLowerCase();
+    const isBudgetCommand = /^\d+$/.test(value) || ['suggest', 'none', 'skip'].includes(value);
+    if (!isBudgetCommand) {
+      // Not a budget answer — treat as the user's first task; budget stays unset.
+      this.pendingBudgetFor = null;
+      return false;
+    }
+    this.pendingBudgetFor = null;
+    const manifest = bm.store.get(botId);
+    const suggested = this.config.bots?.suggestedDailyTokenBudget ?? 5_000_000;
+    let applied: string;
+    if (value === 'suggest') {
+      bm.store.update(botId, m => { m.autonomy = { ...m.autonomy, dailyTokenBudget: suggested }; });
+      applied = `${suggested.toLocaleString()}/day`;
+    } else if (value === 'none' || value === 'skip') {
+      bm.store.update(botId, m => { if (m.autonomy) delete m.autonomy.dailyTokenBudget; });
+      applied = 'no cap (unlimited)';
+    } else {
+      const n = parseInt(value, 10);
+      bm.store.update(botId, m => { m.autonomy = { ...m.autonomy, dailyTokenBudget: n }; });
+      applied = `${n.toLocaleString()}/day`;
+    }
+    bm.invalidateRuntime(botId);
+    const channel = this.channels.getChannelForMessage(msg);
+    await channel?.send(`💰 Budget for **${manifest?.name ?? botId}**: ${applied}. When the cap is hit the bot pauses until the next day — never killed.`, `bot:${botId}`)
+      .catch(() => {});
+    return true;
+  }
+
+  /** Enqueue a bot turn from any channel, with ack + reply-back routing. */
+  private async dispatchToBot(botId: string, message: string, msg: ChannelMessage): Promise<void> {
+    const bm = this.botManager;
+    if (!bm) return;
+    const channel = this.channels.getChannelForMessage(msg);
+    if (!channel) return;
+
+    // Budget step runs after the persona step: the next message answers it
+    // if it looks like one; anything else is the user's first real task.
+    if (this.pendingBudgetFor) {
+      if (this.pendingBudgetFor !== botId) {
+        this.pendingBudgetFor = null;
+      } else {
+        const handled = await this.applyBudgetAnswer(bm, botId, message, msg);
+        if (handled) return;
+      }
+    }
+
+    // Post-create persona setup: the first message typed into the new bot's
+    // chat becomes its persona instead of a task (send /skip to keep the
+    // template). Any dispatch to a different bot cancels the pending setup.
+    if (this.pendingPersonaFor) {
+      if (this.pendingPersonaFor !== botId) {
+        this.pendingPersonaFor = null;
+      } else if (message.trim().toLowerCase() === '/skip') {
+        this.pendingPersonaFor = null;
+        await channel.send('⏭ Keeping the starter persona — edit it anytime with `/persona` here or `/bots persona <id> <text>`.', `bot:${botId}`)
+          .catch(() => {});
+        return;
+      } else {
+        // Offer the "convert to template" step before anything hits disk.
+        await this.finalizePersona(bm, botId, message.trim(), msg, this.pendingPersonaNewlyCreated);
+        return;
+      }
+    }
+    // Dispatched from inside that bot's TUI chat → ack and reply land in
+    // the bot's own transcript (targetId `bot:<id>`; cli.ts routes it).
+    const pendingBot = (channel as any).consumePendingBotChatTarget?.() ?? null;
+    const inBotChat = pendingBot === botId;
+    const replyTarget = inBotChat ? `bot:${botId}` : msg.channelId;
+    const result = bm.enqueue(botId, {
+      trigger: 'chat',
+      prompt: message,
+      source: { channelType: msg.channelType, channelId: replyTarget },
+    });
+    if (result.accepted) {
+      await channel.send(`🤖 Queued for **${botId}** (job ${result.jobId}) — the reply will arrive in this chat.`, replyTarget)
+        .catch((err) => logger.warn({ err }, '/bot ack send failed'));
+    } else {
+      await channel.send(`Could not message **${botId}**: [reason: ${result.reasonCode}]`, replyTarget)
+        .catch((err) => logger.warn({ err }, '/bot ack send failed'));
+    }
+  }
+
+  /**
+   * Parse `@<botId|Name> <message>` into a bot routing when the first token
+   * resolves to a configured bot; null for any other @-message.
+   */
+  private parseBotMention(content: string): { botId: string; message: string } | null {
+    const bm = this.botManager;
+    if (!bm) return null;
+    const firstSpace = content.indexOf(' ');
+    const token = (firstSpace === -1 ? content : content.slice(0, firstSpace)).replace(/^@/, '').trim();
+    const message = firstSpace === -1 ? '' : content.slice(firstSpace + 1).trim();
+    if (!token || !message) return null;
+    const botId = bm.resolveBotId(token);
+    return botId ? { botId, message } : null;
+  }
+
+  /**
+   * /bots — Mercury Bots control surface (BOTS-ARCHITECTURE.md §2.7).
+   * Always fast-path: bots live outside the main message queue, so bot
+   * control stays responsive while the agent is busy.
+   */
+  private async handleBotsCommand(trimmed: string, msg: ChannelMessage, channel: any): Promise<void> {
+    const bm = this.botManager;
+    const channelId = msg.channelId;
+    if (!bm) {
+      await channel.send('Bots are not available (BotManager not wired).', channelId);
+      return;
+    }
+    const rawArgs = trimmed.slice('/bots'.length).trim();
+    const parts = rawArgs.length > 0 ? rawArgs.split(/\s+/) : [];
+    const action = (parts[0] ?? '').toLowerCase();
+
+    // All bot-targeting actions accept id OR name — resolve to the id here.
+    if (['open', 'send', 'journal', 'inbox', 'budget', 'edit', 'delete', 'enable', 'disable', 'stop', 'pause', 'start', 'run', 'persona', 'crew', 'add-crew', 'remove-crew', 'promote', 'demote', 'permissions'].includes(action) && parts[1]) {
+      const resolved = bm.resolveBotId(parts[1]);
+      if (resolved) parts[1] = resolved;
+    }
+
+    // Any explicit /bots command cancels pending onboarding capture — the
+    // user has moved on; a later task in the bot chat must never be eaten
+    // by the persona/budget state machine (review K1).
+    if (this.pendingPersonaFor && action !== '') {
+      this.pendingPersonaFor = null;
+    }
+
+    const stateIcons: Record<string, string> = { idle: '⚪', queued: '🔵', running: '🟢', paused: '🟡', disabled: '⛔' };
+    const runIcons: Record<string, string> = { completed: '✅', failed: '❌', halted: '⛔', paused: '⏸', denied: '🚫' };
+
+    if (action === '' || action === 'list') {
+      const summaries = bm.getStatusSummaries();
+      if (summaries.length === 0) {
+        await channel.send('No bots configured. Use `/bots create <id> "Name" "Description"` to onboard one.', channelId);
+        return;
+      }
+      // Fleet tree: 👑 leads first with crew nested beneath (multi-level,
+      // recursive); parentless solos flat after.
+      const fmt = (s: typeof summaries[number], indent: string) => {
+        const icon = stateIcons[s.state] ?? '❓';
+        const badge = s.fleetRole === 'lead' ? ' 👑' : '';
+        // Crew runs are short and asynchronous — a snapshot rarely catches
+        // them green. Make activity legible anyway: leads show how many crew
+        // are working right now, every bot shows its last run outcome.
+        const crewNote = s.fleetRole === 'lead' && s.crewWorking
+          ? ` · 🟢 ${s.crewWorking} crew working`
+          : '';
+        const lastRun = s.lastRunAt ? ` · last run ${s.lastRunState ?? '?'} ${formatRelative(s.lastRunAt)}` : '';
+        const activity = s.activity ? `\n${indent}   ↳ ${s.activity}` : '';
+        const attention = s.needsYou ? ' · ⚠ needs you' : '';
+        return `${indent}${icon} **${s.name}** (${s.id})${badge} — ${s.state}${crewNote}${attention}${lastRun}${activity}`;
+      };
+      const lines: string[] = [`**Bots** (${summaries.length})`, ''];
+      const rendered = new Set<string>();
+      const renderCrew = (leadId: string, depth: number) => {
+        const crew = summaries.filter(s => s.parent === leadId);
+        for (const c of crew) {
+          const indent = '  '.repeat(depth);
+          lines.push(fmt(c, depth > 0 ? `${indent}└─` : '  '));
+          rendered.add(c.id);
+          renderCrew(c.id, depth + 1);
+        }
+        if (crew.length === 0 && depth === 1) {
+          lines.push(`${'  '.repeat(depth)}└─ (empty crew — \`/bots add-crew\` or the lead can bot_spawn)`);
+        }
+      };
+      for (const root of summaries.filter(s => !s.parent)) {
+        lines.push(fmt(root, ''));
+        rendered.add(root.id);
+        if (root.fleetRole === 'lead') renderCrew(root.id, 1);
+      }
+      for (const s of summaries) {
+        if (!rendered.has(s.id)) lines.push(fmt(s, '')); // detached crew (defensive)
+      }
+      const running = summaries.filter(s => s.state === 'running').length;
+      lines.push('', `Running: ${running} | Queued: ${summaries.reduce((a, s) => a + (s.state === 'queued' ? 1 : 0), 0)}`);
+      await channel.send(lines.join('\n'), channelId);
+      return;
+    }
+
+    if (action === 'open') {
+      const target = parts[1]?.toLowerCase();
+      const manifest = target ? bm.store.get(target) : null;
+      if (!target || !manifest) {
+        await channel.send(`No bot "${target ?? ''}". See \`/bots\` for the roster.`, channelId);
+        return;
+      }
+      if (typeof (channel as any).enterBotChat === 'function') {
+        // Hydrate a cold thread from the durable journal (last 10 runs,
+        // compact) — the bot may have worked unattended for hours.
+        const history = bm.getJournal(target, 10).map(r => ({
+          content: `${r.state === 'completed' ? '✅' : r.state === 'failed' ? '❌' : '⛔'} (${r.trigger}, ${formatRelative(r.startedAt)}${r.durationMs ? `, ${(r.durationMs / 1000).toFixed(0)}s` : ''}) ${r.summary?.slice(0, 300) ?? r.runId}`,
+          timestamp: r.startedAt,
+        })).reverse();
+        (channel as any).enterBotChat(target, manifest.name, history);
+        return;
+      }
+      await channel.send(`Opening a bot chat is only supported in the TUI — use \`/bots send ${target} <message>\` here.`, channelId);
+      return;
+    }
+
+    if (action === 'create' || action === 'onboard') {
+      // /bots create <id> "Name" "Description" ["persona text"]
+      const id = (parts[1] ?? '').toLowerCase();
+      if (!id) {
+        await channel.send('Usage: `/bots create <id> "Name" "Description" "persona (optional)"` — the bot starts with a fail-closed default profile you can refine via its profile files.', channelId);
+        return;
+      }
+      const rest = parts.slice(2).join(' ');
+      const quoted = [...rest.matchAll(/"([^"]*)"/g)].map(m => m[1]);
+      const name = quoted[0] ?? id.toUpperCase();
+      const description = quoted[1];
+      const personaText = quoted[2];
+      try {
+        const manifest = bm.store.create({ id, name, description });
+        this.pendingPersonaNewlyCreated = true;
+        if (personaText) {
+          bm.store.writePersona(id, personaText + '\n');
+          bm.invalidateRuntime(id);
+          await channel.send(`🤖 Bot **${manifest.name}** (\`${id}\`) onboarded with your persona — enabled, fail-closed defaults.\nStart using it: \`/bot ${id} <task>\`, \`/bots open ${id}\`, or just \`@${id} <task>\`.`, channelId);
+          await this.offerFleetStep(bm, id, manifest.name, msg, channel);
+          return;
+        }
+        // No persona given — open its chat and prompt for one now (TUI only).
+        if (typeof (channel as any).enterBotChat === 'function') {
+          (channel as any).enterBotChat(id, manifest.name);
+          this.pendingPersonaFor = id;
+          await channel.send(
+            `🤖 **${manifest.name}** onboarded (fail-closed defaults).\n\nNow give it its character — your next message here becomes its **persona** (who it is, how it works, how it reports). Send \`/skip\` to keep the starter template, or \`/persona\` later to change it.`,
+            `bot:${id}`,
+          );
+        } else {
+          await channel.send(`🤖 Bot **${manifest.name}** (\`${id}\`) onboarded — enabled, fail-closed defaults.\nPersona: \`${bm.store.botDir(id)}/persona.md\` — set it now with \`/bots persona ${id} <text>\`.`, channelId);
+        }
+      } catch (err: any) {
+        await channel.send(`Could not create bot "${id}": ${err?.message}`, channelId);
+      }
+      return;
+    }
+
+    if (action === 'persona') {
+      const target = parts[1]?.toLowerCase();
+      const personaText = parts.slice(2).join(' ');
+      if (!target) {
+        await channel.send('Usage: `/bots persona <id> <full persona text in one message>` — or open the bot chat (`/bots open <id>`) and type `/persona`.', channelId);
+        return;
+      }
+      const resolved = bm.resolveBotId(target) ?? target;
+      if (!bm.store.exists(resolved)) {
+        await channel.send(`No bot "${target}". See \`/bots\` for the roster.`, channelId);
+        return;
+      }
+      if (!personaText) {
+        // Bare `/persona` (typed inside the bot chat): arm the capture —
+        // the next message in that thread becomes the persona. This is the
+        // promised flow ("edit it anytime with /persona here"); it must not
+        // degrade to the /bots roster.
+        this.pendingBudgetFor = null;
+        this.pendingPersonaFor = resolved;
+        const name = bm.store.get(resolved)?.name ?? resolved;
+        await channel.send(`✍️ Persona capture armed for **${name}** — your next message in this chat becomes its persona. \`/skip\` keeps the current one.`, `bot:${resolved}`);
+        return;
+      }
+      await this.finalizePersona(bm, resolved, personaText, msg);
+      return;
+    }
+
+    if (action === 'send') {
+      const target = parts[1]?.toLowerCase();
+      const message = parts.slice(2).join(' ');
+      if (!target || !message) {
+        await channel.send('Usage: `/bots send <id> <message>`', channelId);
+        return;
+      }
+      const result = bm.enqueue(target, { trigger: 'chat', prompt: message, source: { channelType: msg.channelType, channelId } });
+      if (!result.accepted) {
+        await channel.send(`Could not message **${target}**: [reason: ${result.reasonCode}]`, channelId);
+        return;
+      }
+      await channel.send(`🤖 Queued for **${target}** (job ${result.jobId}) — runs outside the main conversation.`, channelId);
+      return;
+    }
+
+    if (action === 'enable' || action === 'disable') {
+      const target = parts[1]?.toLowerCase();
+      if (!target) {
+        await channel.send(`Usage: \`/bots ${action} <id>\``, channelId);
+        return;
+      }
+      try {
+        bm.setEnabled(target, action === 'enable');
+        await channel.send(`${action === 'enable' ? '✅ Enabled' : '⏸ Disabled'} bot **${target}**.`, channelId);
+      } catch (err: any) {
+        await channel.send(`Failed: ${err?.message}`, channelId);
+      }
+      return;
+    }
+
+    if (action === 'budget') {
+      const target = parts[1]?.toLowerCase();
+      const value = (parts[2] ?? '').toLowerCase();
+      if (!target || !value) {
+        const suggested = this.config.bots?.suggestedDailyTokenBudget ?? 5_000_000;
+        await channel.send(`Usage: \`/bots budget <id> <tokens|suggest|none>\` — suggest = ${suggested.toLocaleString()}/day, none = no cap (default).`, channelId);
+        return;
+      }
+      try {
+        bm.store.update(target, m => {
+          if (value === 'none') { if (m.autonomy) delete m.autonomy.dailyTokenBudget; }
+          else if (value === 'suggest') { m.autonomy = { ...m.autonomy, dailyTokenBudget: this.config.bots?.suggestedDailyTokenBudget ?? 5_000_000 }; }
+          else {
+            const n = parseInt(value, 10);
+            if (!Number.isFinite(n) || n <= 0) throw new Error('budget must be a positive integer, "suggest", or "none"');
+            m.autonomy = { ...m.autonomy, dailyTokenBudget: n };
+          }
+        });
+        bm.invalidateRuntime(target);
+        const m = bm.store.get(target);
+        const applied = m?.autonomy?.dailyTokenBudget ? `${m.autonomy.dailyTokenBudget.toLocaleString()}/day` : 'none (unlimited)';
+        await channel.send(`💰 Budget for **${target}**: ${applied}. Hit the cap → the bot pauses until the next day, never killed.`, channelId);
+      } catch (err: any) {
+        await channel.send(`Failed: ${err?.message}`, channelId);
+      }
+      return;
+    }
+
+    if (action === 'edit') {
+      const target = parts[1]?.toLowerCase();
+      const path = parts[2];
+      const value = parts.slice(3).join(' ');
+      if (!target || !path || !value) {
+        await channel.send('Usage: `/bots edit <id> <field> <value>`\nEditable fields: name, description, model.provider, model.model, memory.scope, memory.allowCrossBotRecall, comms.canMessage, tools.allow, tools.deny, autonomy.maxConcurrent, autonomy.maxSteps, autonomy.dailyTokenBudget', channelId);
+        return;
+      }
+      try {
+        const manifest = bm.store.get(target);
+        if (!manifest) throw new Error(`Bot "${target}" does not exist`);
+        const result = applyBotFieldPatch(manifest, path, value);
+        if (!result.ok) {
+          await channel.send(`⚠ ${result.error}`, channelId);
+          return;
+        }
+        bm.store.save(manifest);
+        bm.invalidateRuntime(target);
+        await channel.send(`✏️ **${target}**.${path} = ${result.display}`, channelId);
+      } catch (err: any) {
+        await channel.send(`Failed: ${err?.message}`, channelId);
+      }
+      return;
+    }
+
+    if (action === 'delete') {
+      const target = parts[1]?.toLowerCase();
+      const confirmed = parts[2]?.toLowerCase() === 'confirm';
+      if (!target || !bm.store.exists(target)) {
+        await channel.send('Usage: `/bots delete <id> confirm` — removes the profile dir, halts any running turn, and dead-letters pending jobs. This cannot be undone.', channelId);
+        return;
+      }
+      if (!confirmed && typeof (channel as any).askToContinue === 'function') {
+        const crewCount = bm.store.crewOf(target).length;
+        const proceed = await (channel as any).askToContinue(`Delete bot **${target}** and its profile (persona, memory links, journal)? This cannot be undone.${crewCount > 0 ? ` Its ${crewCount} crew member(s) will be deleted with it (fleet cascade).` : ''}`);
+        if (!proceed) {
+          await channel.send('Deletion cancelled.', channelId);
+          return;
+        }
+      } else if (!confirmed) {
+        await channel.send(`Type \`/bots delete ${target} confirm\` to permanently delete.`, channelId);
+        return;
+      }
+      try {
+        await bm.halt(target);
+        bm.store.delete(target);
+        bm.invalidateRuntime(target);
+        await channel.send(`🗑 Bot **${target}** deleted (running turn halted; its profile directory is gone).`, channelId);
+      } catch (err: any) {
+        await channel.send(`Failed: ${err?.message}`, channelId);
+      }
+      return;
+    }
+
+    if (action === 'export') {
+      // /bots export <id> [path] — a shareable bundle: manifests + personas +
+      // permissions + skills (single JSON; a lead's bundle carries its whole
+      // crew tree). Sandbox, journal, and .env never travel.
+      const target = parts[1]?.toLowerCase();
+      if (!target || !bm.store.exists(target)) {
+        await channel.send('Usage: `/bots export <id> [outPath]` — writes a shareable JSON bundle (fleet leads include their crew).', channelId);
+        return;
+      }
+      try {
+        const bundle = buildBotBundle(bm.store, target);
+        const outPath = parts.slice(2).join(' ') || undefined;
+        const path = writeBundle(bundle, outPath?.trim() || undefined);
+        const crewNote = bundle.kind === 'fleet' ? ` (fleet — ${bundle.bots.length} bots incl. crew)` : '';
+        await channel.send(`📦 Exported **${target}**${crewNote} → \`${path}\`\nIncluded: manifests, personas, permissions, skills. Never included: sandbox, journals, .env (local state + secrets).`, channelId);
+      } catch (err: any) {
+        await channel.send(`Export failed: ${err?.message}`, channelId);
+      }
+      return;
+    }
+
+    if (action === 'import') {
+      // /bots import <path> — recreate bots from a bundle. Imported bots
+      // start DISABLED (fail-closed); enable each one consciously.
+      const rawPath = parts.slice(1).join(' ').trim();
+      if (!rawPath) {
+        await channel.send('Usage: `/bots import <bundlePath>` — recreates bots from a `.bot.json` bundle. Imported bots start disabled; enable with `/bots enable <id>`.', channelId);
+        return;
+      }
+      try {
+        const bundle = readBundle(rawPath.startsWith('~') ? rawPath.replace(/^~/, homedir()) : rawPath);
+        const report = importBotBundle(bm.store, bundle, { overwrite: parts.includes('--overwrite') });
+        const lines: string[] = [];
+        if (report.created.length > 0) lines.push(`✅ Created: ${report.created.map(id => `\`${id}\``).join(', ')} (disabled — enable with \`/bots enable <id>\`)`);
+        for (const s of report.skipped) lines.push(`⏭ \`${s.id}\`: ${s.reason}`);
+        if (lines.length === 0) lines.push('Nothing to import.');
+        await channel.send(`📥 Import from \`${rawPath}\`:\n${lines.join('\n')}`, channelId);
+      } catch (err: any) {
+        await channel.send(`Import failed: ${err?.message}`, channelId);
+      }
+      return;
+    }
+
+    if (action === 'stop' || action === 'pause') {
+      const target = parts[1]?.toLowerCase();
+      if (!target) {
+        await channel.send('Usage: `/bots stop <id>`', channelId);
+        return;
+      }
+      const result = await bm.stop(target);
+      const crewNote = result.crewStopped > 0 ? `\n🛑 Fleet cascade: ${result.crewStopped} crew bot(s) stopped with it.` : '';
+      const heldNote = result.heldJobs > 0 ? `\n↩ ${result.heldJobs} queued job(s) held fleet-wide — resume with \`/bots start ${target}\`.` : '';
+      await channel.send(result.halted
+        ? `⛔ Halt signal sent to **${target}** — it will stop after the current tool step.${crewNote}${heldNote}`
+        : `⛔ **${target}** stopped — nothing was running.${crewNote}${heldNote}`, channelId);
+    }
+
+    if (action === 'start') {
+      const target = parts[1]?.toLowerCase();
+      if (!target) {
+        await channel.send('Usage: `/bots start <id>`', channelId);
+        return;
+      }
+      try {
+        const { resumed } = bm.start(target);
+        await channel.send(resumed > 0
+          ? `▶️ **${target}** started — ${resumed} held job(s) back in the queue.`
+          : `▶️ **${target}** started — nothing was held; it is idle and ready for tasks.`, channelId);
+      } catch (err: any) {
+        await channel.send(`Failed: ${err?.message}`, channelId);
+      }
+      return;
+    }
+
+    if (action === 'run') {
+      const target = parts[1]?.toLowerCase();
+      const routine = parts.slice(2).join(' ') || undefined;
+      if (!target) {
+        await channel.send('Usage: `/bots run <id> [routineName]` — no routine = a bare wake turn.', channelId);
+        return;
+      }
+      const result = bm.runNow(target, routine);
+      if (!result.accepted) {
+        if (result.reasonCode === 'routine_unknown') {
+          const names = (bm.store.get(target)?.schedules ?? []).map(r => r.name);
+          await channel.send(`No routine "${routine}" on **${target}**.${names.length ? ` Configured: ${names.join(', ')}` : ' This bot has no routines — add them with `/bots edit <id>` or /bots open.'}`, channelId);
+          return;
+        }
+        await channel.send(`Could not run **${target}**: [reason: ${result.reasonCode}]`, channelId);
+        return;
+      }
+      await channel.send(routine
+        ? `🏃 Routine **${routine}** fired on **${target}** (job ${result.jobId}) — runs outside the main conversation.`
+        : `🏃 Wake sent to **${target}** (job ${result.jobId}) — it gets a turn to check its mailbox and pending work.`, channelId);
+      return;
+    }
+
+    if (action === 'journal') {
+      const target = parts[1]?.toLowerCase();
+      if (!target) {
+        await channel.send('Usage: `/bots journal <id>`', channelId);
+        return;
+      }
+      const records = bm.getJournal(target, 10);
+      if (records.length === 0) {
+        await channel.send(`No runs recorded yet for **${target}**.`, channelId);
+        return;
+      }
+      const lines = [`**${target} — recent runs**`, ''];
+      for (const r of [...records].reverse()) {
+        const icon = r.state === 'completed' ? '✅' : r.state === 'failed' ? '❌' : r.state === 'paused' ? '⏸' : '⛔';
+        const reason = r.reasonCode ? ` · [reason: ${r.reasonCode}]` : '';
+        lines.push(`${icon} ${r.runId} · ${r.trigger} · ${r.state} · ${(r.durationMs / 1000).toFixed(1)}s · ${r.tokensIn + r.tokensOut} tok${reason}`);
+        if (r.summary) lines.push(`   ${r.summary.slice(0, 100)}`);
+      }
+      await channel.send(lines.join('\n'), channelId);
+      return;
+    }
+
+    if (action === 'inbox') {
+      const target = parts[1]?.toLowerCase();
+      if (!target) {
+        await channel.send('Usage: `/bots inbox <id>`', channelId);
+        return;
+      }
+      const mail = bm.peekMailbox(target);
+      if (mail.length === 0) {
+        await channel.send(`**${target}** mailbox is empty.`, channelId);
+        return;
+      }
+      const lines = [`**${target} — inbox** (${mail.length})`, ''];
+      for (const m of mail) {
+        lines.push(`🤖 from **${m.from}**: ${m.content.slice(0, 120)}`);
+      }
+      await channel.send(lines.join('\n'), channelId);
+      return;
+    }
+
+    if (action === 'dlq') {
+      const target = parts[1]?.toLowerCase();
+      const entries = target ? bm.getDlq(target) : bm.getDlq();
+      if (entries.length === 0) {
+        await channel.send('Dead-letter queue is empty — nothing failed permanently.', channelId);
+        return;
+      }
+      const lines = ['**Dead-letter queue** (replay: `/bots replay <botId> <jobId>`)', ''];
+      for (const e of entries.slice(0, 10)) {
+        lines.push(`🚫 **${e.botId}** ${e.id} · ${e.trigger} · attempts ${e.attempts} · [reason: ${e.reasonCode ?? 'unknown'}] · ${e.prompt.slice(0, 60)}`);
+      }
+      if (entries.length > 10) lines.push(`…and ${entries.length - 10} more`);
+      await channel.send(lines.join('\n'), channelId);
+      return;
+    }
+
+    if (action === 'replay') {
+      const target = parts[1]?.toLowerCase();
+      const jobId = parts[2];
+      if (!target || !jobId) {
+        await channel.send('Usage: `/bots replay <botId> <jobId>`', channelId);
+        return;
+      }
+      const result = bm.replayDlq(target, jobId);
+      if (!result.accepted) {
+        await channel.send(`Replay failed: [reason: ${result.reasonCode}] — is that job id in the DLQ?`, channelId);
+        return;
+      }
+      await channel.send(`↻ Job ${jobId} re-enqueued for **${target}** (new job ${result.jobId}).`, channelId);
+      return;
+    }
+
+    if (action === 'permissions') {
+      // /bots permissions <id> [tier] — show or set the capability tier.
+      const target = parts[1]?.toLowerCase();
+      const tierArg = (parts[2] ?? '').toLowerCase();
+      if (!target || !bm.store.exists(target)) {
+        await channel.send('Usage: `/bots permissions <id> [readonly|builder|operator|full]` — omit the tier to see the current one.', channelId);
+        return;
+      }
+      if (!tierArg) {
+        const perms = bm.store.readPermissions(target);
+        const deny = new Set(perms.tools?.deny ?? bm.store.get(target)?.tools?.deny ?? []);
+        const matched = Object.entries(PERMISSION_TIERS).find(([, t]) => t.deny.length === deny.size && t.deny.every(d => deny.has(d)))?.[0];
+        const current = matched ?? 'custom';
+        const effective = deny.has('run_command') ? 'no shell' : 'shell within its path scopes';
+        const scopeCount = perms.paths?.length ?? 0;
+        await channel.send(`🔐 **${target}**: ${current} (deny: ${[...deny].join(', ') || 'none'}, path scopes: ${scopeCount}) — ${effective}. Source: its permissions.yaml. Set with \`/bots permissions ${target} <readonly|builder|operator|full>\`.`, channelId);
+        return;
+      }
+      if (!isPermissionTier(tierArg)) {
+        await channel.send('Unknown tier — use `readonly`, `builder`, `operator`, or `full`.', channelId);
+        return;
+      }
+      bm.store.writePermissions(target, tierPermissionsFile(tierArg));
+      bm.store.update(target, m => { delete (m as any).tools; });
+      bm.invalidateRuntime(target);
+      await channel.send(`🔐 Permissions for **${target}**: **${PERMISSION_TIERS[tierArg].label}** — ${PERMISSION_TIERS[tierArg].description}\n(Written to its permissions.yaml — the single source of truth.)`, channelId);
+      return;
+    }
+
+    if (action === 'promote' || action === 'demote') {
+      // /bots promote <id> — solo/crew → fleet lead (demote: lead → solo).
+      const target = parts[1]?.toLowerCase();
+      if (!target || !bm.store.exists(target)) {
+        await channel.send(`Usage: \`/bots ${action} <id>\``, channelId);
+        return;
+      }
+      try {
+        bm.store.update(target, m => {
+          if (action === 'promote') {
+            m.fleetRole = 'lead';
+          } else {
+            m.fleetRole = undefined;
+            if (bm.store.crewOf(target).length > 0) throw new Error(`**${target}** still has crew — remove-crew first`);
+          }
+        });
+        bm.invalidateRuntime(target);
+        await channel.send(action === 'promote'
+          ? `👑 **${target}** is now a fleet lead. It will self-organize: give it a setup task and it will build its own crew with bot_spawn (persona-derived), or add crew with \`/bots add-crew ${target} …\`.`
+          : `⬇ **${target}** demoted to a solo bot.`, channelId);
+      } catch (err: any) {
+        await channel.send(`Failed: ${err?.message}`, channelId);
+      }
+      return;
+    }
+
+    if (action === 'crew') {
+      // /bots crew <leadId> — the fleet tree + per-crew recent runs.
+      const leadId = parts[1]?.toLowerCase();
+      if (!leadId || !bm.store.exists(leadId)) {
+        await channel.send('Usage: `/bots crew <leadId>`', channelId);
+        return;
+      }
+      const lead = bm.store.get(leadId);
+      if (lead?.fleetRole !== 'lead') {
+        await channel.send(`**${lead?.name ?? leadId}** is not a fleet lead.`, channelId);
+        return;
+      }
+      const crew = bm.store.crewOf(leadId);
+      const lines = [`👑 **${lead.name}** fleet (${crew.length}/${bm.maxCrew()})`, ''];
+      if (crew.length === 0) {
+        lines.push('(empty — `/bots add-crew` or tell the lead to bot_spawn)');
+      }
+      const stateIcons2: Record<string, string> = { idle: '⚪', queued: '🔵', running: '🟢', paused: '🟡', disabled: '⛔' };
+      for (const c of crew) {
+        const summary = bm.getStatusSummaries().find(s => s.id === c.id);
+        const runs = bm.getJournal(c.id, 3);
+        const lastRun = runs.length > 0 ? `last: ${runs[runs.length - 1].state}` : 'no runs yet';
+        lines.push(`${stateIcons2[summary?.state ?? 'idle']} **${c.name}** (${c.id})${c.description ? ` — ${c.description}` : ''} · ${lastRun}`);
+        for (const r of runs.slice(-2).reverse()) {
+          lines.push(`   ↳ ${r.state === 'completed' ? '✅' : r.state === 'failed' ? '❌' : '⛔'} ${r.summary?.slice(0, 90) ?? r.runId}`);
+        }
+      }
+      await channel.send(lines.join('\n'), channelId);
+      return;
+    }
+
+    if (action === 'add-crew') {
+      // /bots add-crew <leadId> <id> "Name" "Description" ["persona"]
+      const leadId = parts[1]?.toLowerCase();
+      const rest = parts.slice(2).join(' ');
+      const quoted = [...rest.matchAll(/"([^"]*)"/g)].map(m => m[1]);
+      const id = quoted[0] ?? parts[2];
+      if (!leadId || !id || !quoted[0]) {
+        await channel.send('Usage: `/bots add-crew <leadId> <id> "Name" "Description" "persona (optional)"`', channelId);
+        return;
+      }
+      if (!bm.store.exists(leadId) || bm.store.get(leadId)?.fleetRole !== 'lead') {
+        await channel.send(`**${leadId}** is not a fleet lead.`, channelId);
+        return;
+      }
+      try {
+        let persona: string | undefined;
+        if (quoted[2]) {
+          (channel as any).sendHeartbeat?.('⏳ Building the crew persona (up to ~60s)…');
+          const refined = await refinePersona(quoted[2], quoted[0], this.providers.getDefault());
+          (channel as any).clearHeartbeat?.();
+          persona = refined ?? quoted[2];
+        }
+        const result = bm.addCrew(leadId, { id, name: quoted[0], description: quoted[1], persona });
+        if (!result.ok) {
+          await channel.send(`⚠ ${result.error}`, channelId);
+          return;
+        }
+        await channel.send(`👑 Crew member **${quoted[0]}** (\`${result.manifest.id}\`) added to **${leadId}** — fail-closed defaults, comms linked to the lead${persona ? ', persona refined' : ''}.`, channelId);
+      } catch (err: any) {
+        await channel.send(`Failed: ${err?.message}`, channelId);
+      }
+      return;
+    }
+
+    if (action === 'remove-crew') {
+      const leadId = parts[1]?.toLowerCase();
+      const crewId = parts[2]?.toLowerCase();
+      if (!leadId || !crewId) {
+        await channel.send('Usage: `/bots remove-crew <leadId> <crewId>`', channelId);
+        return;
+      }
+      const crew = bm.store.get(crewId);
+      if (!crew || crew.parent !== leadId) {
+        await channel.send(`**${crewId}** is not crew of **${leadId}**. See \`/bots crew ${leadId}\`.`, channelId);
+        return;
+      }
+      if (typeof (channel as any).askToContinue === 'function') {
+        const proceed = await (channel as any).askToContinue(`Retire crew member **${crew.name}** (${crewId})? Profile, sandbox, and queue are removed permanently.`);
+        if (!proceed) {
+          await channel.send('Retirement cancelled.', channelId);
+          return;
+        }
+      }
+      const result = await bm.removeCrew(leadId, crewId);
+      await channel.send(result.ok ? `👑 Crew member **${crewId}** retired from **${leadId}**.` : `⚠ ${result.error}`, channelId);
+      return;
+    }
+
+    if (action === 'storage') {
+      const usage = bm.getStorage();
+      if (usage.length === 0) {
+        await channel.send('No bot storage in use.', channelId);
+        return;
+      }
+      const lines = ['**Bot storage**', ''];
+      let total = 0;
+      for (const u of usage) {
+        total += u.bytes;
+        lines.push(`**${u.id}**: ${formatBytes(u.bytes)} (journal ${formatBytes(u.journalBytes)})`);
+      }
+      lines.push('', `Total: ${formatBytes(total)} — caps are enforced at write time (transcripts keep last 50 runs; journals rotate at 5 MB).`);
+      await channel.send(lines.join('\n'), channelId);
+      return;
+    }
+
+    await channel.send(
+      '**Bots commands**\n' +
+      '`/bots` — roster with live states\n' +
+      '`/bots open <id>` — open a bot chat (transcript swaps to the bot thread)\n' +
+      '`/bots create <id> "Name" "Description"` — onboard a bot\n' +
+      '`/bot <id> <message>` — message a bot from any channel\n' +
+      '`/bots persona <id> <text>` — set/replace its character (with template conversion)\n' +
+      '`/bots budget <id> <tokens|suggest|none>` — daily token budget (none = no cap, default)\n' +
+      '`/bots edit <id> <field> <value>` — edit any config field anytime\n' +
+      '`/bots journal <id>` — recent runs\n' +
+      '`/bots inbox <id>` — pending bot-to-bot mail\n' +
+      '`/bots dlq` — dead-lettered jobs\n' +
+      '`/bots replay <botId> <jobId>` — re-run a dead-lettered job\n' +
+      '`/bots storage` — disk usage\n' +
+      '`/bots enable|disable|stop|start <id>` — control (stop holds queued jobs; start resumes them)\n' +
+      '`/bots run <id> [routineName]` — fire a routine now, or a bare wake turn\n' +
+      '`/bots crew <leadId>` — fleet tree with per-crew runs\n' +
+      '`/bots promote <id>` / demote — make a bot a fleet lead (it then self-organizes) / back to solo\n' +
+      '`/bots permissions <id> [tier]` — capability tier: readonly | builder | operator | full\n' +
+      '`/bots add-crew <leadId> <id> "Name" "Desc" ["persona"]` — add a sub-bot to a fleet\n' +
+      '`/bots remove-crew <leadId> <crewId>` — retire a crew member\n' +
+      '`/bots delete <id> confirm` — permanently delete',
+      channelId,
+    );
   }
 
   private async handleBgCommand(trimmed: string, msg: ChannelMessage, channel: any): Promise<void> {
@@ -4139,6 +5166,12 @@ export class Agent {
     if (skillContext) {
       prompt += '\n\n' + skillContext;
     }
+    // Mercury Bots: the main agent must know the fleet exists — what each
+    // bot does, its live state, and how to dispatch to it. Without this the
+    // conversational agent answers bot questions blindly.
+    if (this.botManager) {
+      prompt += this.botManager.getSystemPromptSection();
+    }
     const programmingSuffix = this.programmingMode.getSystemPromptSuffix();
     if (programmingSuffix) {
       prompt += programmingSuffix;
@@ -4245,6 +5278,23 @@ Always specify owner and repo parameters on GitHub tools. The user's GitHub user
   }
 
   private async handleScheduledTask(manifest: ScheduledTaskManifest): Promise<void> {
+    // Bot routines run on the bot lane, never through the main agent loop
+    // (BOTS-ARCHITECTURE.md §2.3 — cron lane).
+    if (manifest.botId) {
+      if (!this.botManager) {
+        logger.warn({ task: manifest.id, botId: manifest.botId }, 'Bot routine fired but BotManager is not wired');
+        return;
+      }
+      logger.info({ task: manifest.id, botId: manifest.botId }, 'Bot routine firing');
+      const result = this.botManager.enqueue(manifest.botId, {
+        trigger: 'cron',
+        prompt: manifest.prompt || manifest.description,
+      });
+      if (!result.accepted) {
+        logger.warn({ botId: manifest.botId, reasonCode: result.reasonCode }, 'Bot routine could not be enqueued');
+      }
+      return;
+    }
     logger.info({ task: manifest.id, channel: manifest.sourceChannelType }, 'Processing scheduled task');
     try {
       const channel = manifest.sourceChannelType
@@ -7272,4 +8322,23 @@ Is this productive iteration or a stuck loop?`,
       }
     }
   }
+}
+
+/** Relative-time formatter for /bots run stamps (e.g. "3m ago"). */
+function formatRelative(timestamp: number): string {
+  const seconds = Math.max(0, Math.floor((Date.now() - timestamp) / 1000));
+  if (seconds < 60) return `${seconds}s ago`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  return `${Math.floor(hours / 24)}d ago`;
+}
+
+/** Human-readable byte size for /bots storage. */
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
 }

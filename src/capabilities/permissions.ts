@@ -9,6 +9,13 @@ export interface FileScope {
   path: string;
   read: boolean;
   write: boolean;
+  /**
+   * Explicit execute grant (fail-closed bots): shell commands whose path
+   * arguments all resolve inside this scope may run. The global
+   * blocked-command list always wins; commands without path arguments stay
+   * approval-gated.
+   */
+  execute?: boolean;
 }
 
 export interface ShellPermissions {
@@ -290,12 +297,49 @@ export class PermissionManager {
   private currentChannelId: string = 'cli';
   private approvedCommandsByContext = new Map<string, Set<string>>();
   private approvedWritesByContext = new Map<string, Set<string>>();
+  /**
+   * Fail-closed mode (unattended agents, e.g. Mercury Bots): no interactive
+   * approvals exist. Explicitly granted scopes apply without prompting;
+   * everything else denies. Never combined with autoApproveAll.
+   */
+  private failClosed = false;
 
   private tempScopes: FileScope[] = [];
+
+  /**
+   * Bot-scoped shell allow-list (fail-closed runtimes): patterns the bot's
+   * permissions.yaml explicitly granted. Kept separate from the manifest's
+   * autoApproved so an ambient global list (e.g. a user-approved "node *")
+   * can never silently elevate an unattended context.
+   */
+  private botShellAllowList?: string[];
 
   constructor() {
     this.cwd = process.cwd();
     this.manifest = this.load();
+  }
+
+  setFailClosed(value: boolean): void {
+    this.failClosed = value;
+  }
+
+  /**
+   * Bot-only shell allow-list (fail-closed contexts): explicit grants from
+   * the bot's permissions.yaml. A literal "*" is dropped — allow-all is an
+   * interactive-mode concept, not a bot grant.
+   */
+  setBotShellAllowList(patterns: string[]): void {
+    this.botShellAllowList = (patterns ?? [])
+      .map(p => p.trim())
+      .filter(p => p.length > 0 && p !== '*');
+  }
+
+  getBotShellAllowList(): string[] {
+    return [...(this.botShellAllowList ?? [])];
+  }
+
+  isFailClosed(): boolean {
+    return this.failClosed;
   }
 
   setCurrentChannelType(type: string): void {
@@ -337,6 +381,15 @@ export class PermissionManager {
   }
 
   elevateForSkill(allowedTools: string[]): void {
+    // Fail-closed mode (bots): skill elevation must never widen the granted
+    // scopes — elevation is checked BEFORE the fail-closed gates in
+    // checkFsAccess/checkShellCommand, so honoring it here would hand any
+    // skill with allowed-tools an unrestricted bypass. Skills guide; they do
+    // not re-permission.
+    if (this.failClosed) {
+      logger.info({ allowedTools }, 'Skill elevation ignored in fail-closed mode (granted scopes rule)');
+      return;
+    }
     if (allowedTools.includes('run_command')) {
       this.elevatedCommands.add('run_command');
     }
@@ -442,6 +495,15 @@ export class PermissionManager {
       if (tempScope && tempScope.write) return { allowed: true };
     }
 
+    // Fail-closed mode (bots): the explicitly granted scope IS the approval.
+    // No prompting in either direction — in-scope writes run, out-of-scope
+    // writes deny, and nothing ever waits for a user who isn't there.
+    if (this.failClosed) {
+      if (scope && scope.write) return { allowed: true };
+      if (tempScope && tempScope.write) return { allowed: true };
+      return { allowed: false, reason: `Fail-closed: no granted write scope covers ${path}` };
+    }
+
     // Write access in ask-me mode: ALWAYS prompt the user, even if scope exists
     if (mode === 'write' && !this.isGlobalAutoApproveActive() && this.askHandler && this.currentChannelType !== 'internal') {
       const scopeAllows = (scope && scope.write) || (tempScope && tempScope.write);
@@ -532,10 +594,34 @@ export class PermissionManager {
         const hasPathTraversal = this.hasPathBeyondCwd(segment);
         if (hasPathTraversal) {
           const scopeCheck = await this.checkFsAccess(hasPathTraversal, 'write');
-          if (!scopeCheck.allowed) {
+          if (!scopeCheck.allowed && !this.isExecuteScoped(hasPathTraversal)) {
             return { allowed: false, reason: `No permission to access ${hasPathTraversal}. Use approve_scope tool with path="${hasPathTraversal}" and mode="write" to request access.`, needsApproval: false };
           }
         }
+      }
+    }
+
+    // Bot allow-list (fail-closed only): set explicitly by the bot runtime
+    // (registry-factory from permissions.yaml autoApproveCommands) — never
+    // the ambient global autoApproved list, which stays decorative for
+    // unattended contexts. Placement AFTER the cwd-containment gate means a
+    // broad pattern like "cat *" can never launder a path outside granted
+    // scopes; needsApproval wins (the same pattern in both lists means
+    // deny); a bare "*" is rejected at grant time — allow-all is an
+    // interactive-mode concept, not a bot grant. Safe-read commands stay
+    // fully covered by the allSegmentsSafeRead lane below.
+    if (this.failClosed && this.botShellAllowList && this.botShellAllowList.length > 0) {
+      const needsApprovalList = shell.needsApproval ?? [];
+      const botList = this.botShellAllowList;
+      const allSegmentsApproved = segments.every((segment) =>
+        botList.some((pattern) =>
+          pattern.trim() !== '*' && this.matchPattern(segment, pattern)
+        )
+        && !needsApprovalList.some((pattern) => this.matchPattern(segment, pattern))
+      );
+      if (allSegmentsApproved) {
+        logger.info({ cmd: trimmed }, 'Shell command auto-approved (bot allow-list)');
+        return { allowed: true, needsApproval: false };
       }
     }
 
@@ -548,6 +634,19 @@ export class PermissionManager {
     if (allSegmentsSafeRead) {
       logger.info({ cmd: trimmed, segments: segments.length }, 'Shell command auto-approved (safe read-only)');
       return { allowed: true, needsApproval: false };
+    }
+
+    // Fail-closed execute grants (bots): an explicitly granted execute scope
+    // lets the bot run commands whose path arguments ALL live inside it — the
+    // blocked list already won above. Commands with no path argument stay
+    // approval-gated: an unscoped `npm install` mutates cwd and can reach
+    // anywhere via the network, so it is not covered by a directory grant.
+    if (this.failClosed) {
+      const pathTokens = segments.flatMap(s => this.extractPathTokens(s));
+      if (pathTokens.length > 0 && pathTokens.every(t => this.isExecuteScoped(t))) {
+        logger.info({ cmd: trimmed, paths: pathTokens.length }, 'Shell command allowed by execute scope');
+        return { allowed: true, needsApproval: false };
+      }
     }
 
     // All non-safe commands require user approval in ask-me mode
@@ -623,13 +722,20 @@ export class PermissionManager {
 
   private findScope(resolvedPath: string): FileScope | undefined {
     const scopes = this.manifest.capabilities.filesystem.scopes;
+    // Most-specific scope wins: a deep grant (e.g. ~/.mercury/tam rwx) must
+    // not be shadowed by a broad read-only ancestor (e.g. ~/.mercury r).
+    let best: FileScope | undefined;
+    let bestLen = -1;
     for (const scope of scopes) {
       const scopeResolved = resolve(scope.path.replace(/^~/, homedir()));
       if (resolvedPath === scopeResolved || resolvedPath.startsWith(scopeResolved + sep)) {
-        return scope;
+        if (scopeResolved.length > bestLen) {
+          best = scope;
+          bestLen = scopeResolved.length;
+        }
       }
     }
-    return undefined;
+    return best;
   }
 
   async requestScopeExternal(path: string, mode: 'read' | 'write'): Promise<{ allowed: boolean; reason?: string }> {
@@ -707,22 +813,34 @@ export class PermissionManager {
     }
   }
 
-  private hasPathBeyondCwd(command: string): string | null {
-    const pathPatterns = [
-      /(?:^|\s)(\/[^\s]+)/,
-      /(?:^|\s)(~\/[^\s]+)/,
-      /(?:^|\s)\.\.\/([^\s]+)/,
-      /(?:^|\s)([A-Za-z]:\\[^\s]+)/,
-      /(?:^|\s)(\\\\[^\s]+)/,
-    ];
-    for (const p of pathPatterns) {
-      const match = command.match(p);
-      if (match) {
-        const candidate = resolve(match[1].replace(/^~/, homedir()));
-        if (!candidate.startsWith(this.cwd)) {
-          return candidate;
-        }
+  private static readonly PATH_PATTERNS = [
+    /(?:^|\s)(\/[^\s]+)/,
+    /(?:^|\s)(~\/[^\s]+)/,
+    /(?:^|\s)\.\.\/([^\s]+)/,
+    /(?:^|\s)([A-Za-z]:\\[^\s]+)/,
+    /(?:^|\s)(\\\\[^\s]+)/,
+  ];
+
+  /** Every path-like token in a command segment, resolved (tilde expanded). */
+  private extractPathTokens(text: string): string[] {
+    const out: string[] = [];
+    for (const pattern of PermissionManager.PATH_PATTERNS) {
+      for (const match of text.matchAll(new RegExp(pattern.source, 'g'))) {
+        out.push(resolve(match[1].replace(/^~/, homedir())));
       }
+    }
+    return out;
+  }
+
+  /** A resolved path is covered by an explicit execute grant. */
+  private isExecuteScoped(resolvedPath: string): boolean {
+    if (this.findScope(resolvedPath)?.execute) return true;
+    return this.findTempScope(resolvedPath)?.execute === true;
+  }
+
+  private hasPathBeyondCwd(command: string): string | null {
+    for (const candidate of this.extractPathTokens(command)) {
+      if (!candidate.startsWith(this.cwd)) return candidate;
     }
     return null;
   }
