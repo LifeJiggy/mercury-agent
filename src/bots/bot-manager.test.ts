@@ -51,13 +51,15 @@ function makeManager(root: string, overrides: Partial<MercuryConfig> = {}): BotM
   const config = getDefaultConfig() as MercuryConfig;
   config.bots.maxConcurrent = 4;
   Object.assign(config, overrides);
-  return new BotManager({
+  const manager = new BotManager({
     config,
     providers: providersRegistry,
     tokenBudget,
     store: new BotStore(join(root, 'bots')),
     userMemoryFactory: () => null, // no SQLite dependency in unit tests
   });
+  activeManagers.push(manager);
+  return manager;
 }
 
 function seedBot(store: BotStore, id: string, manifestOverrides: Partial<BotManifest> = {}) {
@@ -67,6 +69,10 @@ function seedBot(store: BotStore, id: string, manifestOverrides: Partial<BotMani
 beforeEach(() => {
   mockedGenerateText.mockReset();
 });
+
+// Windows EBUSY guard: every BotManager owns an open SQLite queue handle;
+// afterEach disposes all of them before the tmpdir is deleted.
+const activeManagers: Array<{ dispose: () => void }> = [];
 
 describe('BotManager queue + turn lifecycle', () => {
   let root: string;
@@ -80,6 +86,7 @@ describe('BotManager queue + turn lifecycle', () => {
   });
 
   afterEach(() => {
+    for (const m of activeManagers.splice(0)) m.dispose();
     rmSync(root, { recursive: true, force: true });
   });
 
@@ -245,6 +252,7 @@ describe('BotManager queue + turn lifecycle', () => {
       store: new BotStore(join(root, 'bots')),
       userMemoryFactory: () => { throw new Error('better-sqlite3 is not available'); },
     });
+    activeManagers.push(manager);
     mockedGenerateText.mockResolvedValue({ text: 'stateless ok', finishReason: 'stop', usage: { inputTokens: 1, outputTokens: 1 } } as any);
     seedBot(store, 'nodb');
     manager.enqueue('nodb', { trigger: 'chat', prompt: 'hello' });
@@ -268,6 +276,7 @@ describe('Main-agent bots awareness (system prompt section)', () => {
   });
 
   afterEach(() => {
+    for (const m of activeManagers.splice(0)) m.dispose();
     rmSync(root, { recursive: true, force: true });
   });
 
@@ -329,6 +338,7 @@ describe('BotManager mailboxes (bot-to-bot comms)', () => {
   });
 
   afterEach(() => {
+    for (const m of activeManagers.splice(0)) m.dispose();
     rmSync(root, { recursive: true, force: true });
   });
 
@@ -375,6 +385,7 @@ describe('Per-bot permission isolation (fail-closed)', () => {
   });
 
   afterEach(() => {
+    for (const m of activeManagers.splice(0)) m.dispose();
     rmSync(root, { recursive: true, force: true });
   });
 
@@ -673,6 +684,7 @@ describe('bot_send tool scoping', () => {
   });
 
   afterEach(() => {
+    for (const m of activeManagers.splice(0)) m.dispose();
     rmSync(root, { recursive: true, force: true });
   });
 
@@ -710,6 +722,7 @@ describe('Bot skill access (native + own library)', () => {
   });
 
   afterEach(() => {
+    for (const m of activeManagers.splice(0)) m.dispose();
     rmSync(root, { recursive: true, force: true });
   });
 
@@ -750,6 +763,7 @@ describe('Bot fleets (lead + crew)', () => {
   });
 
   afterEach(() => {
+    for (const m of activeManagers.splice(0)) m.dispose();
     rmSync(root, { recursive: true, force: true });
   });
 

@@ -20,7 +20,7 @@ const mockedGenerateText = vi.mocked(generateText);
 function makeManager(root: string): BotManager {
   const config = getDefaultConfig() as MercuryConfig;
   config.bots.maxConcurrent = 4;
-  return new BotManager({
+  const manager = new BotManager({
     config,
     providers: {
       get: () => undefined,
@@ -35,11 +35,17 @@ function makeManager(root: string): BotManager {
     store: new BotStore(join(root, 'bots')),
     userMemoryFactory: () => null,
   });
+  activeManagers.push(manager);
+  return manager;
 }
 
 beforeEach(() => {
   mockedGenerateText.mockReset();
 });
+
+// Windows EBUSY guard: every BotManager owns an open SQLite queue handle;
+// afterEach disposes all of them before the tmpdir is deleted.
+const activeManagers: Array<{ dispose: () => void }> = [];
 
 describe('fleet delegation lights up crew status', () => {
   let root: string;
@@ -53,6 +59,7 @@ describe('fleet delegation lights up crew status', () => {
   });
 
   afterEach(() => {
+    for (const m of activeManagers.splice(0)) m.dispose();
     rmSync(root, { recursive: true, force: true });
   });
 

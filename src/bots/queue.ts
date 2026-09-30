@@ -99,6 +99,13 @@ export interface BotQueueBackend {
   /** Remove every trace of a bot: jobs, mail, DLQ rows (delete lifecycle). */
   purgeBot(botId: string): void;
   counts(): QueueCounts;
+  /**
+   * Release native handles (the SQLite connection). Idempotent — a second
+   * close is a no-op. On Windows an open handle keeps the file locked
+   * (EBUSY on delete): teardown, fleet-delete cleanup, and shutdown must
+   * close before any directory removal.
+   */
+  close(): void;
 }
 
 export const LEASE_SECONDS = 60;
@@ -140,6 +147,8 @@ function normalizeJob(raw: any): DurableBotJob {
  */
 export class BotQueue {
   readonly backend: BotQueueBackend;
+  /** Post-close guard: in-flight turns' queue access degrades to no-ops. */
+  private closed = false;
 
   constructor(botsRoot: string, dlqCap: number = DLQ_CAP) {
     const path = resolve(botsRoot);
@@ -151,7 +160,14 @@ export class BotQueue {
     logger.info({ backend: this.backend.name, path }, 'Bot queue initialized');
   }
 
+  /** Release native handles (the SQLite connection). Idempotent. */
+  close(): void {
+    this.closed = true;
+    this.backend.close();
+  }
+
   enqueue(job: Omit<DurableBotJob, 'state'>): { job: DurableBotJob; duplicated: boolean } {
+    if (this.closed) return { job: { ...job, state: 'pending' } as DurableBotJob, duplicated: false };
     return this.backend.enqueue(job);
   }
 
@@ -160,11 +176,13 @@ export class BotQueue {
   }
 
   settle(jobId: string, outcome: 'done' | 'dead', reasonCode?: string): void {
+    if (this.closed) return;
     this.backend.settle(jobId, outcome, reasonCode);
   }
 
   /** Durable in-place retry: no settle-then-reenqueue window. */
   retry(jobId: string, attempts: number, runAfterMs?: number): void {
+    if (this.closed) return;
     this.backend.retry(jobId, attempts, runAfterMs);
   }
 
@@ -177,35 +195,43 @@ export class BotQueue {
 
   /** Pending jobs whose retry backoff has elapsed (swept periodically). */
   dueJobs(): DurableBotJob[] {
+    if (this.closed) return [];
     return this.backend.dueJobs();
   }
 
   /** All pending jobs for one bot — explicit resume via /bots start. */
   pendingJobs(botId: string): DurableBotJob[] {
+    if (this.closed) return [];
     return this.backend.pendingJobs(botId);
   }
 
   enqueueMail(mail: Omit<DurableMail, 'id'>): string {
+    if (this.closed) return '';
     return this.backend.enqueueMail(mail);
   }
 
   drainMail(botId: string): DurableMail[] {
+    if (this.closed) return [];
     return this.backend.drainMail(botId);
   }
 
   purgeBot(botId: string): void {
+    if (this.closed) return;
     this.backend.purgeBot(botId);
   }
 
   listDlq(botId?: string): DlqEntry[] {
+    if (this.closed) return [];
     return this.backend.listDlq(botId);
   }
 
   removeFromDlq(jobId: string): DurableBotJob | null {
+    if (this.closed) return null;
     return this.backend.removeFromDlq(jobId);
   }
 
   counts(): QueueCounts {
+    if (this.closed) return { pending: 0, claimed: 0, dlq: 0 };
     return this.backend.counts();
   }
 }
@@ -220,6 +246,10 @@ export class SqliteQueueBackend implements BotQueueBackend {
   readonly name = 'better-sqlite3';
   private db: SqliteDatabase2;
   private dlqCap: number;
+  // A disposed manager must never turn an in-flight turn's queue access into
+  // a crash: post-close ops degrade to no-ops (an unsettled claim survives
+  // via lease expiry and resumes on the next boot).
+  private closed = false;
 
   constructor(path: string, dlqCap: number, cls: (typeof import('better-sqlite3'))) {
     mkdirSync(path, { recursive: true });
@@ -289,11 +319,13 @@ export class SqliteQueueBackend implements BotQueueBackend {
   }
 
   claim(jobId: string, leaseSeconds: number): void {
+    if (this.closed) return;
     this.db.prepare(`UPDATE bot_jobs SET state = 'claimed', lease_expires_at = ? WHERE id = ?`)
       .run(Date.now() + leaseSeconds * 1000, jobId);
   }
 
   heartbeatLease(jobId: string, leaseSeconds: number): void {
+    if (this.closed) return;
     this.db.prepare(`UPDATE bot_jobs SET lease_expires_at = ? WHERE id = ? AND state = 'claimed'`)
       .run(Date.now() + leaseSeconds * 1000, jobId);
   }
@@ -323,6 +355,7 @@ export class SqliteQueueBackend implements BotQueueBackend {
   }
 
   requeueExpiredLeases(): number {
+    if (this.closed) return 0;
     const result = this.db.prepare(
       `UPDATE bot_jobs SET state = 'pending', lease_expires_at = NULL WHERE state = 'claimed' AND lease_expires_at <= ?`,
     ).run(Date.now());
@@ -336,6 +369,7 @@ export class SqliteQueueBackend implements BotQueueBackend {
   }
 
   rehydratable(): DurableBotJob[] {
+    if (this.closed) return [];
     // Due pending jobs + expired-lease claimed jobs — jobs still in their
     // retry backoff (run_after in the future) wait until due.
     const rows = this.db.prepare(
@@ -409,6 +443,16 @@ export class SqliteQueueBackend implements BotQueueBackend {
     const dlq = (this.db.prepare(`SELECT COUNT(*) c FROM bot_dlq`).get() as any).c as number;
     return { pending, claimed, dlq };
   }
+
+  /** WAL checkpoints on close, releasing the -wal/-shm sidecars too. Idempotent. */
+  close(): void {
+    this.closed = true;
+    try {
+      this.db.close();
+    } catch {
+      // Already closed (double teardown must never throw).
+    }
+  }
 }
 
 // Minimal structural type for the better-sqlite3 API we use (avoids pulling
@@ -441,6 +485,9 @@ export class JsonFileQueueBackend implements BotQueueBackend {
   private file: string;
   private data: QueueFile;
   private dlqCap: number;
+
+  /** Writes are fd-opened-and-closed per op (write-to-rename + fsync) — nothing to release. */
+  close(): void { /* no native handles */ }
 
   constructor(dir: string, dlqCap: number) {
     mkdirSync(dir, { recursive: true });

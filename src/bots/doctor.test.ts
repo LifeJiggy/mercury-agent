@@ -23,6 +23,9 @@ describe('runBotDoctor', () => {
   });
 
   afterEach(() => {
+    // The queue owns the SQLite handle — close it or Windows locks queue.db
+    // (EBUSY) and the tmpdir teardown fails.
+    queue.close();
     rmSync(root, { recursive: true, force: true });
   });
 

@@ -1,5 +1,5 @@
 import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { isAbsolute, join, relative, resolve } from 'node:path';
 import { getMercuryHome } from '../utils/config.js';
 import { logger } from '../utils/logger.js';
 import type { BaseProvider } from '../providers/base.js';
@@ -64,7 +64,10 @@ Write the skill that captures the REUSABLE procedure (not this one instance). Ru
     const name = (nameMatch?.[1] ?? `${input.botId}-skill`).trim().slice(0, 60);
     const slug = slugify(`${input.botId}-${name}`);
     const dir = join(skillsRoot, 'bots', slug);
-    if (!dir.startsWith(resolve(skillsRoot) + '/')) return null; // traversal guard
+    // Traversal guard (separator-agnostic — a hardcoded '/' made this fail
+    // on EVERY Windows run): the resolved dir must stay inside the skills root.
+    const rel = relative(resolve(skillsRoot), resolve(dir));
+    if (rel === '' || rel.startsWith('..') || isAbsolute(rel)) return null;
     mkdirSync(dir, { recursive: true });
     const path = join(dir, 'SKILL.md');
     if (!existsSync(path)) {

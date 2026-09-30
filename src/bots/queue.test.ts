@@ -34,6 +34,18 @@ function makeBackends(dir: string) {
   };
 }
 
+// Every backend opened by a test is registered here and closed in afterEach —
+// on Windows an open SQLite handle keeps queue.db locked (EBUSY) and makes
+// the tmpdir teardown fail.
+const openBackends: Array<{ close(): void }> = [];
+function mkBackend(name: 'json' | 'sqlite', dir: string, dlqCap = 100) {
+  const backend = name === 'json'
+    ? new JsonFileQueueBackend(dir, dlqCap)
+    : new SqliteQueueBackend(dir, dlqCap, require('better-sqlite3'));
+  openBackends.push(backend);
+  return backend;
+}
+
 // `require` equivalent for the test (ESM)
 import { createRequire } from 'node:module';
 const require = createRequire(import.meta.url);
@@ -46,16 +58,17 @@ describe('BotQueue backends (JSON-file + SQLite semantics)', () => {
   });
 
   afterEach(() => {
+    for (const b of openBackends.splice(0)) b.close();
     rmSync(root, { recursive: true, force: true });
   });
 
   for (const name of ['json', 'sqlite'] as const) {
     describe(`${name} backend`, () => {
       it('enqueues pending and persists across restart', () => {
-        const backend = name === 'json' ? new JsonFileQueueBackend(root, 100) : new SqliteQueueBackend(root, 100, require('better-sqlite3'));
+        const backend = mkBackend(name, root);
         backend.enqueue(job('a1'));
         // Simulate a restart by re-reading from disk with a fresh instance
-        const fresh = name === 'json' ? new JsonFileQueueBackend(root, 100) : new SqliteQueueBackend(root, 100, require('better-sqlite3'));
+        const fresh = mkBackend(name, root);
         const resumed = fresh.rehydratable();
         expect(resumed).toHaveLength(1);
         expect(resumed[0].id).toBe('a1');
@@ -63,7 +76,7 @@ describe('BotQueue backends (JSON-file + SQLite semantics)', () => {
       });
 
       it('deduplicates on the idempotency key while pending', () => {
-        const backend = name === 'json' ? new JsonFileQueueBackend(root, 100) : new SqliteQueueBackend(root, 100, require('better-sqlite3'));
+        const backend = mkBackend(name, root);
         const first = backend.enqueue(job('a1', { prompt: 'same', idempotencyKey: idempotencyKeyFor('researcher', 'chat', 'same') }));
         const second = backend.enqueue(job('a2', { prompt: 'same', idempotencyKey: idempotencyKeyFor('researcher', 'chat', 'same') }));
         expect(first.duplicated).toBe(false);
@@ -73,7 +86,7 @@ describe('BotQueue backends (JSON-file + SQLite semantics)', () => {
       });
 
       it('claim sets a lease (in-flight, not resumable); settle done removes the job', () => {
-        const backend = name === 'json' ? new JsonFileQueueBackend(root, 100) : new SqliteQueueBackend(root, 100, require('better-sqlite3'));
+        const backend = mkBackend(name, root);
         backend.enqueue(job('a1'));
         backend.claim('a1', LEASE_SECONDS);
         // Fresh lease = in-flight: not resumable, but visible in counts.
@@ -85,7 +98,7 @@ describe('BotQueue backends (JSON-file + SQLite semantics)', () => {
       });
 
       it('pendingJobs returns only that bot’s pending work, ignoring retry backoff', () => {
-        const backend = name === 'json' ? new JsonFileQueueBackend(root, 100) : new SqliteQueueBackend(root, 100, require('better-sqlite3'));
+        const backend = mkBackend(name, root);
         backend.enqueue(job('h1'));
         backend.enqueue(job('h2', { botId: 'other' }));
         backend.enqueue(job('backoff', { idempotencyKey: idempotencyKeyFor('researcher', 'chat', 'task backoff') }));
@@ -95,7 +108,7 @@ describe('BotQueue backends (JSON-file + SQLite semantics)', () => {
       });
 
       it('settle dead moves the job to the DLQ with the reason', () => {
-        const backend = name === 'json' ? new JsonFileQueueBackend(root, 100) : new SqliteQueueBackend(root, 100, require('better-sqlite3'));
+        const backend = mkBackend(name, root);
         backend.enqueue(job('a1'));
         backend.settle('a1', 'dead', 'provider_auth');
         expect(backend.rehydratable()).toHaveLength(0);
@@ -106,7 +119,7 @@ describe('BotQueue backends (JSON-file + SQLite semantics)', () => {
       });
 
       it('expired leases requeue to pending; fresh leases survive in-flight', () => {
-        const backend = name === 'json' ? new JsonFileQueueBackend(root, 100) : new SqliteQueueBackend(root, 100, require('better-sqlite3'));
+        const backend = mkBackend(name, root);
         backend.enqueue(job('expired'));
         backend.enqueue(job('alive'));
         backend.claim('expired', 0); // expires immediately
@@ -120,7 +133,7 @@ describe('BotQueue backends (JSON-file + SQLite semantics)', () => {
       });
 
       it('DLQ is capped with oldest-first eviction', () => {
-        const backend = name === 'json' ? new JsonFileQueueBackend(root, 3) : new SqliteQueueBackend(root, 3, require('better-sqlite3'));
+        const backend = mkBackend(name, root, 3);
         for (let i = 0; i < 5; i++) {
           backend.enqueue(job(`d${i}`, { createdAt: i }));
           backend.settle(`d${i}`, 'dead', 'test');
@@ -132,7 +145,7 @@ describe('BotQueue backends (JSON-file + SQLite semantics)', () => {
       });
 
       it('removeFromDlq returns the entry and clears it for replay', () => {
-        const backend = name === 'json' ? new JsonFileQueueBackend(root, 100) : new SqliteQueueBackend(root, 100, require('better-sqlite3'));
+        const backend = mkBackend(name, root);
         backend.enqueue(job('a1'));
         backend.settle('a1', 'dead', 'provider_rate_limit');
         const removed = backend.removeFromDlq('a1');
@@ -143,7 +156,7 @@ describe('BotQueue backends (JSON-file + SQLite semantics)', () => {
       });
 
       it('counts reflect live state', () => {
-        const backend = name === 'json' ? new JsonFileQueueBackend(root, 100) : new SqliteQueueBackend(root, 100, require('better-sqlite3'));
+        const backend = mkBackend(name, root);
         backend.enqueue(job('a1'));
         backend.enqueue(job('a2'));
         backend.claim('a1', 3600);
@@ -155,6 +168,7 @@ describe('BotQueue backends (JSON-file + SQLite semantics)', () => {
   it('BotQueue facade resumes expired leases and pending jobs', () => {
     const dir = join(root, 'bots');
     const queue = new BotQueue(dir, 100);
+    openBackends.push(queue);
     queue.enqueue(job('r1'));
     queue.enqueue(job('r2'));
     queue.claim('r1', 0);
@@ -166,7 +180,7 @@ describe('BotQueue backends (JSON-file + SQLite semantics)', () => {
   it('retry requeues the same job in place — no settle-then-reenqueue window', () => {
     for (const name of ['json', 'sqlite'] as const) {
       const dir = join(root, `retry-${name}`);
-      const backend = name === 'json' ? new JsonFileQueueBackend(dir, 100) : new SqliteQueueBackend(dir, 100, require('better-sqlite3'));
+      const backend = mkBackend(name, dir);
       backend.enqueue(job('t1'));
       backend.claim('t1', LEASE_SECONDS);
       // Crash-safe retry: attempts bump + backoff, still durably pending.
@@ -174,7 +188,7 @@ describe('BotQueue backends (JSON-file + SQLite semantics)', () => {
       expect(backend.rehydratable()).toHaveLength(0); // backoff not elapsed
       expect(backend.dueJobs()).toHaveLength(0);
       // A restart (fresh instance over the same storage) still sees the job
-      const fresh = name === 'json' ? new JsonFileQueueBackend(dir, 100) : new SqliteQueueBackend(dir, 100, require('better-sqlite3'));
+      const fresh = mkBackend(name, dir);
       expect(fresh.rehydratable().length).toBeGreaterThanOrEqual(0);
       expect(fresh.counts().pending).toBe(1);
     }
@@ -183,10 +197,10 @@ describe('BotQueue backends (JSON-file + SQLite semantics)', () => {
   it('durable mail survives a restart and drains once', () => {
     for (const name of ['json', 'sqlite'] as const) {
       const dir = join(root, `mail-${name}`);
-      const backend = name === 'json' ? new JsonFileQueueBackend(dir, 100) : new SqliteQueueBackend(dir, 100, require('better-sqlite3'));
+      const backend = mkBackend(name, dir);
       backend.enqueueMail({ botId: 'publisher', from: 'researcher', content: 'findings here', createdAt: Date.now() });
       // Restart: the mail is still there
-      const fresh = name === 'json' ? new JsonFileQueueBackend(dir, 100) : new SqliteQueueBackend(dir, 100, require('better-sqlite3'));
+      const fresh = mkBackend(name, dir);
       const drained = fresh.drainMail('publisher');
       expect(drained).toHaveLength(1);
       expect(drained[0].from).toBe('researcher');
@@ -231,6 +245,9 @@ describe('BotManager durable queue integration', () => {
   });
 
   afterEach(() => {
+    // The manager owns the SQLite queue handle — close it or Windows locks
+    // queue.db (EBUSY) and the tmpdir teardown fails.
+    try { manager?.dispose?.(); } catch { /* already gone */ }
     rmSync(root, { recursive: true, force: true });
   });
 
