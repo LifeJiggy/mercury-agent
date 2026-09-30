@@ -46,6 +46,7 @@ import {
 import type { MercuryConfig } from './utils/config.js';
 import type { ProviderName } from './utils/config.js';
 import { logger } from './utils/logger.js';
+import { devBuildLabel, isDevBuild } from './utils/dev-build.js';
 import { redactPhone } from './utils/redact.js';
 import { Identity } from './soul/identity.js';
 import { ShortTermMemory, LongTermMemory, EpisodicMemory, migrateLegacyMemory } from './memory/store.js';
@@ -87,8 +88,16 @@ import { isWebAuthInitialized, setWebPassword, writeAttachToken } from './web/au
 const __dirname = dirname(fileURLToPath(import.meta.url));
 let pkgVersion: string;
 try {
-  // Normal (npm) install: package.json sits one level above dist/.
-  pkgVersion = JSON.parse(readFileSync(join(__dirname, '..', 'package.json'), 'utf8')).version;
+  // Dev-channel builds are stamped at compile time (MERCURY_CHANNEL_VERSION →
+  // tsup define). This wins over whatever version happens to sit on disk —
+  // a dev binary run from a checkout must still report its dev stamp.
+  const channelVersion = (globalThis as any).__MERCURY_CHANNEL_VERSION__ as string | undefined;
+  if (channelVersion) {
+    pkgVersion = channelVersion;
+  } else {
+    // Normal (npm) install: package.json sits one level above dist/.
+    pkgVersion = JSON.parse(readFileSync(join(__dirname, '..', 'package.json'), 'utf8')).version;
+  }
 } catch {
   // Standalone binary (Bun --compile / pkg / SEA): package.json is not on
   // disk next to the embedded bundle. Use the version injected at build
@@ -116,6 +125,11 @@ function banner() {
   console.log(chalk.bold.cyan('  MERCURY'));
   console.log(chalk.white('  Your soul-driven AI agent'));
   console.log(chalk.dim(`  v${pkgVersion} · by Cosmic Stack · mercuryagent.sh`));
+  // Dev-channel builds announce themselves on EVERY launch — a preview
+  // binary must never be mistaken for the stable distribution.
+  if (isDevBuild(pkgVersion)) {
+    console.log(chalk.yellow(`  ⚠ ${devBuildLabel(pkgVersion)} · not for production`));
+  }
   console.log('');
 }
 
@@ -129,6 +143,9 @@ function splashScreen() {
   console.log(chalk.dim('  Your soul-driven AI agent'));
   console.log(chalk.cyan('  by Cosmic Stack'));
   console.log(chalk.dim('  mercuryagent.sh'));
+  if (isDevBuild(pkgVersion)) {
+    console.log(chalk.yellow(`  ⚠ ${devBuildLabel(pkgVersion)}`));
+  }
   console.log('');
 }
 
@@ -4649,6 +4666,12 @@ serviceCmd
   .action(async () => {
     console.log('');
     console.log(chalk.cyan(`  Mercury ${chalk.white(`v${pkgVersion}`)}`));
+    // A dev binary upgrades itself in place on the same channel (re-running
+    // the dev installer below); npm builds take the npm stable track.
+    if (isDevBuild(pkgVersion)) {
+      console.log(chalk.yellow('  ⚠ development build — upgrading within the dev channel (rolling mercury-dev-latest)'));
+      console.log('');
+    }
     console.log('');
 
     const daemon = getDaemonStatus();
@@ -4662,8 +4685,16 @@ serviceCmd
 
     if (standalone) {
       // Standalone binary: re-run the installer script which downloads the
-      // latest release from GitHub and replaces the binary in-place.
-      console.log(chalk.dim('  Standalone binary detected — re-running installer...'));
+      // latest release from GitHub and replaces the binary in-place. A dev
+      // build re-runs the DEV installer so `upgrade` stays on its channel —
+      // running the stable installer here would silently switch installs.
+      const isDev = isDevBuild(pkgVersion);
+      const installer = isDev ? 'install-dev' : 'install';
+      console.log(
+        isDev
+          ? chalk.dim('  Development build detected — re-running the dev installer (stays on the dev channel)...')
+          : chalk.dim('  Standalone binary detected — re-running installer...'),
+      );
       console.log('');
 
       const { execSync, spawn } = await import('node:child_process');
@@ -4671,27 +4702,27 @@ serviceCmd
 
       if (platform === 'win32') {
         // Run after this process exits so Windows releases the current executable.
-        const psCmd = 'Start-Sleep -Seconds 1; irm https://mercuryagent.sh/install.ps1 | iex';
+        const psCmd = `Start-Sleep -Seconds 1; irm https://mercuryagent.sh/${installer}.ps1 | iex`;
         try {
-          const installer = spawn(
+          const installer2 = spawn(
             'powershell.exe',
             ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', psCmd],
             { detached: true, stdio: 'inherit' },
           );
-          installer.unref();
+          installer2.unref();
           console.log(chalk.green('  ✓ Upgrade installer started. Mercury will exit before installation begins.'));
         } catch {
           console.log(chalk.red('  ✗ Upgrade failed. Try manually:'));
-          console.log(chalk.dim('    irm https://mercuryagent.sh/install.ps1 | iex'));
+          console.log(chalk.dim(`    irm https://mercuryagent.sh/${installer}.ps1 | iex`));
         }
       } else {
         // macOS / Linux: use shell installer
-        const shCmd = 'curl -fsSL https://mercuryagent.sh/install.sh | sh';
+        const shCmd = `curl -fsSL https://mercuryagent.sh/${installer}.sh | sh`;
         try {
           execSync(shCmd, { stdio: 'inherit' });
         } catch {
           console.log(chalk.red('  ✗ Upgrade failed. Try manually:'));
-          console.log(chalk.dim('    curl -fsSL https://mercuryagent.sh/install.sh | sh'));
+          console.log(chalk.dim(`    curl -fsSL https://mercuryagent.sh/${installer}.sh | sh`));
         }
       }
 

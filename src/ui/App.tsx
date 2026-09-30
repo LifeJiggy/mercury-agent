@@ -6,6 +6,7 @@ import type { AppMode, ChatMessage, ToolStep, SubAgentInfo, PermissionPromptStat
 import type { PermissionMode } from '../channels/base.js';
 import type { ProgrammingModeState } from '../core/programming-mode.js';
 import { renderMarkdown } from '../utils/markdown.js';
+import { isDevBuild } from '../utils/dev-build.js';
 import { highlightCodeBlock } from '../utils/highlight.js';
 import { normalizeTerminalText, getViewportWindow } from './terminal-viewport.js';
 import { buildMercuryMessageLines, buildMercuryBrandLines, buildStreamTailLines, parseChunkIndex, splitFinalMessage, splitStreamingMessage, type MercuryTranscriptLine } from './mercury-transcript.js';
@@ -971,7 +972,7 @@ export function TuiApp({ channel, onInput, onPermissionResolve, onExit, spotifyC
           <Box flexDirection="column" flexGrow={1}>
             <Text bold color="white">Session</Text>
             <Text color="gray">{'─'.repeat(56)}</Text>
-            <Text>Version: <Text color="cyan">{state.version}</Text></Text>
+            <Text>Version: <Text color="cyan">{state.version}</Text>{isDevBuild(state.version) && <Text color="yellow"> ⚠ development build</Text>}</Text>
             <Text>Provider: <Text color={BRAND.accent}>{state.provider ? `${state.provider.name} · ${state.provider.model}` : 'Detecting...'}</Text></Text>
             <Text>Mode: <Text color="yellow">Startup</Text></Text>
             {state.tokenInfo && (

@@ -7,8 +7,13 @@
 #
 # Environment variables:
 #   MERCURY_VERSION   Version to install (e.g. "1.1.9"). Default: latest.
+#                     (Stable channel only — dev installs always track the
+#                     latest dev build.)
+#   MERCURY_CHANNEL   Distribution channel: "stable" (default) or "dev".
 #   MERCURY_INSTALL   Install prefix.    Default: $HOME/.mercury
+#                     ($HOME/.mercury-dev for the dev channel.)
 #                     The binary lands at $MERCURY_INSTALL/bin/mercury.
+#                     (mercury-dev on the dev channel.)
 #   MERCURY_NO_PATH   If set to "1", skip modifying shell rc files.
 #
 # Windows users: use install.ps1 instead.
@@ -18,6 +23,33 @@ set -eu
 REPO="cosmicstack-labs/mercury-agent"
 GITHUB_API="https://api.github.com/repos/${REPO}"
 GITHUB_DL="https://github.com/${REPO}/releases/download"
+
+# ----- channel ---------------------------------------------------------------
+#
+# Stable is the default distribution channel — it resolves the numbered
+# GitHub release current users should install. The dev channel tracks the
+# rolling `mercury-dev-latest` PRE-release (feature previews that are NOT
+# "latest" on GitHub, so the stable installer and users never see them).
+# The two channels install under different prefixes with different binary
+# names, so a dev install coexists with a stable one on the same machine.
+CHANNEL="${MERCURY_CHANNEL:-stable}"
+
+case "$CHANNEL" in
+  stable)
+    RELEASE_TAG=""                 # resolved to v<version> at install time
+    DEFAULT_PREFIX="$HOME/.mercury"
+    BIN_NAME="mercury"
+    ;;
+  dev)
+    RELEASE_TAG="mercury-dev-latest"
+    DEFAULT_PREFIX="$HOME/.mercury-dev"
+    BIN_NAME="mercury-dev"
+    ;;
+  *)
+    err "Unknown MERCURY_CHANNEL '$CHANNEL' (expected stable or dev)."
+    exit 1
+    ;;
+esac
 
 # ----- helpers ---------------------------------------------------------------
 
@@ -131,7 +163,10 @@ maybe_update_path() {
   case ":$PATH:" in *":$bin_dir:"*) return 0 ;; esac
 
   rc=$(shell_rc_file)
-  marker='# added by mercury installer'
+  # Channel-suffixed sentinel: stable and dev installs must not shadow each
+  # other's rc entries — a shared marker made the second channel's PATH
+  # append a silent no-op ("already present" while never adding its dir).
+  marker="# added by mercury installer ($CHANNEL)"
   if [ -f "$rc" ] && grep -Fq "$marker" "$rc" 2>/dev/null; then
     info "PATH entry already present in $(basename "$rc")"
     return 0
@@ -153,6 +188,10 @@ maybe_update_path() {
 main() {
   printf '\n%s\n' "$(c_bold '☿ Mercury installer')"
   printf '   Soul-driven AI agent · https://mercuryagent.sh\n\n'
+  if [ "$CHANNEL" = "dev" ]; then
+    printf '%s Dev channel — unstable preview builds.\n' "$(c_yellow '!')"
+    printf '  Installs as %s (coexists with stable).\n\n' "$DEFAULT_PREFIX/bin/$BIN_NAME"
+  fi
 
   termux_prefix=0
   case "${PREFIX:-}" in *com.termux*) termux_prefix=1 ;; esac
@@ -168,18 +207,26 @@ Install the supported Node.js package instead:
   info "Detected platform: ${os}-${arch}"
 
   version=${MERCURY_VERSION:-}
-  if [ -z "$version" ]; then
-    info "Resolving latest version from GitHub..."
-    version=$(resolve_latest_version)
+  if [ "$CHANNEL" = "dev" ]; then
+    release_dir="${GITHUB_DL}/${RELEASE_TAG}"
+    version_label="dev (rolling ${RELEASE_TAG})"
+  else
+    release_dir="${GITHUB_DL}/v${version}"
+    if [ -z "$version" ]; then
+      info "Resolving latest version from GitHub..."
+      version=$(resolve_latest_version)
+    fi
+    release_dir="${GITHUB_DL}/v${version}"
+    version_label="v${version}"
   fi
-  info "Installing Mercury v${version}"
+  info "Installing Mercury ${version_label}"
 
   asset="mercury-${os}-${arch}"
-  url="${GITHUB_DL}/v${version}/${asset}"
+  url="${release_dir}/${asset}"
 
-  prefix=${MERCURY_INSTALL:-"$HOME/.mercury"}
+  prefix=${MERCURY_INSTALL:-"$DEFAULT_PREFIX"}
   bin_dir="$prefix/bin"
-  bin_path="$bin_dir/mercury"
+  bin_path="$bin_dir/$BIN_NAME"
 
   tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/mercury.XXXXXX")
   binary_tmp="$tmp_dir/$asset"
@@ -188,7 +235,7 @@ Install the supported Node.js package instead:
   stage_dir="$tmp_dir/stage"
   trap 'rm -rf "$tmp_dir"' EXIT INT TERM
 
-  checksum_url="${GITHUB_DL}/v${version}/checksums.txt"
+  checksum_url="${release_dir}/checksums.txt"
   info "Downloading checksums.txt ..."
   fetch_to "$checksum_url" "$checksums_tmp" || die "Failed to download required checksums from $checksum_url"
   expected_binary=$(checksum_for "$checksums_tmp" "$asset")
@@ -197,11 +244,11 @@ Install the supported Node.js package instead:
   info "Downloading $asset ..."
   if ! fetch_to "$url" "$binary_tmp"; then
     die "Failed to download $url
-   The binary for v${version} on ${os}-${arch} may not have been published yet.
+   The binary for ${version_label} on ${os}-${arch} may not have been published yet.
    Browse releases: https://github.com/${REPO}/releases"
   fi
 
-  web_tar_url="${GITHUB_DL}/v${version}/web.tar.gz"
+  web_tar_url="${release_dir}/web.tar.gz"
   info "Downloading web.tar.gz ..."
   fetch_to "$web_tar_url" "$web_tmp" || die "Failed to download required web dashboard assets from $web_tar_url"
 
@@ -248,7 +295,7 @@ Install the supported Node.js package instead:
   PATH_UPDATED=0
   maybe_update_path "$bin_dir"
 
-  printf '\n%s Mercury v%s is ready.\n' "$(c_green '✓')" "$version"
+  printf '\n%s Mercury %s is ready.\n' "$(c_green '✓')" "$version_label"
 
   if [ "${PATH_UPDATED:-0}" = "1" ]; then
     printf '\n%s Restart your shell or run:\n' "$(c_yellow 'NOTE:')"
@@ -258,7 +305,13 @@ Install the supported Node.js package instead:
   printf 'Get started:\n'
   printf '   %s --help\n' "$bin_path"
   printf '   %s              # first run launches setup wizard\n\n' \
-    "$([ "${PATH_UPDATED:-0}" = "1" ] && echo mercury || echo "$bin_path")"
+    "$([ "${PATH_UPDATED:-0}" = "1" ] && echo "$BIN_NAME" || echo "$bin_path")"
+
+  if [ "$CHANNEL" = "dev" ]; then
+    printf '%s Dev channel — preview builds, may break. Run to check:\n' "$(c_yellow 'NOTE:')"
+    printf '    %s version\n' "$bin_path"
+    printf 'Re-run this script to update to the latest dev build.\n\n'
+  fi
 }
 
 main "$@"

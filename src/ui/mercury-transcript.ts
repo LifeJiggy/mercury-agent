@@ -2,6 +2,7 @@ import type { ChatMessage } from './types.js';
 import { TASK_SUMMARY_FILE_LIMIT } from './types.js';
 import { normalizeTerminalText } from './terminal-viewport.js';
 import { renderMarkdown } from '../utils/markdown.js';
+import { devBuildLabel, isDevBuild } from '../utils/dev-build.js';
 import { renderMercuryCodeParts } from './pixel-logo.js';
 
 export type MercuryTranscriptKind = 'header' | 'text' | 'code-label' | 'code' | 'system' | 'file' | 'spacer' | 'brand';
@@ -56,7 +57,11 @@ export function buildMercuryBrandLines(version: string, cols: number): MercuryTr
   const maxLen = Math.max(...parts.map((p) => p.left.length + 2 + p.right.length));
   const indent = Math.max(0, Math.floor((cols - maxLen) / 2));
   const versionStr = `v${version}`;
-  const versionIndent = Math.max(0, indent + maxLen - versionStr.length - 1);
+  // Dev builds badge the version row two-tone (accent) — an unmistakable
+  // marker that this binary is a channel preview, on every TUI boot.
+  const devSuffix = isDevBuild(version) ? `  ⚠ ${devBuildLabel(version)}` : '';
+  const versionTotal = versionStr.length + devSuffix.length;
+  const versionIndent = Math.max(0, indent + maxLen - versionTotal - 1);
   // Top padding: a clean band of air above the mark.
   const padRow: MercuryTranscriptLine = { key: 'brand:pad-top', kind: 'spacer', role: 'system', text: '' };
   const rows: MercuryTranscriptLine[] = [padRow, ...parts.map((part, i) => ({
@@ -71,7 +76,7 @@ export function buildMercuryBrandLines(version: string, cols: number): MercuryTr
     kind: 'brand',
     role: 'system',
     text: ' '.repeat(versionIndent) + versionStr,
-    accent: '',
+    accent: devSuffix,
   });
   rows.push({ key: 'brand:spacer', kind: 'spacer', role: 'system', text: '' });
   return rows;

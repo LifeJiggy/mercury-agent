@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { ChatMessage } from './types.js';
 import {
+  buildMercuryBrandLines,
   buildMercuryMessageLines,
   parseChunkIndex,
   settledChunkEnds,
@@ -170,5 +171,27 @@ describe('settled-chunk splitter (progressive streaming flush)', () => {
   it('degenerate inputs: short and empty messages produce exactly one chunk', () => {
     expect(splitFinalMessage(chunkMessage('short answer')).map((c) => c.id)).toEqual(['m1#c0']);
     expect(splitFinalMessage(chunkMessage('')).map((c) => c.id)).toEqual(['m1#c0']);
+  });
+});
+
+describe('dev-build badge on the TUI wordmark', () => {
+  const devVersion = '1.2.7-dev.20260929.790d20a';
+
+  it('badges the version row two-tone on dev builds', () => {
+    const rows = buildMercuryBrandLines(devVersion, 120);
+    const versionRow = rows.find((r) => r.key === 'brand:version');
+    expect(versionRow).toBeDefined();
+    expect(versionRow!.text).toContain(`v${devVersion}`);
+    // Two-tone: the dev marker rides the accent segment, so it renders in the
+    // wordmark's secondary color — not buried in the version string.
+    expect(versionRow!.accent).toContain('dev build 20260929.790d20a');
+  });
+
+  it('leaves the version row clean on stable builds', () => {
+    const rows = buildMercuryBrandLines('1.2.7', 120);
+    const versionRow = rows.find((r) => r.key === 'brand:version');
+    expect(versionRow).toBeDefined();
+    expect(versionRow!.accent).toBe('');
+    expect(versionRow!.text).toContain('v1.2.7');
   });
 });

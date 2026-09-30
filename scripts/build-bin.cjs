@@ -26,10 +26,16 @@
  * deleted first. Host builds are isolated under release/smoke.
  *
  * Usage:
+ * Usage:
  *   node scripts/build-bin.cjs                # host target only
  *   node scripts/build-bin.cjs --all          # all configured targets
  *   node scripts/build-bin.cjs --force        # overwrite existing binaries
  *   node scripts/build-bin.cjs --all --force
+ *   node scripts/build-bin.cjs --dev          # dev channel: all targets into
+ *                                             # release/dev (rolling, wiped
+ *                                             # each run; publish-dev.sh
+ *                                             # uploads it as the rolling
+ *                                             # mercury-dev-latest pre-release)
  *
  * Cross-compilation:
  *   Bun ships its own runtime per target, so cross-compile works for JS.
@@ -223,17 +229,29 @@ if (!fs.existsSync(entry)) {
 
 const args = process.argv.slice(2);
 const buildAll = args.includes('--all');
+const buildDev = args.includes('--dev');
 const force = args.includes('--force');
-const unknownArgs = args.filter((arg) => arg !== '--all' && arg !== '--force');
+const unknownArgs = args.filter((arg) => arg !== '--all' && arg !== '--force' && arg !== '--dev');
 if (unknownArgs.length > 0) {
   console.error(`ERROR: unknown argument(s): ${unknownArgs.join(', ')}`);
   process.exit(1);
 }
+if (buildAll && buildDev) {
+  console.error('ERROR: --all and --dev are mutually exclusive.');
+  process.exit(1);
+}
 
-const versionDir = buildAll
-  ? path.join(releaseRoot, `v${version}`)
-  : path.join(releaseRoot, 'smoke', `v${version}`);
-if (!buildAll && force) fs.rmSync(versionDir, { recursive: true, force: true });
+const versionDir = buildDev
+  ? path.join(releaseRoot, 'dev')
+  : buildAll
+    ? path.join(releaseRoot, `v${version}`)
+    : path.join(releaseRoot, 'smoke', `v${version}`);
+if (!buildAll && !buildDev && force) fs.rmSync(versionDir, { recursive: true, force: true });
+if (buildDev) {
+  // The dev channel is a rolling build (scripts/publish-dev.sh always
+  // replaces it wholesale) — no mix guard, just wipe and rebuild.
+  fs.rmSync(versionDir, { recursive: true, force: true });
+}
 if (buildAll && fs.existsSync(versionDir)) {
   if (!force && fs.readdirSync(versionDir).length > 0) {
     console.error(`ERROR: ${path.relative(root, versionDir)} already contains release assets.`);
@@ -245,9 +263,9 @@ if (buildAll && fs.existsSync(versionDir)) {
 fs.mkdirSync(versionDir, { recursive: true });
 
 const bun = findBun();
-const targets = buildAll ? ALL_TARGETS : [hostTarget()];
+const targets = buildDev || buildAll ? ALL_TARGETS : [hostTarget()];
 
-console.log(`\nMercury v${version} — building ${targets.length} ${buildAll ? 'release' : 'host smoke'} target(s) with ${bun}`);
+console.log(`\nMercury ${buildDev ? '(dev channel)' : `v${version}`} — building ${targets.length} ${buildDev || buildAll ? 'release' : 'host smoke'} target(s) with ${bun}`);
 console.log(`Output: ${path.relative(root, versionDir)}/${force ? '  (force overwrite)' : ''}\n`);
 
 const results = [];
@@ -256,15 +274,17 @@ for (const target of targets) {
   results.push(compile(bun, target, { force, versionDir }));
 }
 
-const webTarPath = createWebArchive(versionDir, { required: buildAll });
+const webTarPath = createWebArchive(versionDir, { required: buildDev || buildAll });
 writeChecksums(versionDir, [...results.map((result) => result.outPath), webTarPath]);
 
-if (buildAll) {
+if (buildDev || buildAll) {
   execFileSync(process.execPath, [path.join(__dirname, 'verify-standalone-release.cjs'), versionDir], {
     cwd: root,
     stdio: 'inherit',
   });
-  updateLatestSymlink();
+  // Only stable releases move the `release/latest` pointer — a dev build must
+  // never clobber what the stable channel resolves.
+  if (buildAll) updateLatestSymlink();
 }
 
 const built = results.filter((r) => !r.skipped).length;
