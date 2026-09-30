@@ -577,7 +577,11 @@ export class JsonFileQueueBackend implements BotQueueBackend {
     const now = Date.now();
     let n = 0;
     for (const job of this.data.jobs) {
-      if (job.state === 'claimed' && (job.leaseExpiresAt ?? 0) < now) {
+      // Inclusive boundary (matches SQLite's lease_expires_at <= now): a
+      // heartbeat to an instant-expiry lease (now + 0) must be sweepable in
+      // the SAME millisecond it was written — strict < raced the ms clock
+      // and trapped zero-width leases on fast-Linux/Windows fsync.
+      if (job.state === 'claimed' && (job.leaseExpiresAt ?? 0) <= now) {
         job.state = 'pending';
         job.leaseExpiresAt = undefined;
         n++;
@@ -599,11 +603,14 @@ export class JsonFileQueueBackend implements BotQueueBackend {
   }
 
   rehydratable(): DurableBotJob[] {
-    // Due pending + expired-lease claimed — future run_after waits.
+    // Due pending + expired-lease claimed (INCLUSIVE — a heartbeat to an
+    // instant-expiry lease must be sweepable in the same millisecond;
+    // strict < raced the ms clock and trapped zero-width leases).
+    // Future run_after waits.
     const now = Date.now();
     return this.data.jobs.filter(j =>
       (j.state === 'pending' && (j.runAfter === undefined || j.runAfter <= now))
-      || (j.state === 'claimed' && (j.leaseExpiresAt ?? 0) < now));
+      || (j.state === 'claimed' && (j.leaseExpiresAt ?? 0) <= now));
   }
 
   dueJobs(): DurableBotJob[] {
