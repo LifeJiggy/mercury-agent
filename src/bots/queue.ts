@@ -92,6 +92,8 @@ export interface BotQueueBackend {
   requeueExpiredLeases(): number;
   heartbeatLease(jobId: string, leaseSeconds: number): void;
   listDlq(botId?: string): DlqEntry[];
+  /** Read a DLQ entry without removing it (replay does lookup-then-remove so a bot mismatch never destroys the entry). */
+  peekDlq(jobId: string): DurableBotJob | null;
   removeFromDlq(jobId: string): DurableBotJob | null;
   /** Durable bot-to-bot mailbox (§2.6: a handoff must survive a crash). */
   enqueueMail(mail: Omit<DurableMail, 'id'>): string;
@@ -228,6 +230,16 @@ export class BotQueue {
   removeFromDlq(jobId: string): DurableBotJob | null {
     if (this.closed) return null;
     return this.backend.removeFromDlq(jobId);
+  }
+
+  peekDlq(jobId: string): DurableBotJob | null {
+    if (this.closed) return null;
+    return this.backend.peekDlq(jobId);
+  }
+
+  heartbeatLease(jobId: string, leaseSeconds: number = LEASE_SECONDS): void {
+    if (this.closed) return;
+    this.backend.heartbeatLease(jobId, leaseSeconds);
   }
 
   counts(): QueueCounts {
@@ -430,6 +442,11 @@ export class SqliteQueueBackend implements BotQueueBackend {
     }));
   }
 
+  peekDlq(jobId: string): DurableBotJob | null {
+    const row = this.db.prepare(`SELECT * FROM bot_dlq WHERE id = ?`).get(jobId) as any;
+    return row ? ({ ...normalizeJob(row), state: 'dead' as const, deadAt: row.dead_at } as any) : null;
+  }
+
   removeFromDlq(jobId: string): DurableBotJob | null {
     const row = this.db.prepare(`SELECT * FROM bot_dlq WHERE id = ?`).get(jobId) as any;
     if (!row) return null;
@@ -624,6 +641,10 @@ export class JsonFileQueueBackend implements BotQueueBackend {
 
   listDlq(botId?: string): DlqEntry[] {
     return this.data.dlq.filter(j => !botId || j.botId === botId);
+  }
+
+  peekDlq(jobId: string): DurableBotJob | null {
+    return this.data.dlq.find(j => j.id === jobId) ?? null;
   }
 
   removeFromDlq(jobId: string): DurableBotJob | null {

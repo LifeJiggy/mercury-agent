@@ -442,8 +442,20 @@ export class BotManager {
       return;
     }
 
+    // Lease heartbeat: a turn can outlive LEASE_SECONDS by minutes (long
+    // provider calls). Without a heartbeat the 30s due-sweep requeues the
+    // STILL-RUNNING job, a duplicate turn starts, and whichever settles
+    // first makes the other's settle a silent no-op — the job vanishes
+    // from the DLQ and /bots replay reports not_found. A live turn must
+    // never expire its lease.
+    let heartbeat: ReturnType<typeof setInterval> | undefined;
+
     try {
       this.queue.claim(job.id, LEASE_SECONDS);
+      heartbeat = setInterval(() => {
+        try { this.queue.heartbeatLease(job.id, LEASE_SECONDS); } catch { /* best effort */ }
+      }, (LEASE_SECONDS / 3) * 1000);
+      heartbeat.unref?.();
       const turn = this.buildTurn(botId, manifest, job, controller.signal);
       const output = await runBotTurn({
         ...turn.input,
@@ -599,6 +611,7 @@ export class BotManager {
       });
       this.needsYou.add(botId);
     } finally {
+      if (heartbeat) clearInterval(heartbeat);
       running.delete(job.id);
       this.aborts.delete(`${botId}:${job.id}`);
       if (running.size === 0) this.activity.delete(botId);
@@ -1174,8 +1187,12 @@ export class BotManager {
 
   /** Re-run a dead-lettered job: remove it from the DLQ and re-enqueue fresh. */
   replayDlq(botId: string, jobId: string): { accepted: boolean; jobId?: string; reasonCode?: string } {
-    const entry = this.queue.removeFromDlq(jobId);
+    // Look up WITHOUT removing first: a bot-id mismatch must not destroy the
+    // DLQ entry (the old remove-then-check permanently deleted real work and
+    // then reported not_found).
+    const entry = this.queue.peekDlq(jobId);
     if (!entry || entry.botId !== botId) return { accepted: false, reasonCode: 'not_found' };
+    this.queue.removeFromDlq(jobId);
     return this.enqueue(botId, {
       trigger: entry.trigger,
       prompt: entry.prompt,

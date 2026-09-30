@@ -279,8 +279,10 @@ export function classifyFailure(err: any): string {
   // Network blips ARE transient — ECONNRESET (connection dropped mid-read)
   // and friends used to fall through to unknown_error, so a plain
   // connection blip went straight to the DLQ with a needs-you flag instead
-  // of retrying like every other transient failure.
-  if (/timeout|etimedout|econnaborted|econnreset|econnrefused|epipe|enotfound|eai_again|getaddrinfo|fetch failed|socket hang up|network/.test(msg)) return 'provider_timeout';
+  // of retrying like every other transient failure. "timed out" (with a
+  // space) is how several providers phrase a deadline miss — it also used to
+  // fall through to unknown_error and land the turn in the DLQ.
+  if (/timeout|timed out|etimedout|econnaborted|econnreset|econnrefused|epipe|enotfound|eai_again|getaddrinfo|fetch failed|socket hang up|network/.test(msg)) return 'provider_timeout';
   if (/permission denied|blocked command|no permission/.test(msg)) return 'permission_denied';
   if (/api key|unauthorized|401|authentication/.test(msg)) return 'provider_auth';
   if (/quota|billing|402/.test(msg)) return 'provider_quota';

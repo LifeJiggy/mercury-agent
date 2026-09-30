@@ -102,6 +102,11 @@ describe('runBotTurn step-budget continuation', () => {
     expect(classifyFailure(new Error('Cannot connect to API: read ECONNRESET'))).toBe('provider_timeout');
     expect(classifyFailure(new Error('getaddrinfo ENOTFOUND api.example.com'))).toBe('provider_timeout');
     expect(classifyFailure(new Error('fetch failed: ECONNREFUSED 1.2.3.4:443'))).toBe('provider_timeout');
+    // "The operation timed out." (with a SPACE) is how several providers
+    // phrase a deadline miss — it used to fall through to unknown_error and
+    // ship long leader-bot turns straight to the DLQ instead of retrying.
+    expect(classifyFailure(new Error('The operation timed out.'))).toBe('provider_timeout');
+    expect(classifyFailure(new Error('Request timed out after 60000ms'))).toBe('provider_timeout');
     // Still-permanent things stay permanent.
     expect(classifyFailure(new Error('401 unauthorized'))).toBe('provider_auth');
     expect(classifyFailure(new Error('permission denied by policy'))).toBe('permission_denied');

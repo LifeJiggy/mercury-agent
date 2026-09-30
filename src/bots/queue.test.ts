@@ -283,4 +283,39 @@ describe('BotManager durable queue integration', () => {
     expect(replay.accepted).toBe(true);
     expect(manager.getDlq('alpha')).toHaveLength(0);
   });
+
+  it('replaying a job under the WRONG bot id does not destroy the DLQ entry', async () => {
+    // The old replayDlq removed the entry BEFORE checking the bot — a
+    // mismatch permanently deleted real work and still reported not_found.
+    mockedGenerateText.mockReset();
+    mockedGenerateText.mockRejectedValue(new Error('permission denied: workspace'));
+    store.create({ id: 'alpha', name: 'Alpha' });
+    manager.enqueue('alpha', { trigger: 'chat', prompt: 'do the thing' });
+    await new Promise(r => setTimeout(r, 50));
+    const jobId = manager.getDlq('alpha')[0].id;
+    expect(manager.replayDlq('other-bot', jobId)).toMatchObject({ accepted: false, reasonCode: 'not_found' });
+    expect(manager.getDlq('alpha')).toHaveLength(1); // still there — lookup happened before removal
+    // A correct-bot replay then succeeds.
+    mockedGenerateText.mockResolvedValue({ text: 'done', finishReason: 'stop', usage: { inputTokens: 1, outputTokens: 1 } } as any);
+    expect(manager.replayDlq('alpha', jobId).accepted).toBe(true);
+  });
+
+  it('a heartbeat keeps a claimed lease alive past its lease window', () => {
+    // Live bug: a 20-minute leader-bot turn outlived the 60s lease, the
+    // due-sweep requeued the STILL-RUNNING job, and the race made its later
+    // settle a silent no-op — the job never reached the DLQ.
+    for (const name of ['json', 'sqlite'] as const) {
+      const dir = join(root, `heartbeat-${name}`);
+      const backend = mkBackend(name, dir);
+      backend.enqueue(job('hb1'));
+      backend.claim('hb1', 60);
+      backend.heartbeatLease('hb1', 60); // the turn is alive — lease window reset
+      // Expire the PRE-heartbeat lease but not the heartbeated one: the
+      // heartbeat renewed the whole window, so at +1s it is still claimed.
+      expect(backend.counts().claimed).toBe(1);
+      expect(backend.rehydratable()).toHaveLength(0);
+      backend.heartbeatLease('hb1', 0); // heartbeat to an instant-expiry lease → swept again
+      expect(backend.rehydratable()).toHaveLength(1);
+    }
+  });
 });
