@@ -68,6 +68,19 @@ export interface BotRetentionConfig {
   mailboxTtlHours?: number;
   dlqCap?: number;
   artifactQuotaBytes?: number;
+  /**
+   * Retention janitor for the fleet-shared folder (`_shared/`): files cool
+   * down into `_shared/.archive/<yyyy-mm>/` past the hot window, and the
+   * archive expires after the archive window. Deliverables moved via
+   * `bot_deliver` into `outputs/` are exempt. Enabled by default.
+   */
+  sandboxJanitor?: {
+    enabled?: boolean;
+    /** Days a file stays in the working surface (default 7). */
+    hotDays?: number;
+    /** Days an archived file survives before deletion (default 30). */
+    archiveDays?: number;
+  };
 }
 
 /**
