@@ -1,0 +1,207 @@
+/* ============================================================
+   KillipiGlyph — Mercury's living glyph (v2)
+   Anti-gradient: hairline rings, soft silver, one restrained accent.
+   ============================================================ */
+
+:root {
+  --kp-accent: #9ad8e8;
+  --kp-accent-soft: rgba(154, 216, 232, 0.5);
+  --kp-line: rgba(230, 240, 244, 0.16);
+  --kp-orb-fill: #101418;
+  --kp-orb-edge: rgba(230, 240, 244, 0.28);
+  --kp-feature: rgba(230, 244, 247, 0.92);
+  --kp-dim: rgba(230, 244, 247, 0.4);
+}
+
+html[data-theme='light'] {
+  --kp-orb-fill: #f2f5f6;
+  --kp-orb-edge: rgba(20, 34, 40, 0.3);
+  --kp-line: rgba(20, 34, 40, 0.14);
+  --kp-feature: rgba(20, 44, 52, 0.92);
+  --kp-accent: #2e7d92;
+}
+
+.kp-wrap {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  margin: 0 auto 8px;
+  width: var(--kp-size, 264px);
+}
+
+/* The orb box: locked size — voice-line rotation cannot shrink it. */
+#killipi-orb {
+  position: relative;
+  flex: none; /* never flex-shrink — voice-line length must not resize the glyph */
+  width: var(--kp-size, 264px);
+  height: var(--kp-size, 264px);
+  cursor: pointer;
+  user-select: none;
+  -webkit-tap-highlight-color: transparent;
+  filter: drop-shadow(0 8px 34px rgba(0, 0, 0, 0.36));
+}
+
+/* ---------- ambient (restrained, no neon) ---------- */
+.kp-ambient {
+  position: absolute;
+  inset: 4%;
+  border-radius: 50%;
+  background:
+    radial-gradient(circle at 50% 42%, rgba(154, 216, 232, 0.09) 0%, rgba(154, 216, 232, 0) 62%);
+  animation: kp-breathe 7s ease-in-out infinite;
+  pointer-events: none;
+}
+
+@keyframes kp-breathe {
+  0%, 100% { opacity: 0.6; transform: scale(1); }
+  50% { opacity: 1; transform: scale(1.05); }
+}
+
+.kp-svg {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+}
+
+/* ---------- orbital rings ---------- */
+.kp-rings {
+  transform-origin: 42px 34px;
+  transform-box: view-box;
+}
+
+.kp-ring {
+  fill: none;
+  stroke: var(--kp-line);
+  stroke-width: 1;
+  vector-effect: non-scaling-stroke;
+  transform-origin: 42px 34px;
+  transform-box: view-box;
+}
+
+.kp-ring-a {
+  stroke: var(--kp-accent-soft);
+  stroke-dasharray: 60 30;
+  animation: kp-spin 38s linear infinite;
+}
+
+.kp-ring-b {
+  stroke: var(--kp-line);
+  stroke-dasharray: 8 14;
+  animation: kp-spin-rev 54s linear infinite;
+  opacity: 0.8;
+}
+
+.kp-thinking .kp-ring-a { animation-duration: 7s; }
+.kp-thinking .kp-ring-a { stroke: var(--kp-accent); }
+.kp-thinking .kp-ring-b { animation-duration: 11s; }
+
+@keyframes kp-spin { to { transform: rotate(360deg); } }
+@keyframes kp-spin-rev { from { transform: rotate(360deg); } to { transform: rotate(0deg); } }
+
+/* ---------- orb core ---------- */
+.kp-core {
+  transition: transform 0.18s cubic-bezier(0.3, 0.7, 0.4, 1);
+  will-change: transform;
+}
+
+.kp-orb {
+  fill: var(--kp-orb-fill);
+  stroke: var(--kp-orb-edge);
+  stroke-width: 1.1;
+}
+
+.kp-inner {
+  fill: none;
+  stroke: var(--kp-line);
+  stroke-width: 1;
+}
+
+.kp-crescent {
+  stroke: var(--kp-accent-soft);
+  stroke-width: 1.4;
+  opacity: 0.9;
+}
+
+html[data-theme='light'] .kp-crescent {
+  stroke: rgba(46, 125, 146, 0.55);
+}
+
+/* ---------- face ---------- */
+.kp-symbol line {
+  stroke: var(--kp-orb-edge);
+  stroke-width: 1.4;
+  stroke-linecap: round;
+}
+
+/* ---------- status label ---------- */
+.kp-status {
+  position: absolute;
+  bottom: -4%;
+  left: 50%;
+  transform: translateX(-50%);
+  font-family: var(--font-mono, 'SF Mono', 'Cascadia Code', 'Fira Code', 'JetBrains Mono', Menlo, monospace);
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  color: var(--kp-dim);
+  white-space: nowrap;
+  pointer-events: none;
+  animation: kp-fade 0.35s ease;
+}
+
+@keyframes kp-fade {
+  from { opacity: 0; transform: translate(-50%, 5px); }
+  to { opacity: 1; transform: translate(-50%, 0); }
+}
+
+/* ---------- reduced motion ---------- */
+@media (prefers-reduced-motion: reduce) {
+  .kp-ring-a,
+  .kp-ring-b,
+  .kp-ambient {
+    animation: none;
+  }
+  .kp-core {
+    transition: none;
+  }
+}
+
+/* ============ v2.5: working / success / demo-sync ============ */
+
+.kp-working .kp-ring-a { animation-duration: 7s; }
+.kp-working .kp-ring-b { animation-duration: 11s; opacity: 0.9; }
+
+.kp-success .kp-ring-a { animation-duration: 4s; }
+.kp-success .kp-ring-b { animation-duration: 6s; }
+
+.kp-success #killipi-orb { animation: kp-pulse-scale 0.9s ease 2; }
+@keyframes kp-pulse-scale {
+  0% { transform: scale(1); }
+  50% { transform: scale(1.07); }
+  100% { transform: scale(1); }
+}
+.kp-success .kp-core { animation: kp-pulse-scale 0.9s ease 2; }
+
+.kp-success .kp-crescent {
+  stroke: var(--kp-accent);
+  opacity: 1;
+}
+
+/* ---------- glyph voice line (first-person, Pi pattern) ---------- */
+.kp-voice {
+  margin-top: 10px; /* clear of the mood label, which hangs below the orb */
+  min-height: 1.5em;
+  max-width: 340px; /* long lines wrap to 2 centered rows — they never push the orb */
+  font-family: var(--font-body, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif);
+  font-size: 0.95em;
+  font-style: italic;
+  color: var(--kp-dim);
+  text-align: center;
+  letter-spacing: 0.01em;
+  transition: opacity 0.5s ease;
+}
+
+@media (max-width: 480px) {
+  :root { --kp-size: 168px; }
+}
