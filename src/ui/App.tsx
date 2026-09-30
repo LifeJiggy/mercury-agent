@@ -127,6 +127,21 @@ export function TuiApp({ channel, onInput, onPermissionResolve, onExit, spotifyC
     '/session ',
     '/session archive ',
     '/session delete ',
+    '/bots',
+    '/bots list',
+    '/bots open ',
+    '/bots create ',
+    '/bots send ',
+    '/bots persona ',
+    '/bots budget ',
+    '/bots edit ',
+    '/bots delete ',
+    '/bots journal ',
+    '/bots inbox ',
+    '/bots storage',
+    '/bots enable ',
+    '/bots disable ',
+    '/bots stop ',
     '/status',
     '/progress',
     '/menu',
@@ -203,8 +218,22 @@ export function TuiApp({ channel, onInput, onPermissionResolve, onExit, spotifyC
   const slashSuggestions = React.useMemo(() => {
     if (!input.startsWith('/')) return [];
     const q = input.toLowerCase();
+    // Bot-id argument completion: `/bots <action> <partial>` or `/bot <partial>`
+    // suggests existing bots (id or name) — the roster arrives via the 2s poller.
+    const botsArg = /^(\/bots\s+(?:open|send|journal|inbox|budget|edit|delete|enable|disable|stop|persona)\s+)(\S*)$/.exec(input);
+    const botArg = /^(\/bot\s+)(\S*)$/.exec(input);
+    if ((botsArg || botArg) && state.botRoster.length > 0) {
+      const [_, cmdPrefix, typed] = botsArg ?? botArg!;
+      const p = typed.toLowerCase();
+      const botCmds = state.botRoster
+        .filter((b) => b.id.startsWith(p) || b.name.toLowerCase().startsWith(p))
+        .slice(0, 5)
+        .map((b) => `${cmdPrefix}${b.id}`);
+      const base = slashCommands.filter((cmd) => cmd.startsWith(q)).slice(0, 2);
+      return [...botCmds, ...base].slice(0, 5);
+    }
     return slashCommands.filter((cmd) => cmd.startsWith(q)).slice(0, 5);
-  }, [input, slashCommands]);
+  }, [input, slashCommands, state.botRoster]);
 
   const [slashSelIdx, setSlashSelIdx] = React.useState(0);
 
@@ -1011,6 +1040,8 @@ export function TuiApp({ channel, onInput, onPermissionResolve, onExit, spotifyC
           mode={state.mode}
           programmingMode={state.programmingMode}
           projectContext={state.projectContext}
+          botChat={state.botChat}
+          botsWorking={state.botRoster.filter((b) => b.state === 'running').length}
         />
       )}
       {showInput && state.mode !== 'mercury-code' && slashSuggestions.length > 0 && (
@@ -1233,6 +1264,14 @@ function ChatBody({ state, maxDynamicLines }: { state: TuiState; maxDynamicLines
         <ChatMessagesView messages={dynamicMessages} agentName={state.agentName} maxLines={maxDynamicLines} />
         {state.toolSteps.length > 0 && !state.isThinking && <ToolStepsView steps={state.toolSteps} viewMode={state.viewMode} idle />}
         {state.isThinking && <ThinkingIndicator agentName={state.agentName} steps={state.toolSteps} mode={state.mode} liveActivity={state.liveActivity} thinkingPreview={state.thinkingPreview} />}
+        {state.botChat && !state.isThinking && (
+          <BotFleetLiveRegion
+            botId={state.botChat.botId}
+            botName={state.botChat.botName}
+            botLiveActivity={state.botLiveActivity ?? {}}
+            botRoster={state.botRoster}
+          />
+        )}
         {state.subAgents.length > 0 && <AgentPanelView agents={state.subAgents} />}
       </Box>
     </Box>
@@ -1283,6 +1322,14 @@ function CodingBody({ state, maxDynamicLines }: { state: TuiState; maxDynamicLin
         <ChatMessagesView messages={dynamicMessages} agentName={state.agentName} maxLines={maxDynamicLines} />
         {state.toolSteps.length > 0 && !state.isThinking && <ToolStepsView steps={state.toolSteps} viewMode={state.viewMode} idle />}
         {state.isThinking && <ThinkingIndicator agentName={state.agentName} steps={state.toolSteps} mode={state.mode} liveActivity={state.liveActivity} thinkingPreview={state.thinkingPreview} />}
+        {state.botChat && !state.isThinking && (
+          <BotFleetLiveRegion
+            botId={state.botChat.botId}
+            botName={state.botChat.botName}
+            botLiveActivity={state.botLiveActivity ?? {}}
+            botRoster={state.botRoster}
+          />
+        )}
         <Box paddingX={1} marginTop={1}>
           <Text dimColor>Mode shortcuts: Ctrl+P Plan · Ctrl+X Execute (Auto runs by default)</Text>
         </Box>
@@ -1986,7 +2033,7 @@ function ToolStepsView({ steps, viewMode, idle }: { steps: ToolStep[]; viewMode:
   );
 }
 
-function ThinkingIndicator({ agentName, steps, mode, liveActivity, thinkingPreview, frozen }: { agentName: string; steps: ToolStep[]; mode: AppMode; liveActivity?: LiveActivityState | null; thinkingPreview?: string | null; frozen?: boolean }) {
+function ThinkingIndicator({ agentName, steps, mode, liveActivity, thinkingPreview, frozen, title, longOpHint }: { agentName: string; steps: ToolStep[]; mode: AppMode; liveActivity?: LiveActivityState | null; thinkingPreview?: string | null; frozen?: boolean; title?: string; longOpHint?: boolean }) {
   const frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
   const [frame, setFrame] = React.useState(0);
   const [elapsed, setElapsed] = React.useState(0);
@@ -2036,12 +2083,14 @@ function ThinkingIndicator({ agentName, steps, mode, liveActivity, thinkingPrevi
       <Box>
         <Text color={actionTone === 'white' ? 'cyan' : actionTone}>{spinner}</Text>
         <Text> </Text>
-        <Text color="cyan" bold>Processing</Text>
+        <Text color="cyan" bold>{title ?? 'Processing'}</Text>
         <Text dimColor>{totalSteps > 0 ? ` · step ${totalSteps} · ${timeStr}` : ` · ${timeStr}`}</Text>
       </Box>
       <Box marginLeft={4}>
         <Text color={actionTone} bold>{currentAction}</Text>
-        {displayElapsed >= 90 && <Text color="red" dimColor> · long op (/bg current to background, /stop to stop)</Text>}
+        {/* The /bg·/stop hint is main-agent only — bot threads have their own
+            controls, and long tasks are the norm for bots. */}
+        {(longOpHint ?? true) && displayElapsed >= 90 && <Text color="red" dimColor> · long op (/bg current to background, /stop to stop)</Text>}
       </Box>
       {thinkLine && (
         <Box marginLeft={4}>
@@ -2059,6 +2108,60 @@ function ThinkingIndicator({ agentName, steps, mode, liveActivity, thinkingPrevi
           ))}
         </Box>
       )}
+    </Box>
+  );
+}
+
+/**
+ * Fleet live region for an open bot thread: what this bot is doing RIGHT
+ * NOW, and — for a lead — exactly which sub-bot is doing what, recursively
+ * (CEO → Eng Lead → Backend). One self-ticker drives all rows; the rows
+ * also refresh on every activity event.
+ */
+function BotFleetLiveRegion({ botId, botName, botLiveActivity, botRoster }: {
+  botId: string;
+  botName: string;
+  botLiveActivity: Record<string, LiveActivityState>;
+  botRoster: Array<{ id: string; name: string; state: string; fleetRole?: 'lead' | 'crew'; parent?: string }>;
+}) {
+  const own = botLiveActivity[botId];
+  const crew = botRoster.filter(b => b.parent === botId);
+  const crewLive = crew.filter(c => botLiveActivity[c.id]);
+  if (!own && crewLive.length === 0) return null;
+
+  const frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+  const [tick, setTick] = React.useState(0);
+  React.useEffect(() => {
+    const timer = setInterval(() => setTick(v => v + 1), 250);
+    return () => clearInterval(timer);
+  }, []);
+
+  const row = (id: string, name: string, label: string, indent: string): React.ReactNode => {
+    return (
+      <Box key={id}>
+        <Text>{indent}</Text>
+        <Text color="cyan">{frames[tick % frames.length]}</Text>
+        <Text bold> {name} ({id})</Text>
+        <Text dimColor> · {label}</Text>
+      </Box>
+    );
+  };
+
+  const renderCrewTree = (leadId: string, depth: number): React.ReactNode[] => {
+    const out: React.ReactNode[] = [];
+    for (const member of botRoster.filter(b => b.parent === leadId)) {
+      const act = botLiveActivity[member.id];
+      if (act) out.push(row(member.id, member.name, act.detail || act.phase, '  '.repeat(depth)));
+      out.push(...renderCrewTree(member.id, depth + 1));
+    }
+    return out;
+  };
+
+  return (
+    <Box marginTop={1} marginLeft={4} flexDirection="column">
+      {own && row(botId, botName, own.detail || own.phase, '')}
+      {crewLive.length > 0 && <Text dimColor>  └ crew working ({crewLive.length}):</Text>}
+      {renderCrewTree(botId, 1)}
     </Box>
   );
 }
@@ -2158,17 +2261,22 @@ function InputBox({
   mode,
   programmingMode,
   projectContext,
+  botChat,
+  botsWorking,
 }: {
   input: string;
   cursorPos: number;
   mode: AppMode;
   programmingMode: ProgrammingModeState;
   projectContext: string | null;
+  botChat?: { botId: string; botName: string } | null;
+  /** Bots currently running a turn (live roster, polled every 2s). */
+  botsWorking?: number;
 }) {
   const inWorkspace = mode === 'workspace';
   const inCoding = mode === 'coding' || inWorkspace;
-  const promptColor = inWorkspace ? 'cyan' : inCoding ? 'green' : 'yellow';
-  const label = inWorkspace ? '[IDE CHAT]' : inCoding ? '[CODING]' : '[CHAT]';
+  const promptColor = botChat ? 'magenta' : inWorkspace ? 'cyan' : inCoding ? 'green' : 'yellow';
+  const label = botChat ? `[BOT ${botChat.botId}]` : inWorkspace ? '[IDE CHAT]' : inCoding ? '[CODING]' : '[CHAT]';
   const contextLabel = projectContext && projectContext.length > 52
     ? `...${projectContext.slice(-49)}`
     : (projectContext || 'No project context');
@@ -2196,6 +2304,11 @@ function InputBox({
         <Text color={programmingMode === 'execute' ? 'green' : programmingMode === 'plan' ? 'yellow' : 'gray'}>
           mode={programmingMode.toUpperCase()}
         </Text>
+        {/* Ambient bot-fleet status: shown ONLY while bots are actually
+            working (idle = nothing rendered, no "idle" noise). */}
+        {botsWorking && botsWorking > 0 ? (
+          <Text color="magenta"> 🤖 {botsWorking} working</Text>
+        ) : null}
       </Box>
       <Box paddingX={1} flexDirection="column">
         {lines.map((line, i) => (
@@ -2441,10 +2554,9 @@ function MercuryLiveFeedback({ state }: { state: TuiState }): React.ReactNode {
           {stepsDone > 0 && <Text dimColor> · step {stepsDone}</Text>}
           <Text dimColor> · {timeStr}</Text>
           {detail && <Text dimColor> — {detail}</Text>}
-          {/* Long-op hint (same 90s escalation as the chat surfaces): the
-              user can background OR stop a long task right from the coding
-              TUI — no need to hunt the command picker. One row, no churn. */}
-          {elapsedSec >= 90 && <Text color="red" dimColor> · long op — /bg current to background, /stop to stop</Text>}
+          {/* No long-op hint here: Mercury Code tasks are long by design —
+              the hint is noise in the coding TUI. It stays on the chat
+              surfaces, where a long foreground op is the exception. */}
         </Box>
       )}
       {running && (

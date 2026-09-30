@@ -1,0 +1,370 @@
+import { generateText, stepCountIs } from 'ai';
+import type { Tool } from 'ai';
+import type { CapabilityRegistry } from '../capabilities/registry.js';
+import type { UserMemoryStore } from '../memory/user-memory.js';
+import type { TokenBudget } from '../utils/tokens.js';
+import type { BaseProvider } from '../providers/base.js';
+import { classifyStreamCompletion } from '../core/stream-completion.js';
+import { stepsExhaustedPrompt } from '../core/completion-verdict.js';
+import { MAX_AUTOMATIC_CONTINUATIONS } from '../core/execution-limits.js';
+import { formatToolStep } from '../utils/tool-label.js';
+import { logger } from '../utils/logger.js';
+import type { BotManifest, BotTrigger } from './types.js';
+
+/** Mailbox messages injected mid-turn (bot-to-bot or queued user input). */
+export interface BotTurnMail {
+  from: string;
+  content: string;
+}
+
+/**
+ * Real-time bot activity event — what the bot is doing RIGHT NOW. Emitted at
+ * AI SDK callback granularity (step start, tool call start/finish) so the
+ * surfaces can show live work instead of the coarse idle/running states.
+ */
+export type BotActivityEvent = {
+  botId: string;
+  jobId: string;
+  kind: 'turn-start' | 'step' | 'tool' | 'turn-end';
+  /** Human-readable: "read_file ~/cookies" / "step 4 · 12.3k tok in". */
+  label: string;
+  detail?: string;
+  stepIndex: number;
+  elapsedMs: number;
+  status?: 'running' | 'done' | 'error';
+};
+
+export interface BotTurnInput {
+  manifest: BotManifest;
+  trigger: BotTrigger;
+  /** Durable job id — correlates activity events with the run. */
+  jobId?: string;
+  prompt: string;
+  persona: string;
+  /** Pending mailbox messages at turn start (attributed bot-to-bot handoffs). */
+  mail: BotTurnMail[];
+  /** Callback checked between rounds for newly arrived mailbox messages. */
+  pollMail: () => BotTurnMail[];
+  /** Sandbox areas granted implicitly (rw+x): private workspace + fleet-shared folder. */
+  sandbox: { workspace: string; shared: string };
+  /** Skill roster text (native + the bot's own library); empty when none. */
+  skillsPrompt?: string;
+  /** Fleet hierarchy context (lead crew roster / crew membership); absent for solos. */
+  fleet?: {
+    role: 'lead' | 'crew';
+    leadName?: string;
+    crew: Array<{ id: string; name: string; description?: string; state: string }>;
+    maxCrew: number;
+  };
+  capabilities: CapabilityRegistry;
+  tools: Record<string, Tool>;
+  userMemory: UserMemoryStore | null;
+  provider: BaseProvider;
+  tokenBudget: TokenBudget;
+  abortSignal: AbortSignal;
+  /** Real-time activity consumer (roster, live regions, web feed). */
+  onActivity?: (ev: BotActivityEvent) => void;
+}
+
+export interface BotTurnOutput {
+  status: 'completed' | 'failed' | 'halted' | 'paused';
+  output: string;
+  tokensIn: number;
+  tokensOut: number;
+  /** Distinct tool names the turn used (drives auto-skill synthesis). */
+  toolsUsed: string[];
+  error?: string;
+  reasonCode?: string;
+}
+
+const MAX_STEPS_DEFAULT = 25;
+
+/**
+ * One run of one bot: a fresh-context tool loop over the bot's own provider,
+ * persona, toolset, memory namespace, and fail-closed permission manager.
+ * Structurally mirrors SubAgent.run() minus the shared-registry hazards:
+ * every dependency here is already per-bot.
+ */
+export async function runBotTurn(input: BotTurnInput): Promise<BotTurnOutput> {
+  const { manifest, provider, capabilities, tools, tokenBudget, abortSignal } = input;
+  const maxSteps = manifest.autonomy?.maxSteps ?? MAX_STEPS_DEFAULT;
+
+  const system = buildBotSystemPrompt(input);
+  const messages: any[] = [];
+
+  for (const m of input.mail) {
+    messages.push({ role: 'user', content: `Message from 🤖 ${m.from}:\n\n${m.content}` });
+  }
+  if (input.prompt) {
+    messages.push({ role: 'user', content: input.prompt });
+  }
+  if (messages.length === 0) {
+    messages.push({ role: 'user', content: 'You have no specific task. Check your inbox and report your status.' });
+  }
+
+  let tokensIn = 0;
+  let tokensOut = 0;
+  let lastResult: any = null;
+  let stepsRemaining = maxSteps;
+  let budgetContinuations = 0;
+  let stepIndex = 0;
+  const turnStartedAt = Date.now();
+  const toolsUsed = new Set<string>();
+  const onActivity = input.onActivity;
+  const emit = (ev: { kind: BotActivityEvent['kind']; label: string; detail?: string; stepIndex: number; status?: BotActivityEvent['status']; elapsedMs?: number }): void => {
+    if (!onActivity) return;
+    try {
+      onActivity({
+        botId: manifest.id,
+        jobId: input.jobId ?? '',
+        elapsedMs: ev.elapsedMs ?? Date.now() - turnStartedAt,
+        kind: ev.kind,
+        label: ev.label,
+        detail: ev.detail,
+        stepIndex: ev.stepIndex,
+        status: ev.status,
+      });
+    } catch { /* activity feedback must never break a turn */ }
+  };
+
+  try {
+    emit({ kind: 'turn-start', stepIndex: 0, label: input.prompt ? input.prompt.slice(0, 80) : 'Checking inbox' });
+    while (stepsRemaining > 0 && !abortSignal.aborted) {
+      const result = await generateText({
+        model: provider.getModelInstance(),
+        system,
+        messages,
+        tools,
+        stopWhen: stepCountIs(stepsRemaining),
+        abortSignal,
+        experimental_include: { requestBody: false, responseBody: false },
+        experimental_onStepStart: () => {
+          stepIndex++;
+          emit({ kind: 'step', stepIndex, label: `step ${stepIndex}` });
+        },
+        experimental_onToolCallStart: ({ toolCall }: any) => {
+          const label = formatToolStep(String(toolCall?.toolName ?? 'tool'), (toolCall?.input ?? {}) as Record<string, any>);
+          emit({ kind: 'tool', stepIndex, label, status: 'running' });
+        },
+        experimental_onToolCallFinish: ({ toolCall, success, error, durationMs }: any) => {
+          const label = formatToolStep(String(toolCall?.toolName ?? 'tool'), (toolCall?.input ?? {}) as Record<string, any>);
+          emit({
+            kind: 'tool',
+            stepIndex,
+            label,
+            detail: error != null ? String(error?.message ?? error).slice(0, 200) : undefined,
+            status: success ? 'done' : 'error',
+            elapsedMs: typeof durationMs === 'number' ? durationMs : undefined,
+          });
+        },
+        onStepFinish: ({ usage, toolCalls }) => {
+          if (abortSignal.aborted) return;
+          stepsRemaining--;
+          if (usage) {
+            tokensIn += usage.inputTokens ?? 0;
+            tokensOut += usage.outputTokens ?? 0;
+          }
+          for (const tc of toolCalls ?? []) {
+            if (tc?.toolName) toolsUsed.add(String(tc.toolName));
+          }
+          const kIn = Math.round(tokensIn / 100) / 10;
+          emit({ kind: 'step', stepIndex, label: `step ${stepIndex} · ${kIn}k tok in` });
+        },
+      });
+      lastResult = result;
+
+      const completion = classifyStreamCompletion({
+        finishReason: (result as any)?.finishReason,
+        hasText: Boolean(result?.text),
+        hasToolCalls: true,
+      });
+      if (completion === 'interrupted') {
+        throw new Error('Generation was interrupted before completion (no finish signal from provider)');
+      }
+
+      if (result.text) {
+        messages.push({ role: 'assistant', content: result.text });
+      }
+
+      // Step budget exhausted with tool calls still pending is a PAUSE, never
+      // a completion (sub-agent completion contract). Mirror the main agent's
+      // bounded auto-continuation: refill the budget and resume the SAME
+      // conversation in-process — the old path requeued the job and rebuilt
+      // the turn from scratch, discarding every completed step and re-burning
+      // the budget redoing the first 25 steps. The per-bot daily token
+      // budget remains the runaway guard; past the continuation bound the
+      // paused return below still applies.
+      if (stepsRemaining <= 0 && (lastResult as any)?.finishReason === 'tool-calls') {
+        if (!abortSignal.aborted && budgetContinuations < MAX_AUTOMATIC_CONTINUATIONS) {
+          budgetContinuations++;
+          logger.warn(
+            { botId: manifest.id, rounds: budgetContinuations, budget: maxSteps },
+            'Bot step budget exhausted mid-turn — continuing with a fresh budget',
+          );
+          messages.push({ role: 'user', content: stepsExhaustedPrompt(input.prompt) });
+          stepsRemaining = maxSteps;
+          continue;
+        }
+        break;
+      }
+
+      // Consume newly arrived mailbox messages before finishing, so a
+      // handoff delivered mid-turn is not lost to the next scheduling gap.
+      if (!abortSignal.aborted && stepsRemaining > 0) {
+        const fresh = input.pollMail();
+        if (fresh.length > 0) {
+          for (const m of fresh) {
+            messages.push({ role: 'user', content: `Message from 🤖 ${m.from}:\n\n${m.content}` });
+          }
+          continue;
+        }
+      }
+      break;
+    }
+
+    if (abortSignal.aborted) {
+      return { status: 'halted', output: 'Turn was halted.', tokensIn, tokensOut, toolsUsed: [...toolsUsed] };
+    }
+
+    // Step budget exhausted with tool calls still pending — pause, never
+    // report success on half-done work (sub-agent completion contract).
+    // Last resort only: reached past the in-process continuation bound.
+    if (stepsRemaining <= 0 && (lastResult as any)?.finishReason === 'tool-calls') {
+      emit({ kind: 'turn-end', stepIndex, label: 'paused — step budget', status: 'done' });
+      return {
+        status: 'paused',
+        output: 'Step budget reached before the turn completed — remaining work continues next turn.',
+        tokensIn,
+        tokensOut,
+        toolsUsed: [...toolsUsed],
+        reasonCode: 'step_budget',
+      };
+    }
+
+    const output = (lastResult?.text || '').trim() || '(no text response)';
+
+    tokenBudget.recordUsage({
+      provider: provider.name,
+      model: provider.getModel(),
+      inputTokens: tokensIn,
+      outputTokens: tokensOut,
+      totalTokens: tokensIn + tokensOut,
+      channelType: 'bot',
+    });
+
+    emit({ kind: 'turn-end', stepIndex, label: 'completed', status: 'done' });
+    return { status: 'completed', output, tokensIn, tokensOut, toolsUsed: [...toolsUsed] };
+  } catch (err: any) {
+    if (abortSignal.aborted) {
+      emit({ kind: 'turn-end', stepIndex, label: 'halted', status: 'done' });
+      return { status: 'halted', output: 'Turn was halted.', tokensIn, tokensOut, toolsUsed: [...toolsUsed] };
+    }
+    emit({ kind: 'turn-end', stepIndex, label: `failed: ${String(err?.message ?? err).slice(0, 80)}`, status: 'error' });
+    return {
+      status: 'failed',
+      output: `Turn failed: ${err?.message ?? String(err)}`,
+      tokensIn,
+      tokensOut,
+      toolsUsed: [...toolsUsed],
+      error: err?.message ?? String(err),
+      reasonCode: classifyFailure(err),
+    };
+  }
+}
+
+/** Map a provider/tool error to a typed reason code (retry vs permanent). */
+export function classifyFailure(err: any): string {
+  const msg = String(err?.message ?? err ?? '').toLowerCase();
+  if (/rate.?limit|429|too many requests/.test(msg)) return 'provider_rate_limit';
+  // Network blips ARE transient — ECONNRESET (connection dropped mid-read)
+  // and friends used to fall through to unknown_error, so a plain
+  // connection blip went straight to the DLQ with a needs-you flag instead
+  // of retrying like every other transient failure. "timed out" (with a
+  // space) is how several providers phrase a deadline miss — it also used to
+  // fall through to unknown_error and land the turn in the DLQ.
+  if (/timeout|timed out|etimedout|econnaborted|econnreset|econnrefused|epipe|enotfound|eai_again|getaddrinfo|fetch failed|socket hang up|network/.test(msg)) return 'provider_timeout';
+  if (/permission denied|blocked command|no permission/.test(msg)) return 'permission_denied';
+  if (/api key|unauthorized|401|authentication/.test(msg)) return 'provider_auth';
+  if (/quota|billing|402/.test(msg)) return 'provider_quota';
+  if (/context|maximum.*tokens|too long/.test(msg)) return 'context_overflow';
+  return 'unknown_error';
+}
+
+/** Transient failures may retry; permanent ones go straight to the DLQ. */
+export function isTransientFailure(reasonCode: string): boolean {
+  return reasonCode === 'provider_rate_limit' || reasonCode === 'provider_timeout';
+}
+
+function buildBotSystemPrompt(input: BotTurnInput): string {
+  const { manifest } = input;
+  let prompt = `You are "${manifest.name}", a Mercury bot (id: ${manifest.id}).\n`;
+  if (manifest.description) {
+    prompt += `Role: ${manifest.description}\n`;
+  }
+  prompt += '\n';
+  prompt += input.persona;
+
+  // Scoped memory injection — mirrors the main agent's injection site, but
+  // into the bot's own namespace (scope own/shared-read; scope none = null).
+  if (input.userMemory) {
+    try {
+      const query = input.mail.map(m => m.content).join(' ') || input.prompt;
+      const relevant = input.userMemory.retrieveRelevant(query, { maxRecords: 5, maxChars: 900 });
+      if (relevant?.context) {
+        prompt += `\n\n[Bot memory — auto-retrieved context]\n${relevant.context}`;
+      }
+    } catch (err: any) {
+      logger.warn({ botId: manifest.id, err: err?.message }, 'Bot memory retrieval failed — continuing without');
+    }
+  }
+
+  prompt += `\n\nOperating rules:
+- You run unattended: NEVER ask the user questions or wait for confirmation. If a required input is missing, state the assumption you are proceeding with.
+- Actions you lack permission for are denied automatically (fail-closed). Do not attempt workarounds; report what you could not do.
+- Stay in your specialty; say so plainly when a request falls outside it.`;
+
+  // Sandbox: the bot's always-granted work areas (rw+x, no permission ask).
+  prompt += `\n\nSandbox (always granted — read, write, execute; no permission needed):
+- Private workspace: ${input.sandbox.workspace} — your scratch area: drafts, intermediate work, compiled artifacts.
+- Fleet-shared folder: ${input.sandbox.shared} — one folder shared with all other bots. Publish reusable data here (clearly named files), even when not explicitly asked — other bots consume it without a handoff.
+Anything outside these two areas and your declared Access grants is denied.`;
+
+  const roster = manifest.comms?.canMessage ?? [];
+  if (roster.length > 0) {
+    prompt += `\n\nBots you can message via bot_send: ${roster.join(', ')}.`;
+  }
+
+  const toolNames = Object.keys(input.tools);
+  if (toolNames.length > 0) {
+    prompt += `\n\nAvailable tools: ${toolNames.join(', ')}`;
+  }
+
+  if (input.skillsPrompt) {
+    prompt += `\n\n${input.skillsPrompt}`;
+    prompt += `\nSkill scripts are subject to your access grants: a skill whose scripts you cannot run from its own directory can be copied into your sandbox workspace and run from there.`;
+  }
+
+  // Fleet hierarchy: the lead orchestrates, the crew executes.
+  if (input.fleet?.role === 'lead') {
+    const roster = input.fleet.crew.length > 0
+      ? input.fleet.crew.map(c => `- ${c.name} (${c.id})${c.description ? ` — ${c.description}` : ''} [${c.state}]`).join('\n')
+      : '(EMPTY — build your team first, see below)';
+    prompt += `\n\nYou lead a fleet of crew bots:
+${roster}
+
+Fleet protocol:
+- SELF-ORGANIZE: if your crew is empty or lacks a specialist the task needs, BUILD IT FIRST with bot_spawn — design each sub-bot's role and persona from YOUR persona and the current task (e.g. a product lead spawns research/QA/support specialists). Do not report that you lack a team; hire one. Then delegate.
+- DELEGATE with bot_send (task: true) — be concrete and self-contained; the result arrives in your mailbox when the bot finishes.
+- MONITOR with fleet_status — check who is running, idle, or blocked before and after delegating.
+- You may create specialists with bot_spawn (crew cap: ${input.fleet.maxCrew}) and retire your own crew with bot_retire.
+- Crew run CONCURRENTLY — dispatch independent work in parallel rather than sequentially.
+- You SYNTHESIZE: crew results arrive in your mailbox attributed by bot; combine them and report a single coherent outcome.${input.fleet.leadName ? `\n- You are also crew of **${input.fleet.leadName}** — your task results return to it automatically; treat it as your manager.` : ''}`;
+  } else if (input.fleet?.role === 'crew') {
+    prompt += `\n\nYou are crew in **${input.fleet.leadName ?? 'your lead'}'s** fleet. Tasks delegated to you (mailbox messages with a task) return your result to the lead automatically when you finish — make your final output a complete, self-contained report. Use bot_send to ask the lead questions mid-task.`;
+  }
+
+  const remaining = input.tokenBudget.getRemaining();
+  prompt += `\n\nToken budget remaining: ${remaining}`;
+
+  return prompt;
+}

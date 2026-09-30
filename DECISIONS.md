@@ -105,13 +105,32 @@
   - Increase cap to 200 — more headroom but still arbitrary
   - Tier-based caps (e.g., 20 durable + 30 active) — more complex, harder to tune
 - **Consequence**: No memory is ever permanently lost to time. The subconscious layer archives everything, and the recall mechanism surfaces dormant memories when context demands it. The 30-day threshold is configurable and the recall scoring weights can be tuned based on real-world usage.
-## ADR-012: Atomic Chat as a first-class local provider
+
+## ADR-012: Mercury Bots — persistent persona-scoped agents, in-process
+
+- **Context**: Mercury needs a second agent kind alongside the main conversational agent: multiple persistent "bots" (marketing, research, publisher, …), each with its own character, model, scoped memory, and tool permissions. Bots must never block the main agent loop, never prompt the user at runtime, respect low-end hardware (Termux/RPi), and never lose work. Competitor research (Hermes Agent profiles, OpenClaw gateway lanes, Grok-on-X prompt templates + Automations) and Mercury's own architecture audit (see `BOTS-ARCHITECTURE.md`) inform the design.
+- **Decision**:
+  - **Bot = profile dir + runtime**: `~/.mercury/bots/<botId>/` holds `bot.yaml`, `persona.md`, `permissions.yaml`, `.env` (mirrors Hermes' profile primitive; persona as markdown like soul files).
+  - **In-process execution**: bots run as async coroutines in a `BotManager` with a durable SQLite lease queue (`~/.mercury/bots/queue.db`) — never through `Agent.processQueue`, never one thread/process per bot (unaffordable on Termux; per-bot `worker_thread` isolation is an opt-in P2 escape hatch).
+  - **Full state isolation per bot**: own `CapabilityRegistry` + `PermissionManager` (fixing sub-agents' shared-registry hazard), own provider/model resolution, own memory namespace via `UserMemoryStore` `userKey` (default scope `own`; `none`/`shared-read` configurable).
+  - **Fail-closed autonomy**: no interactive approvals inside bot turns — permission questions auto-deny and journal; deny-list beats allow-list; no allow-all inheritance; token/step budgets are hard stops.
+  - **Never-fail contract**: durable enqueue-before-ack, lease-based claiming with expiry requeue, failure-typed retries (transient → backoff; denials/injection-suspect → DLQ, never retried), throttled supervisor restarts with exit-code semantics, idempotency keys, run journal + replayable DLQ.
+  - **Bot↔bot comms**: fire-and-forget mailbox (`bot_send`, delivery receipts, typed failure codes), bridged cross-instance via the existing Cloud `agent.message.relay`. Cron routines (separate lane) in P0.
+  - **Surfaces**: `/bots` TUI command, Hono HTTP API module, Mercury Cloud `bot.*` commands, Telegram ingress; generic webhooks in P1.
+- **Alternatives considered**:
+  - Hermes-style process-per-bot / warm process pool (~60MB/bot) — clean isolation but unaffordable on Termux/Pi; kept as P2 opt-in only
+  - JSON-file lease queue — zero native deps but weak concurrent-writer semantics vs SQLite leases
+  - Direct nested bot invocation (simpler reasoning) — couples runtimes, deadlock-prone with cyclic links
+- **Consequence**: Bots share the process (cheap: dozens on a Pi) but not state; the main agent's serial queue is untouched; all bot state survives crashes via the queue + journal. Sub-agent model/registry hardcoding (`providers.getDefault()`, shared registries) gets generalized as a side effect. Requires per-provider wire-shape tests for the bot LLM path (LiteLLM/LM Studio are OpenAI-compat chat).
+
+## ADR-013: Atomic Chat as a first-class local provider
 
 - **Context**: PR #90 (yanalialiuk) adds Atomic Chat (atomic.chat) as a local OpenAI-compatible provider, defaulting to `http://127.0.0.1:1337/v1`, mirroring the Ollama Local pattern. Security review found no vulnerabilities: no new dependencies, no secrets, base URL passes `validateBaseUrl`, model discovery reuses the existing OpenAI-compat catalog fetch, and the web server that accepts `baseUrl` binds to 127.0.0.1 only — same by-design trust boundary as `ollamaLocal`/`lmStudio`.
 - **Decision**: Accept and maintain. Adapted on merge: `atomicChat` routed through `fetchOpenAICompatModels` (without dragging `lmStudio` off its dedicated fetcher), registered in `getPreferredModelsForProvider`, and treated as keyless in the web provider test endpoint. Merge commit authored by Mercury, feature commit retains the original author.
+- **Note**: originally numbered ADR-012 in the PR-merge sequence; renumbered on the Mercury-bots merge, which independently reached ADR-012 for the Bots subsystem (kept — referenced throughout `BOTS-ARCHITECTURE.md` and the bots implementation).
 - **Consequence**: Mercury now supports four keyless local providers (Ollama Local, LM Studio, LiteLLM, Atomic Chat). Maintenance owned by Mercury: keep `atomicChat` wired into any new provider surface (config, registry, web API, catalogs, docs), and revisit the SSRF posture if the web server is ever exposed beyond 127.0.0.1.
 
-## ADR-013: Adopt PR #126 — AppleDouble-free web archive and hard `allowedTools` enforcement
+## ADR-014: Adopt PR #126 — AppleDouble-free web archive and hard `allowedTools` enforcement
 
 - **Context**: PR #126 (SeashoreShi) fixes issue #122: macOS release builds produced `web.tar.gz` containing an AppleDouble entry (`._web`) because `web/` carries xattrs. bsdtar hides the entry from `tar -tzf` so build-time verification never saw it, but GNU tar lists it and `install.sh`'s `^web/` path guard rejected the asset — breaking `mercury update` on Linux. The PR also upgrades sub-agent `allowedTools` from advisory (prompt text only — the model still received every tool) to a hard runtime filter via a new `filterToolsByAllowlist` util.
 - **Decision**: Accept and maintain. Verified empirically on macOS before merge: an xattr-bearing `web/` directory produced `._web` in the archive without `COPYFILE_DISABLE=1` and nothing with it. Full suite green (487 tests), `tsc --noEmit` clean. The allowlist change is a security positive (defense in depth — children can no longer invoke tools outside their allowlist, e.g. `list_agents`/`stop_agent`); the runtime filter subsumes the prompt-text filtering in `sub-agent.ts` line 516, which remains as harmless documentation. Merge commit authored by Mercury, feature commits retain the original author.

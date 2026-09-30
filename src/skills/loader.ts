@@ -30,12 +30,17 @@ function parseSkillMd(content: string): { meta: SkillMeta; instructions: string 
 
 export class SkillLoader {
   private skillsDir: string;
+  /** Additional read-only skill roots (e.g. a bot's own skills dir). Own-dir entries load after the primary dir, so they win on name collision. */
+  private extraDirs: string[];
+  private seedDefaults: boolean;
   private discovered: Map<string, SkillDiscovery> = new Map();
   private loaded: Map<string, Skill> = new Map();
   readonly intentRouter: IntentRouter;
 
-  constructor(skillsDir?: string) {
+  constructor(skillsDir?: string, options?: { extraDirs?: string[]; seedDefaults?: boolean }) {
     this.skillsDir = skillsDir || join(getMercuryHome(), 'skills');
+    this.extraDirs = options?.extraDirs ?? [];
+    this.seedDefaults = options?.seedDefaults !== false;
     this.intentRouter = new IntentRouter();
   }
 
@@ -43,11 +48,14 @@ export class SkillLoader {
     this.discovered.clear();
     this.loaded.clear();
     if (!existsSync(this.skillsDir)) {
+      if (!this.seedDefaults) return [];
       mkdirSync(this.skillsDir, { recursive: true });
       this.seedTemplate();
     }
 
-    this.ensureDefaultSkills();
+    if (this.seedDefaults) {
+      this.ensureDefaultSkills();
+    }
 
     // Walk both layouts:
     //   - flat:   <skillsDir>/<name>/SKILL.md            (legacy + user-authored)
@@ -116,11 +124,19 @@ export class SkillLoader {
    */
   private findSkillFiles(): string[] {
     const out: string[] = [];
-    if (!existsSync(this.skillsDir)) return out;
+    for (const dir of [this.skillsDir, ...this.extraDirs]) {
+      this.findSkillFilesIn(dir, out);
+    }
+    return out;
+  }
 
-    for (const entry of readdirSync(this.skillsDir, { withFileTypes: true })) {
+  /** Walk one skills root (flat + one nested category level), appending SKILL.md paths. */
+  private findSkillFilesIn(skillsDir: string, out: string[]): string[] {
+    if (!existsSync(skillsDir)) return out;
+
+    for (const entry of readdirSync(skillsDir, { withFileTypes: true })) {
       if (!entry.isDirectory() || entry.name.startsWith('_') || entry.name.startsWith('.')) continue;
-      const dir = join(this.skillsDir, entry.name);
+      const dir = join(skillsDir, entry.name);
       if (existsSync(join(dir, DISABLED_FILE))) continue;
 
       const flat = join(dir, SKILL_FILE);

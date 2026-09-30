@@ -198,6 +198,42 @@ export interface MercuryConfig {
     maxConcurrent: number;
     mode: 'auto' | 'manual';
   };
+  bots: {
+    enabled: boolean;
+    /** 0 = auto (clamp(2, cpus-1)). Fleet-wide cap on concurrent bot turns. */
+    maxConcurrent: number;
+    /** Shared secret for POST /api/bots/:id/hooks/* (unset = session auth only). */
+    webhookSecret?: string;
+    /** Auto-skill synthesis: draft SKILL.md from completed multi-step bot runs. */
+    autoSkill?: {
+      enabled?: boolean;
+    };
+    /** Fleet hierarchies: lead bots managing a crew of sub-bots. */
+    fleets?: {
+      /** Hard cap on crew size per lead (CrewAI guidance: 3-6 for delegation accuracy). */
+      maxCrew?: number;
+      /** Lead bots may create/remove their own crew via bot_spawn/bot_retire. */
+      allowLeadSpawn?: boolean;
+    };
+    /** Suggested per-bot daily token budget offered during onboarding. */
+    suggestedDailyTokenBudget?: number;
+    retention: {
+      transcriptRuns: number;
+      journalRotateBytes: number;
+      journalKeepRotations: number;
+      mailboxTtlHours: number;
+      dlqCap: number;
+      artifactQuotaBytes: number;
+      /** Retention janitor for the fleet-shared folder (disabled = never sweep). */
+      sandboxJanitor: {
+        enabled: boolean;
+        /** Days a file stays in the working surface. */
+        hotDays: number;
+        /** Days an archived file survives before deletion. */
+        archiveDays: number;
+      };
+    };
+  };
   spotify: {
     enabled: boolean;
     clientId: string;
@@ -450,6 +486,32 @@ export function getDefaultConfig(): MercuryConfig {
       enabled: getEnvBool('SUBAGENTS_ENABLED', true),
       maxConcurrent: getEnvNum('SUBAGENTS_MAX_CONCURRENT', 0),
       mode: (process.env.SUBAGENTS_MODE as 'auto' | 'manual') || 'auto',
+    },
+    bots: {
+      enabled: getEnvBool('BOTS_ENABLED', true),
+      maxConcurrent: getEnvNum('BOTS_MAX_CONCURRENT', 0),
+      webhookSecret: getEnv('BOTS_WEBHOOK_SECRET') || undefined,
+      autoSkill: {
+        enabled: getEnvBool('BOTS_AUTO_SKILL', false),
+      },
+      fleets: {
+        maxCrew: getEnvNum('BOTS_FLEET_MAX_CREW', 6),
+        allowLeadSpawn: getEnvBool('BOTS_FLEET_LEAD_SPAWN', true),
+      },
+      suggestedDailyTokenBudget: getEnvNum('BOTS_SUGGESTED_DAILY_TOKEN_BUDGET', 5_000_000),
+      retention: {
+        transcriptRuns: getEnvNum('BOTS_RETENTION_TRANSCRIPT_RUNS', 50),
+        journalRotateBytes: getEnvNum('BOTS_JOURNAL_ROTATE_BYTES', 5 * 1024 * 1024),
+        journalKeepRotations: getEnvNum('BOTS_JOURNAL_KEEP_ROTATIONS', 3),
+        mailboxTtlHours: getEnvNum('BOTS_MAILBOX_TTL_HOURS', 72),
+        dlqCap: getEnvNum('BOTS_DLQ_CAP', 100),
+        artifactQuotaBytes: getEnvNum('BOTS_ARTIFACT_QUOTA_BYTES', 500 * 1024 * 1024),
+        sandboxJanitor: {
+          enabled: getEnvBool('BOTS_SANDBOX_JANITOR', true),
+          hotDays: getEnvNum('BOTS_SANDBOX_HOT_DAYS', 7),
+          archiveDays: getEnvNum('BOTS_SANDBOX_ARCHIVE_DAYS', 30),
+        },
+      },
     },
     spotify: {
       enabled: getEnvBool('SPOTIFY_ENABLED', false),

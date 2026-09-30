@@ -324,6 +324,13 @@ export interface TuiState {
   /** A newer Mercury version the background check found — shown as a tiny
    * bottom-bar indicator (⬆ vX) in Mercury Code until ignored. */
   updateAvailable: string | null;
+  /** Active Mercury Bot chat — transcript is swapped to the bot's thread. */
+  botChat: { botId: string; botName: string } | null;
+  /** Per-bot real-time activity (what each bot is doing RIGHT NOW) — rendered
+   * as a live region in an open bot thread, keyed by bot id. */
+  botLiveActivity: Record<string, LiveActivityState>;
+  /** Live bot roster (drives `/bots` argument autocomplete and badges). */
+  botRoster: Array<{ id: string; name: string; state: string; needsYou: boolean; fleetRole?: 'lead' | 'crew'; parent?: string }>;
 }
 
 const defaultState: TuiState = {
@@ -358,6 +365,9 @@ const defaultState: TuiState = {
   statusVerbs: null,
   tuiFrozen: false,
   updateAvailable: null,
+  botChat: null,
+  botLiveActivity: {},
+  botRoster: [],
 };
 
 function shallowEqualSubAgents(a: SubAgentInfo[], b: SubAgentInfo[]): boolean {
@@ -386,6 +396,14 @@ export class CLIChannel extends BaseChannel {
   private menuDepth = 0;
   private menuAbortController: AbortController | null = null;
   private heartbeatMsgId: string | null = null;
+  // Mercury Bot chat (mode-scoped transcript swap, §3.3): the bot's thread
+  // replaces the transcript on screen; main-agent traffic parks in
+  // mainTranscript until /chat restores it.
+  private activeBotId: string | null = null;
+  private mainTranscript: ChatMessage[] | null = null;
+  private botTranscripts = new Map<string, ChatMessage[]>();
+  /** Set while the input handler dispatches a bot-chat message downstream. */
+  private pendingBotChatTarget: string | null = null;
 
   // Per-turn file-change attribution: file-tool calls (write/create/edit/
   // delete) with their args path. Committed entries surface in the completion
@@ -421,6 +439,7 @@ export class CLIChannel extends BaseChannel {
     saver?: () => { state: import('../core/saver-mode.js').SaverModeState; savedToday: number; savedLifetime: number };
     subAgents?: () => SubAgentInfo[];
     bgTasks?: () => BackgroundTaskInfo[];
+    botRoster?: () => Array<{ id: string; name: string; state: string; needsYou: boolean }>;
   } = {};
 
   constructor(agentName: string = 'Mercury') {
@@ -588,6 +607,70 @@ export class CLIChannel extends BaseChannel {
   }
 
   /** useSyncExternalStore contract: read the latest immutable state snapshot. */
+  // ---- Mercury Bot chat (per-bot transcripts) ------------------------------
+
+  /** Open a bot's chat: swap the on-screen transcript to the bot's thread.
+   * `history` hydrates a thread with no in-memory transcript (journal tail). */
+  enterBotChat(botId: string, botName: string, history?: Array<{ content: string; timestamp: number }>): void {
+    if (this.activeBotId === botId) return;
+    if (this.activeBotId) {
+      this.botTranscripts.set(this.activeBotId, [...this.state.chatMessages]);
+    } else {
+      this.mainTranscript = [...this.state.chatMessages];
+    }
+    this.activeBotId = botId;
+    // In-memory transcript wins (live session continuity); otherwise hydrate
+    // from the durable journal history the caller provides, so a thread
+    // opened after a restart (or after the bot worked unattended) shows what
+    // happened instead of an empty room. Bounded: caller passes ≤10 records.
+    const seed: ChatMessage[] = (this.botTranscripts.get(botId) ?? [
+      {
+        id: `bot-open-${Date.now().toString(36)}`,
+        role: 'system',
+        content: `🤖 **${botName}** bot chat — everything you type here goes to the bot (runs outside the main conversation). \`/chat\` returns to the main transcript.`,
+        timestamp: Date.now(),
+      },
+      ...(history ?? []).map((h, i) => ({
+        id: `bot-hist-${botId}-${i}-${h.timestamp.toString(36)}`,
+        role: 'system' as const,
+        content: `📜 ${h.content}`,
+        timestamp: h.timestamp,
+      })),
+    ]);
+    this.botTranscripts.set(botId, seed);
+    this.trimAndSetMessages(seed, { botChat: { botId, botName }, isThinking: false, liveActivity: null });
+  }
+
+  /** Leave the bot chat and restore the main transcript. */
+  exitBotChat(): void {
+    if (!this.activeBotId) return;
+    this.botTranscripts.set(this.activeBotId, [...this.state.chatMessages]);
+    const main = this.mainTranscript ?? [];
+    this.activeBotId = null;
+    this.mainTranscript = null;
+    this.trimAndSetMessages(main, { botChat: null, isThinking: false, liveActivity: null });
+  }
+
+  getActiveBotChat(): { botId: string; botName: string } | null {
+    return this.activeBotId ? this.state.botChat : null;
+  }
+
+  /** Agent-side marker: the in-flight input was dispatched from a bot chat. */
+  consumePendingBotChatTarget(): string | null {
+    const target = this.pendingBotChatTarget;
+    this.pendingBotChatTarget = null;
+    return target;
+  }
+
+  private appendBotMessage(botId: string, msg: ChatMessage): void {
+    const existing = this.botTranscripts.get(botId) ?? [];
+    const updated = [...existing.slice(-CLIChannel.MAX_CHAT_MESSAGES + 1), msg];
+    this.botTranscripts.set(botId, updated);
+    if (this.activeBotId === botId) {
+      this.trimAndSetMessages(updated, { isThinking: false, liveActivity: null });
+    }
+  }
+
   getTuiStateSnapshot = (): TuiState => {
     return this.state;
   };
@@ -664,6 +747,56 @@ export class CLIChannel extends BaseChannel {
 
     this.inputHandler = (text: string) => {
       const trimmed = text.trim();
+      // Bot chat: /chat exits back to the main transcript; plain text goes
+      // to the bot as `/bot <id> <text>` (durable enqueue, reply lands here).
+      if (this.activeBotId) {
+        if (trimmed === '/chat' || trimmed === '/c') {
+          this.exitBotChat();
+          this.update({ mode: 'chat' });
+          return;
+        }
+        if (trimmed && !trimmed.startsWith('/')) {
+          const wrapped = `/bot ${this.activeBotId} ${trimmed}`;
+          this.pendingBotChatTarget = this.activeBotId;
+          try {
+            onInput(wrapped);
+          } finally {
+            this.pendingBotChatTarget = null;
+          }
+          return;
+        }
+        // /skip during persona capture routes INTO the bot thread so the
+        // agent's capture state machine sees it — a bare slash here would
+        // exit the chat and strand the pending persona (the onboarding
+        // prompt explicitly tells the user to send /skip).
+        if (trimmed === '/skip') {
+          const wrapped = `/bot ${this.activeBotId} /skip`;
+          this.pendingBotChatTarget = this.activeBotId;
+          try {
+            onInput(wrapped);
+          } finally {
+            this.pendingBotChatTarget = null;
+          }
+          return;
+        }
+        // /persona inside a bot chat rewrites to the explicit setter so the
+        // persona flow works without leaving the bot thread. Bare /persona
+        // arms the capture (next message becomes the persona) — it must NOT
+        // degrade to the /bots roster.
+        if (trimmed.startsWith('/persona')) {
+          const personaText = trimmed.slice('/persona'.length).trim();
+          onInput(personaText
+            ? `/bots persona ${this.activeBotId} ${personaText}`
+            : `/bots persona ${this.activeBotId}`);
+          return;
+        }
+        // Any other slash command exits the bot chat first (review D2):
+        // command replies route to the main transcript and would otherwise
+        // be invisible from inside the bot thread.
+        if (trimmed.startsWith('/')) {
+          this.exitBotChat();
+        }
+      }
       if (trimmed === '/chat' || trimmed === '/c') {
         // Returning from Mercury Code must tear down its state (mouse mode,
         // scroll offset, programming mode) — not just flip the view. A bare
@@ -988,18 +1121,35 @@ export class CLIChannel extends BaseChannel {
     this.trimAndSetMessages([...this.state.chatMessages, msg]);
   }
 
-  async send(content: string, _targetId?: string, _elapsedMs?: number): Promise<void> {
+  async send(content: string, targetId?: string, _elapsedMs?: number): Promise<void> {
     const msg: ChatMessage = {
       id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
       role: 'agent',
       content,
       timestamp: Date.now(),
     };
+    // Bot transcripts (targetId `bot:<id>`, BOTS-ARCHITECTURE §3.3): route to
+    // the bot's own thread — live if it is the one on screen, else stored.
+    if (targetId?.startsWith('bot:')) {
+      this.appendBotMessage(targetId.slice(4), msg);
+      return;
+    }
     // Clear any lingering heartbeat message when we send a real response.
     let chat = this.state.chatMessages;
     if (this.heartbeatMsgId) {
       chat = chat.filter((m) => m.id !== this.heartbeatMsgId);
       this.heartbeatMsgId = null;
+    }
+    // While a bot chat is open, main-agent traffic must not leak into the
+    // bot's thread: non-bot sends land in the parked main transcript.
+    if (this.activeBotId) {
+      // Parked main traffic is bounded by the same transcript cap as the
+      // visible transcript (review I1 — daemon-in-bot-chat memory growth).
+      this.mainTranscript = [
+        ...(this.mainTranscript ?? []).slice(-CLIChannel.MAX_CHAT_MESSAGES + 1),
+        msg,
+      ];
+      return;
     }
     this.trimAndSetMessages([...chat, msg], { isThinking: false, liveActivity: null });
   }
@@ -1345,6 +1495,18 @@ export class CLIChannel extends BaseChannel {
   }
 
   async stream(content: AsyncIterable<string>, _targetId?: string): Promise<string> {
+    // While a bot chat is open, main-agent streaming must NEVER render into
+    // the bot's transcript (review D1): consume silently and park the full
+    // reply into the parked main transcript instead.
+    if (this.activeBotId) {
+      let parked = '';
+      for await (const chunk of content) parked += chunk;
+      this.mainTranscript = [
+        ...(this.mainTranscript ?? []).slice(-CLIChannel.MAX_CHAT_MESSAGES + 1),
+        { id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6), role: 'agent', content: parked, timestamp: Date.now() },
+      ];
+      return parked;
+    }
     const msgId = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
     let full = '';
     let started = false;
@@ -1618,6 +1780,39 @@ export class CLIChannel extends BaseChannel {
     if (existing) this.update({ liveActivity: { ...existing, stepsDone: existing.stepsDone + 1 } });
   }
 
+  /**
+   * Per-bot real-time activity: what a bot is doing RIGHT NOW, rendered as a
+   * live region inside its open thread (same spinner block the main chat
+   * gets). Events arrive from the bot activity bus (BotManager.onBotActivity).
+   * Mapping: turn-start → "Working on: <task>"; step/tool labels follow the
+   * actual work; tool finishes keep the last running label (less churn);
+   * turn-end clears the region.
+   */
+  setBotLiveActivity(botId: string, ev: { kind: 'turn-start' | 'step' | 'tool' | 'turn-end'; label: string; detail?: string; status?: string }): void {
+    const map = { ...this.state.botLiveActivity };
+    if (ev.kind === 'turn-end') {
+      if (!map[botId]) return;
+      delete map[botId];
+      this.update({ botLiveActivity: map });
+      return;
+    }
+    // A finished tool keeps its label until the next event — the region
+    // should not flicker to an intermediate state and back.
+    if (ev.kind === 'tool' && ev.status === 'done' && map[botId]) return;
+    const existing = map[botId];
+    map[botId] = {
+      phase: ev.kind === 'turn-start' ? 'Working' : ev.label,
+      detail: ev.kind === 'turn-start'
+        ? ev.label.slice(0, 80)
+        : ev.status === 'error'
+          ? `✗ ${ev.label}${ev.detail ? ` — ${ev.detail}` : ''}`
+          : undefined,
+      stepsDone: ev.kind === 'step' ? (existing?.stepsDone ?? 0) + 1 : (existing?.stepsDone ?? 0),
+      startedAt: existing?.startedAt ?? Date.now(),
+    };
+    this.update({ botLiveActivity: map });
+  }
+
   /** Clear the live activity block (task finished or idle). */
   clearLiveActivity(): void {
     // Turn-end cleanup: clear the phase AND the thinking state together.
@@ -1689,6 +1884,13 @@ export class CLIChannel extends BaseChannel {
     const target = path.resolve(dir.replace(/^~(?=$|\/)/, process.env.HOME || '~'));
     if (!fs.existsSync(target)) return { ok: false, message: `Directory does not exist: ${target}` };
     if (!fs.statSync(target).isDirectory()) return { ok: false, message: `Not a directory: ${target}` };
+
+    // A bot chat must not survive a mode switch: a stranded activeBotId would
+    // park every later send into the hidden main transcript (invisible
+    // responses) and wrap nothing visibly. The typed /code path already
+    // exits the bot chat first — this covers every OTHER entry (the
+    // automatic coding hand-off, Esc flows).
+    if (this.activeBotId) this.exitBotChat();
 
     const dirName = path.basename(target) || target;
     this.exitEscArmed = false;
@@ -1926,6 +2128,16 @@ export class CLIChannel extends BaseChannel {
         const tasks = this.statusProviders.bgTasks();
         if (!shallowEqualBgTasks(this.state.backgroundTasks, tasks)) {
           patch.backgroundTasks = tasks;
+        }
+      }
+
+      // 4b. Bot roster — drives /bots argument autocomplete (§3.2)
+      if (this.statusProviders.botRoster) {
+        const roster = this.statusProviders.botRoster();
+        const current = this.state.botRoster;
+        if (current.length !== roster.length || current.some((b, i) =>
+          b.id !== roster[i].id || b.name !== roster[i].name || b.state !== roster[i].state || b.needsYou !== roster[i].needsYou)) {
+          patch.botRoster = roster;
         }
       }
 

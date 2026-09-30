@@ -51,6 +51,7 @@ import { Identity } from './soul/identity.js';
 import { ShortTermMemory, LongTermMemory, EpisodicMemory, migrateLegacyMemory } from './memory/store.js';
 import { buildConversationHistoryPayload, CloudSessionSynchronizer, SessionRepository } from './sessions/index.js';
 import { UserMemoryStore } from './memory/user-memory.js';
+import { BotManager } from './bots/bot-manager.js';
 import { isBetterSqlite3Available } from './memory/second-brain-db.js';
 import { ProviderRegistry } from './providers/registry.js';
 import { Agent } from './core/agent.js';
@@ -68,6 +69,7 @@ import { TokenBudget } from './utils/tokens.js';
 import { CapabilityRegistry } from './capabilities/registry.js';
 import { SkillLoader } from './skills/loader.js';
 import { registerSkillsCommand } from './skills/cli.js';
+import { registerBotsCommand } from './bots/cli.js';
 import { getManual } from './utils/manual.js';
 import { startBackground, stopDaemon, showLogs, getDaemonStatus, registerRuntimeProcess, releaseRuntimeProcess, restartDaemon, tryAutoDaemonize, isStandaloneBinary, getForegroundRuntimeStatus, stopForegroundRuntime } from './cli/daemon.js';
 import { runUninstall } from './cli/uninstall.js';
@@ -79,7 +81,7 @@ import { selectWithArrowKeys } from './utils/arrow-select.js';
 import { ProviderModelFetchError, fetchProviderModelCatalog } from './utils/provider-models.js';
 import { initCloudTokenStore } from './cloud/token-store.js';
 import { clearCloudRuntimeOnline, markCloudRuntimeOnline } from './cloud/runtime-status.js';
-import { startWebServer, stopWebServer, updateStatus as updateWebStatus, setUserMemory as setWebUserMemory, setWebChannel as setWebWebChannel, setScheduler as setWebScheduler, setAgentSupervisor as setWebSupervisor, setBackgroundTaskManager as setWebBgTasks, setSpotifyClient as setWebSpotify, setProgrammingMode as setWebProgrammingMode, setModelSwitchCallback as setWebModelSwitch, setCurrentProviderCallback as setWebCurrentProvider, setKanbanSupervisor as setWebKanban, setKanbanBoardManager as setWebBoardManager, setKanbanProviders as setWebKanbanProviders, setIDEProviders as setWebIDEProviders, setSessionRepository as setWebSessions, setSessionSyncEnabledCallback as setWebSessionSyncEnabled } from './web/server.js';
+import { startWebServer, stopWebServer, updateStatus as updateWebStatus, setUserMemory as setWebUserMemory, setWebChannel as setWebWebChannel, setScheduler as setWebScheduler, setAgentSupervisor as setWebSupervisor, setBackgroundTaskManager as setWebBgTasks, setSpotifyClient as setWebSpotify, setProgrammingMode as setWebProgrammingMode, setModelSwitchCallback as setWebModelSwitch, setCurrentProviderCallback as setWebCurrentProvider, setKanbanSupervisor as setWebKanban, setKanbanBoardManager as setWebBoardManager, setKanbanProviders as setWebKanbanProviders, setIDEProviders as setWebIDEProviders, setSessionRepository as setWebSessions, setSessionSyncEnabledCallback as setWebSessionSyncEnabled, setBotManager as setWebBotManager, setBotsWebhookSecret } from './web/server.js';
 import { isWebAuthInitialized, setWebPassword, writeAttachToken } from './web/auth.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -2540,6 +2542,58 @@ async function runAgent(isDaemon: boolean = false): Promise<void> {
     agent.setSupervisor(supervisor);
   }
 
+  // Mercury Bots: fleet manager runs outside the main message queue.
+  let botManager: BotManager | undefined;
+  if (config.bots?.enabled) {
+    const bot = new BotManager({
+      config,
+      providers,
+      tokenBudget,
+      userMemoryFactory: (_botId, manifest) => {
+        const scope = manifest.memory?.scope ?? 'own';
+        if (scope === 'none') return null;
+        if (!userMemory) return null; // second brain unavailable — bots run stateless
+        // Bots share the second-brain DB but are namespaced per bot.
+        return new UserMemoryStore(config, `bot:${manifest.id}`);
+      },
+    });
+    botManager = bot;
+    bot.setScheduler(scheduler);
+    // Startup migrations must run before routines register: fleet layout
+    // (crew nesting + orphan cascade) and permission consolidation to the
+    // single permissions.yaml source.
+    void bot.migrateFleetLayout()
+      .then(() => bot.migratePermissions())
+      .then(() => bot.registerRoutines(scheduler));
+    agent.setBotManager(bot);
+    setWebBotManager(bot);
+    // Real-time bot activity bus → surfaces: the CLI bot-thread live region
+    // (what the bot is doing RIGHT NOW while you watch its thread) and the
+    // web SSE feed (dashboards / third-party backends). The roster's activity
+    // label is updated inside the manager itself.
+    const botCliChannel = channels.get('cli');
+    bot.onBotActivity((ev) => {
+      if (botCliChannel instanceof CLIChannel) botCliChannel.setBotLiveActivity(ev.botId, ev);
+      webChannel.broadcastBotActivity(ev);
+    });
+    if (config.bots?.webhookSecret) {
+      setBotsWebhookSecret(config.bots.webhookSecret);
+    }
+    // Main-agent awareness: bots section in the system prompt + dispatch tool.
+    capabilities.setBotDispatchHandler((botIdOrName, message, ctx) => {
+      const botId = bot.resolveBotId(botIdOrName);
+      if (!botId) return { accepted: false, reasonCode: 'target_unknown' };
+      const result = bot.enqueue(botId, {
+        trigger: 'chat',
+        prompt: message,
+        source: { channelType: ctx.channelType, channelId: ctx.channelId },
+      });
+      return result.accepted
+        ? { accepted: true, jobId: result.jobId }
+        : { accepted: false, reasonCode: result.reasonCode };
+    }, () => capabilities.getChannelContext());
+  }
+
   let spotifyClient: SpotifyClient | undefined;
   if (config.spotify.clientId && config.spotify.clientSecret) {
     spotifyClient = new SpotifyClient(config);
@@ -2593,6 +2647,14 @@ async function runAgent(isDaemon: boolean = false): Promise<void> {
           startedAt: 0,
         })) : [],
         bgTasks: () => agent.backgroundTasks.getAllSummaries(),
+        botRoster: () => agent.getBotManager()?.getStatusSummaries().map((b) => ({
+          id: b.id,
+          name: b.name,
+          state: b.state,
+          needsYou: b.needsYou,
+          fleetRole: b.fleetRole,
+          parent: b.parent,
+        })) ?? [],
       });
       bootCli.startStatusPoller(2000);
       bootCli.mountTUI((inputText: string) => {
@@ -3549,6 +3611,9 @@ async function runAgent(isDaemon: boolean = false): Promise<void> {
         } catch {}
       }
       await stopWebServer();
+      // Release the bots' SQLite queue handle — on Windows an open handle
+      // keeps queue.db locked against any later uninstall/replace.
+      try { botManager?.dispose(); } catch { /* best effort */ }
       await agent.shutdown();
       clearCloudRuntimeOnline();
       releaseRuntimeProcess(runtimeMode);
@@ -4817,5 +4882,6 @@ cloud
   });
 
 registerSkillsCommand(program);
+registerBotsCommand(program);
 
 program.parse();
