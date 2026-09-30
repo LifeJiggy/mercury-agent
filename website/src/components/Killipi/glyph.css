@@ -21,6 +21,24 @@ html[data-theme='light'] {
   --kp-accent: #2e7d92;
 }
 
+/* The v3 landing page (.lp-page) is dark-by-design: its own baked-in palette
+   ignores the global theme toggle. The glyph lives inside it, so it must match
+   the page — keep the dark palette scoped to .lp-page in every theme.
+   (Inheritance beats html[data-theme='light'] for everything inside .lp-page.) */
+.lp-page {
+  --kp-orb-fill: #101418;
+  --kp-orb-edge: rgba(230, 240, 244, 0.28);
+  --kp-line: rgba(230, 240, 244, 0.16);
+  --kp-feature: rgba(230, 244, 247, 0.92);
+  --kp-dim: rgba(230, 244, 247, 0.4);
+  --kp-accent: #9ad8e8;
+  --kp-accent-soft: rgba(154, 216, 232, 0.5);
+}
+
+html[data-theme='light'] .lp-page .kp-crescent {
+  stroke: var(--kp-accent-soft); /* undo the light-theme teal — dark backdrop here */
+}
+
 .kp-wrap {
   display: flex;
   flex-direction: column;
