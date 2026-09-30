@@ -162,7 +162,10 @@ try {
     $archiveEntries = @(tar -tzf $webTmp)
     if ($LASTEXITCODE -ne 0) { Die 'Failed to inspect web.tar.gz' }
     foreach ($entry in $archiveEntries) {
-        if ($entry -notmatch '^web(/|$)' -or $entry -match '(^|/)\.\.(/|$)') {
+        # AppleDouble sidecars (._*, macOS tar's xattr artifact — invisible to
+        # bsdtar, listed by GNU tar) are inert; the extraction stage discards
+        # them. Traversal attempts stay fatal.
+        if (($entry -notmatch '^web(/|$)' -and $entry -notmatch '^\._') -or $entry -match '(^|/)\.\.(/|$)') {
             Die "web.tar.gz contains an unsafe path: $entry"
         }
     }

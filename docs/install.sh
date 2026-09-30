@@ -216,7 +216,12 @@ Install the supported Node.js package instead:
   info "Checksums verified (sha256)"
 
   tar -tzf "$web_tmp" > "$tmp_dir/web-files.txt" || die "Failed to inspect web.tar.gz"
-  awk '$0 !~ /^web(\/|$)/ || $0 ~ /(^|\/)\.\.(\/|$)/ { bad=1 } END { exit bad }' \
+  # Safe = the `web/` tree itself. AppleDouble sidecars (`._web` — macOS
+  # tar's xattr artifact, invisible to bsdtar but LISTED by GNU tar) are
+  # ignored, not rejected: they are inert files the extraction stage
+  # discards, and a hard reject bricked every Linux install of tarballs
+  # built before the COPYFILE_DISABLE fix (#122). Traversal stays fatal.
+  awk '$0 ~ /(^|\/)\.\.(\/|$)/ || ($0 !~ /^web(\/|$)/ && $0 !~ /^\._/) { bad=1 } END { exit bad }' \
     "$tmp_dir/web-files.txt" || die "web.tar.gz contains an unsafe path"
   mkdir -p "$stage_dir"
   tar -xzf "$web_tmp" -C "$stage_dir" || die "Failed to extract web dashboard assets"
