@@ -4,8 +4,13 @@
 #
 # Environment variables:
 #   $env:MERCURY_VERSION   Version to install (e.g. "1.1.9"). Default: latest.
+#                          (Stable channel only — dev tracks the latest dev
+#                          build.)
+#   $env:MERCURY_CHANNEL   Distribution channel: "stable" (default) or "dev".
 #   $env:MERCURY_INSTALL   Install prefix.    Default: $HOME\.mercury
+#                          (~\.mercury-dev for the dev channel.)
 #                          Binary lands at $env:MERCURY_INSTALL\bin\mercury.exe.
+#                          (mercury-dev.exe on the dev channel.)
 #   $env:MERCURY_NO_PATH   If "1", skip modifying user PATH.
 
 #Requires -Version 5
@@ -106,20 +111,37 @@ function Update-UserPath ([string]$BinDir) {
 
 # ----- main ------------------------------------------------------------------
 
+# Channel: stable (default) vs dev. The dev channel tracks the rolling
+# `mercury-dev-latest` PRE-release (never shown to stable users) and installs
+# as mercury-dev.exe in ~\.mercury-dev, so both channels coexist.
+$IsDev = ($env:MERCURY_CHANNEL -eq 'dev')
+
 Write-Host ''
 Write-Host '☿ Mercury installer' -ForegroundColor White
 Write-Host '   Soul-driven AI agent · https://mercuryagent.sh'
 Write-Host ''
+if ($IsDev) {
+    Write-Warn2 'Dev channel — unstable preview builds.'
+    Write-Host ("  Installs as {0}\bin\mercury-dev.exe (coexists with stable)." -f (Join-Path $HOME '.mercury-dev'))
+    Write-Host ''
+}
 
 $arch = Get-MercuryArch
 Write-Info "Detected platform: win-$arch"
 
-$version = $env:MERCURY_VERSION
-if ([string]::IsNullOrEmpty($version)) {
-    Write-Info 'Resolving latest version from GitHub...'
-    $version = Resolve-LatestVersion
+if ($IsDev) {
+    $releaseDir = "$GhDl/mercury-dev-latest"
+    $versionLabel = 'dev (rolling mercury-dev-latest)'
+} else {
+    $version = $env:MERCURY_VERSION
+    if ([string]::IsNullOrEmpty($version)) {
+        Write-Info 'Resolving latest version from GitHub...'
+        $version = Resolve-LatestVersion
+    }
+    $releaseDir = "$GhDl/v$version"
+    $versionLabel = "v$version"
 }
-Write-Info "Installing Mercury v$version"
+Write-Info "Installing Mercury $versionLabel"
 
 # Mercury's release naming for Windows: mercury-win-x64.exe (no arm64 build yet).
 if ($arch -ne 'x64') {
@@ -127,12 +149,15 @@ if ($arch -ne 'x64') {
 }
 
 $asset = "mercury-win-x64.exe"
-$url   = "$GhDl/v$version/$asset"
+$url   = "$releaseDir/$asset"
 
 $prefix = $env:MERCURY_INSTALL
-if ([string]::IsNullOrEmpty($prefix)) { $prefix = Join-Path $HOME '.mercury' }
+if ([string]::IsNullOrEmpty($prefix)) {
+    $prefix = if ($IsDev) { Join-Path $HOME '.mercury-dev' } else { Join-Path $HOME '.mercury' }
+}
 $binDir  = Join-Path $prefix 'bin'
-$binPath = Join-Path $binDir 'mercury.exe'
+$binName = if ($IsDev) { 'mercury-dev.exe' } else { 'mercury.exe' }
+$binPath = Join-Path $binDir $binName
 
 $tmpDir = Join-Path $env:TEMP ("mercury-" + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $tmpDir | Out-Null
@@ -141,7 +166,7 @@ $webTmp = Join-Path $tmpDir 'web.tar.gz'
 $stageDir = Join-Path $tmpDir 'stage'
 
 try {
-    $checksumsUrl = "$GhDl/v$version/checksums.txt"
+    $checksumsUrl = "$releaseDir/checksums.txt"
     Write-Info 'Downloading checksums.txt ...'
     try {
         $checksums = (Invoke-WebRequest -Uri $checksumsUrl -UseBasicParsing).Content
@@ -154,7 +179,7 @@ try {
     Write-Info "Downloading $asset ..."
     Save-VerifiedAsset -Uri $url -Path $binaryTmp -ExpectedHash $expectedBinary -Asset $asset
 
-    $webTarUrl = "$GhDl/v$version/web.tar.gz"
+    $webTarUrl = "$releaseDir/web.tar.gz"
     Write-Info 'Downloading web.tar.gz ...'
     Save-VerifiedAsset -Uri $webTarUrl -Path $webTmp -ExpectedHash $expectedWeb -Asset 'web.tar.gz'
     Write-Info 'Checksums verified (sha256)'
@@ -193,7 +218,7 @@ Write-Info "Installed to $binPath"
 $pathUpdated = Update-UserPath -BinDir $binDir
 
 Write-Host ''
-Write-Host "✓ Mercury v$version is ready." -ForegroundColor Green
+Write-Host "✓ Mercury $versionLabel is ready." -ForegroundColor Green
 Write-Host ''
 
 if ($pathUpdated) {
@@ -204,8 +229,11 @@ if ($pathUpdated) {
 Write-Host 'Get started:'
 Write-Host "   $binPath --help"
 if ($pathUpdated) {
-    Write-Host '   mercury              # first run launches setup wizard'
+    Write-Host "   $binName              # first run launches setup wizard"
 } else {
     Write-Host "   $binPath              # first run launches setup wizard"
+}
+if ($IsDev) {
+    Write-Warn2 'Dev channel — preview builds, may break. Re-run this script to update.'
 }
 Write-Host ''
