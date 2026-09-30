@@ -1,7 +1,7 @@
 import { cpus } from 'node:os';
 import { randomUUID } from 'node:crypto';
-import { resolve, join } from 'node:path';
-import { statSync } from 'node:fs';
+import { basename, extname, isAbsolute, relative, resolve, join } from 'node:path';
+import { copyFileSync, existsSync, mkdirSync, renameSync, statSync, unlinkSync } from 'node:fs';
 import type { Tool } from 'ai';
 import type { MercuryConfig } from '../utils/config.js';
 import type { ProviderRegistry } from '../providers/registry.js';
@@ -12,8 +12,10 @@ import { UserMemoryStore as UserMemoryStoreImpl } from '../memory/user-memory.js
 import { BotStore, BOT_JOURNAL_FILENAME, BOT_PERMISSIONS_FILENAME, isValidCronExpression } from './store.js';
 import { BotJournal } from './journal.js';
 import { BotQueue, idempotencyKeyFor, LEASE_SECONDS, type DurableBotJob } from './queue.js';
+import { sweepSharedSandbox } from './retention.js';
 import { createBotCapabilityRegistry, filterBotTools } from './registry-factory.js';
 import { createBotSendTool } from './tools/bot-send.js';
+import { createBotDeliverTool } from './tools/bot-deliver.js';
 import { createBotScheduleTool, type BotScheduler } from './tools/bot-schedule.js';
 import { createFleetStatusTool } from './tools/fleet-status.js';
 import { createBotSpawnTool } from './tools/bot-spawn.js';
@@ -216,6 +218,14 @@ export class BotManager {
     // when their run_after elapses (also covers crash-restart backoffs).
     this.dueTimer = setInterval(() => this.resumeDueJobs(), 30_000);
     this.dueTimer.unref?.();
+    // Retention janitor: on boot + once a day, cool down aged files in the
+    // fleet-shared folder into the archive and expire the archive (disabled
+    // entirely with `sandboxJanitor.enabled: false`).
+    if (this.config.bots?.retention?.sandboxJanitor?.enabled !== false) {
+      const janitorTimer = setInterval(() => this.sweepRetention(), 24 * 60 * 60 * 1000);
+      janitorTimer.unref?.();
+      setTimeout(() => this.sweepRetention(), 15_000);
+    }
     // Real-time activity consumer registration happens via onBotActivity();
     // executeTurn feeds every registered listener AND the live `activity`
     // map (rendered by the /bots roster and fleet_status).
@@ -732,12 +742,14 @@ export class BotManager {
     // permissions.yaml tool gate), THEN add the bot-specific tools —
     // otherwise the filter would strip them again.
     const filtered = filterBotTools({ ...registry.getTools() }, manifest, this.store.ensurePermissions(botId));
-    // Fleet relations are implicit comms: a lead can message its crew and a
-    // crew bot its lead, without anyone hand-editing canMessage.
     const effectiveRoster = this.effectiveRoster(botId, manifest);
     if (effectiveRoster.length > 0) {
       filtered.bot_send = createBotSendTool(this, botId, effectiveRoster) as Tool;
     }
+    // bot_deliver: implicit lifecycle op — every bot can move a finished
+    // artifact out of its writable roots into the owner-curated outputs zone
+    // (exempt from the retention janitor).
+    filtered.bot_deliver = createBotDeliverTool(this, botId) as Tool;
     // Fleet tools for leads: monitor the crew, spawn/retire within caps.
     if (manifest.fleetRole === 'lead') {
       filtered.fleet_status = createFleetStatusTool(this, botId);
@@ -1235,6 +1247,75 @@ export class BotManager {
       this.dueTimer = undefined;
     }
     this.queue.close();
+  }
+
+  /**
+   * bot_deliver: move a finished artifact out of the bot's writable areas
+   * (its private sandbox or the fleet-shared folder) into the owner-curated
+   * `outputs/<botId>/` zone — exempt from the retention janitor. Only files
+   * from the bot's OWN writable roots travel (containment is enforced); the
+   * source is removed on success (a move, not a copy — the shared surface
+   * stays lean by construction).
+   */
+  deliver(botId: string, filePath: string, rename?: string): { accepted: boolean; path?: string; reasonCode?: string } {
+    if (!this.store.get(botId)) return { accepted: false, reasonCode: 'target_unknown' };
+    const candidate = resolve(filePath.replace(/^~(?=$|\/|\\)/, process.env.HOME || '~'));
+    const allowedBases = [this.store.sharedSandboxDir(), this.store.sandboxDir(botId)];
+    const inside = allowedBases.some((base) => {
+      const rel = relative(resolve(base), candidate);
+      return rel !== '' && !rel.startsWith('..') && !isAbsolute(rel);
+    });
+    if (!inside || !existsSync(candidate) || !statSync(candidate).isFile()) {
+      return { accepted: false, reasonCode: 'outside_sandbox' };
+    }
+    const outputsDir = join(this.store.outputsDir(), botId);
+    mkdirSync(outputsDir, { recursive: true });
+    const stem = basename(candidate, extname(candidate));
+    const extMatch = extname(candidate);
+    const requested = (rename || stem)
+      .replace(/[ <>:"/\\|?*]/g, '-')
+      .replace(/-+/g, '-')
+      .replace(/^-|-$/g, '')
+      .slice(0, 120) || 'output';
+    let dest = join(outputsDir, requested);
+    for (let i = 2; existsSync(dest); i++) {
+      dest = join(outputsDir, `${requested}-${i}${extMatch}`);
+    }
+    try {
+      renameSync(candidate, dest);
+    } catch {
+      // Cross-device fallback: copy then remove the source.
+      try {
+        copyFileSync(candidate, dest);
+        unlinkSync(candidate);
+      } catch {
+        return { accepted: false, reasonCode: 'move_failed' };
+      }
+    }
+    logger.info({ botId, dest }, 'Bot delivered a final artifact');
+    return { accepted: true, path: dest };
+  }
+
+  /**
+   * Retention janitor sweep: files in the fleet-shared folder cool down into
+   * `_shared/.archive/<yyyy-mm>/` past the hot window, and the archive
+   * expires after the archive window — the working surface stays small while
+   * an incorrectly aged-out file stays recoverable for a month.
+   */
+  sweepRetention(): void {
+    const sandbox = this.config.bots?.retention?.sandboxJanitor;
+    if (sandbox?.enabled === false) return;
+    const result = sweepSharedSandbox(this.store.botsRoot, {
+      hotDays: sandbox?.hotDays ?? 7,
+      archiveDays: sandbox?.archiveDays ?? 30,
+    });
+    const touched = result.moved.length + result.deleted.length;
+    if (touched > 0 || result.errors.length > 0) {
+      logger.info(
+        { moved: result.moved.length, deleted: result.deleted.length, kept: result.kept, errors: result.errors },
+        'Sandbox retention sweep',
+      );
+    }
   }
 }
 

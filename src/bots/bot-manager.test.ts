@@ -879,3 +879,53 @@ describe('Bot fleets (lead + crew)', () => {
     expect(tools.bot_spawn).toBeUndefined();
   });
 });
+
+describe('bot_deliver — final artifact delivery', () => {
+  let root: string;
+  let store: BotStore;
+  let manager: BotManager;
+
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), 'mercury-bot-deliver-'));
+    store = new BotStore(join(root, 'bots'));
+    manager = makeManager(root);
+    store.get('researcher') ?? seedBot(store, 'researcher');
+    mkdirSync(join(root, 'bots', '_shared'), { recursive: true });
+    writeFileSync(join(root, 'bots', '_shared', 'final-report.md'), '# Final');
+    mkdirSync(store.sandboxDir('researcher'), { recursive: true });
+    writeFileSync(store.sandboxDir('researcher') + '/draft.md', 'draft body');
+  });
+
+  afterEach(() => {
+    for (const m of activeManagers.splice(0)) m.dispose();
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  it('moves a shared-folder artifact into the protected outputs zone', () => {
+    const sharedFile = join(root, 'bots', '_shared', 'final-report.md');
+    const result = manager.deliver('researcher', sharedFile);
+    expect(result.accepted).toBe(true);
+    expect(result.path).toContain(join('outputs', 'researcher'));
+    expect(existsSync(sharedFile)).toBe(false); // a MOVE — the shared surface stays lean
+    expect(existsSync(result.path!)).toBe(true);
+  });
+
+  it('rejects files outside the bot\'s writable roots (containment)', () => {
+    writeFileSync(join(root, 'escape-me.md'), 'secret');
+    const result = manager.deliver('researcher', join(root, 'escape-me.md'));
+    expect(result.accepted).toBe(false);
+    expect(result.reasonCode).toBe('outside_sandbox');
+  });
+
+  it('moves from the bot\'s private sandbox and dedupes delivered names', () => {
+    const sandboxFile = join(store.sandboxDir('researcher'), 'draft.md');
+    const first = manager.deliver('researcher', sandboxFile);
+    expect(first.accepted).toBe(true);
+    writeFileSync(sandboxFile, 'second body');
+    const second = manager.deliver('researcher', sandboxFile);
+    expect(second.accepted).toBe(true);
+    expect(second.path).not.toBe(first.path);
+    expect(existsSync(first.path!)).toBe(true);
+    expect(existsSync(second.path!)).toBe(true);
+  });
+});

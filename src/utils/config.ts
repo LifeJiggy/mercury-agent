@@ -224,6 +224,14 @@ export interface MercuryConfig {
       mailboxTtlHours: number;
       dlqCap: number;
       artifactQuotaBytes: number;
+      /** Retention janitor for the fleet-shared folder (disabled = never sweep). */
+      sandboxJanitor: {
+        enabled: boolean;
+        /** Days a file stays in the working surface. */
+        hotDays: number;
+        /** Days an archived file survives before deletion. */
+        archiveDays: number;
+      };
     };
   };
   spotify: {
@@ -498,6 +506,11 @@ export function getDefaultConfig(): MercuryConfig {
         mailboxTtlHours: getEnvNum('BOTS_MAILBOX_TTL_HOURS', 72),
         dlqCap: getEnvNum('BOTS_DLQ_CAP', 100),
         artifactQuotaBytes: getEnvNum('BOTS_ARTIFACT_QUOTA_BYTES', 500 * 1024 * 1024),
+        sandboxJanitor: {
+          enabled: getEnvBool('BOTS_SANDBOX_JANITOR', true),
+          hotDays: getEnvNum('BOTS_SANDBOX_HOT_DAYS', 7),
+          archiveDays: getEnvNum('BOTS_SANDBOX_ARCHIVE_DAYS', 30),
+        },
       },
     },
     spotify: {

@@ -167,6 +167,8 @@ Bots get their **own** `PermissionManager` seeded from `bots/<id>/permissions.ya
 - **Path scopes**: bot file access is scope-based like the main agent's manifest, defaulting to the bot's own dir + explicitly granted workspace paths. `cwdOnly`-style escape gates apply. The bot's sandbox and the fleet-shared folder are implicit, never configurable away.
 - **Dangerous-pattern denylist** reused from the main permission system for any allowed shell (plus the hardline set that survives every mode).
 - **Budgets as security**: per-bot `dailyTokenBudget` and turn caps are hard stops (pause + journal, resume next window), protecting low-end devices and wallets from runaway loops.
+- **Retention janitor for the shared folder** (`src/bots/retention.ts`): the fleet-shared folder is a *message surface*, not storage — dated inter-run reports would accumulate forever. A two-stage janitor runs on `BotManager` boot + daily: files older than `retention.sandboxJanitor.hotDays` (default 7) cool down into `_shared/.archive/<yyyy-mm>/`, and archived files are hard-deleted past `archiveDays` (default 30). Guards: nothing younger than 24h is ever moved, dotfiles and `outputs/` are exempt, post-close queue access degrades to no-ops (Windows EBUSY), and a wrongly aged-out file stays recoverable for a month.
+- **`bot_deliver`**: a bot moves a FINISHED artifact out of its writable roots (private sandbox or `_shared/`) into the owner-curated `outputs/<botId>/` zone — exempt from the janitor, deleted only by the owner. Containment is enforced (nothing outside the bot's own writable roots travels); delivery is a MOVE, so the shared surface stays lean by construction.
 
 ### 2.6 Never-fail contract
 

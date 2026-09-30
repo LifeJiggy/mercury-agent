@@ -235,6 +235,15 @@ export class BotStore {
     return resolve(this.botsRoot, BOT_SHARED_SANDBOX_DIRNAME);
   }
 
+  /**
+   * Owner-curated final deliverables (`bot_deliver`). Sits OUTSIDE the
+   * fleet-shared folder and is exempt from the retention janitor — the
+   * owner deletes these when done with them.
+   */
+  outputsDir(): string {
+    return resolve(this.botsRoot, 'outputs');
+  }
+
   /** Create both sandbox areas if missing (cheap + idempotent). */
   ensureSandboxes(id: string): void {
     mkdirSync(this.sandboxDir(id), { recursive: true });
