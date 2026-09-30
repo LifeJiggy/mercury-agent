@@ -248,6 +248,9 @@ describe('BotManager durable queue integration', () => {
     // The manager owns the SQLite queue handle — close it or Windows locks
     // queue.db (EBUSY) and the tmpdir teardown fails.
     try { manager?.dispose?.(); } catch { /* already gone */ }
+    // This describe also opens backends directly (heartbeat test) — close
+    // them or Windows locks queue.db (EBUSY) at tmpdir teardown.
+    for (const b of openBackends.splice(0)) b.close();
     rmSync(root, { recursive: true, force: true });
   });
 
