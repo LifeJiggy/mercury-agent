@@ -97,10 +97,11 @@ describe('shared-sandbox retention janitor', () => {
     writeFileSync(join(privateSandbox, 'private-artifact.md'), 'x');
     for (const f of ['.DS_Store', join('subfolder', 'nested.md'), join('..', 'researcher', 'private-artifact.md')]) {
       const p = join(shared, f);
-      const mtime = NOW - 20 * DAYS;
-      utimesSync(join(shared, f), mtime, mtime);
+      const mtime = new Date(NOW - 20 * DAYS); // fs.utimes accepts Date — a bare number is SECONDS (EINVAL on Windows)
+      utimesSync(p, mtime, mtime);
     }
-    utimesSync(join(privateSandbox, 'private-artifact.md'), NOW - 20 * DAYS, NOW - 20 * DAYS);
+    const privateMtime = new Date(NOW - 20 * DAYS);
+    utimesSync(join(privateSandbox, 'private-artifact.md'), privateMtime, privateMtime);
     const result = sweepSharedSandbox(join(root, 'bots'), { hotDays: 7, archiveDays: 30, now: NOW });
     expect(result.moved).toHaveLength(0);
     expect(existsSync(join(shared, '.DS_Store'))).toBe(true);
