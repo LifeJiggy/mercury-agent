@@ -1,16 +1,16 @@
-import { useEffect, useState, useCallback } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { motion } from "framer-motion";
-import { Bot, Plus, Send, RefreshCw, Trash2, Play, Pause, RotateCcw, RotateCw, AlertTriangle } from "lucide-react";
+import { Bot, Plus, RefreshCw, AlertTriangle, Crown, Users, Package } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
-import { Textarea } from "@/components/ui/textarea";
-import {
-  Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter,
-} from "@/components/ui/dialog";
+import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { cn, formatDate } from "@/lib/utils";
-import api, { type BotStatus, type BotManifest, type BotRunRecord, type BotDlqEntry } from "@/lib/api";
+import api, { type BotStatus, type BotRunRecord, type BotDlqEntry, type BotManifest } from "@/lib/api";
+import { useBotEvents } from "@/components/bots/useBotEvents";
+import { BotDetail } from "@/components/bots/BotDetail";
+import { OnboardWizard } from "@/components/bots/OnboardWizard";
+import { DeliverablesList } from "@/components/bots/DeliverablesList";
 
 const fadeUp = {
   hidden: { opacity: 0, y: 12 },
@@ -28,23 +28,20 @@ const STATE_STYLES: Record<string, { label: string; className: string }> = {
   idle: { label: "⚪ Idle", className: "bg-muted text-muted-foreground" },
 };
 
-function Skeleton({ className }: { className?: string }) {
-  return <div className={cn("animate-pulse rounded-lg bg-muted", className)} />;
-}
-
+/**
+ * "Mercury Bots" — the full fleet cockpit: live roster (fleet nesting), bot
+ * panels, the deliverables inbox, and onboarding with executable tiers.
+ */
 export function BotsPage() {
   const [botsList, setBotsList] = useState<BotStatus[]>([]);
   const [loading, setLoading] = useState(true);
   const [available, setAvailable] = useState(true);
-  const [selected, setSelected] = useState<string | null>(null);
-  const [detail, setDetail] = useState<{ bot: BotManifest; journal: BotRunRecord[]; inbox: unknown[] } | null>(null);
-  const [dlq, setDlq] = useState<BotDlqEntry[]>([]);
-  const [message, setMessage] = useState("");
-  const [creating, setCreating] = useState(false);
-  const [newId, setNewId] = useState("");
-  const [newName, setNewName] = useState("");
-  const [newDescription, setNewDescription] = useState("");
-  const [error, setError] = useState<string | null>(null);
+  const [detail, setDetail] = useState<{ bot: BotManifest; state: BotStatus | null; journal: BotRunRecord[]; inbox: unknown[] } | null>(null);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [wizardOpen, setWizardOpen] = useState(false);
+  const [newInFleet, setNewInFleet] = useState<"solo" | { leadId: string }>("solo");
+  const [liveBanner, setLiveBanner] = useState<string | null>(null);
+  const live = useBotEvents();
 
   const refresh = useCallback(async () => {
     try {
@@ -58,80 +55,131 @@ export function BotsPage() {
     }
   }, []);
 
-  const openDetail = useCallback(async (id: string) => {
-    setSelected(id);
+  const openBot = useCallback(async (id: string) => {
+    setSelectedId(id);
     try {
-      const [detail, dlqData] = await Promise.all([api.bots.get(id), api.bots.dlq(id)]);
-      setDetail(detail);
-      setDlq(dlqData.dlq);
-    } catch (err) {
-      setError(String(err));
-    }
+      const d = await api.bots.get(id);
+      setDetail(d);
+    } catch {}
   }, []);
 
   useEffect(() => {
     void refresh();
-    const t = setInterval(() => void refresh(), 4000); // live roster states
+    const t = setInterval(() => void refresh(), 4000); // fallback: SSE rides live activity
     return () => clearInterval(t);
   }, [refresh]);
 
-  const sendMessage = async () => {
-    if (!selected || !message.trim()) return;
-    try {
-      const result = await api.bots.message(selected, message.trim());
-      if (result.accepted) {
-        setMessage("");
-        setTimeout(() => void openDetail(selected), 400);
-      } else {
-        setError(`Rejected: ${result.reasonCode}`);
-      }
-    } catch (err) {
-      setError(String(err));
+  // Live deliverable banner + inbox refresh
+  useEffect(() => {
+    if (live.lastDelivery) {
+      const name = live.lastDelivery.name;
+      setLiveBanner(`${live.lastDelivery.botId} delivered ${name}`);
+      const t = setTimeout(() => setLiveBanner(null), 6000);
+      return () => clearTimeout(t);
     }
+  }, [live.lastDelivery?.at, live.lastDelivery?.name, live.lastDelivery?.botId]);
+
+  const botNames = useMemo(() => Object.fromEntries(botsList.map((b) => [b.id, b.name])), [botsList]);
+
+  // Fleet-first grouping: leads with nested crew, then solos, then crew orphans sorted after
+  const grouped = useMemo(() => {
+    const leads = botsList.filter((b) => b.fleetRole === "lead");
+    const crews = botsList.filter((b) => b.fleetRole === "crew");
+    const solos = botsList.filter((b) => !b.fleetRole);
+    return { leads, crews, solos };
+  }, [botsList]);
+
+  const BotCard = ({ id, idx }: { id: string; idx: number }) => {
+    const bot = botsList.find((b) => b.id === id);
+    if (!bot) return null;
+    const liveLabel = live.activity[bot.id];
+    // Crew members live inside their lead's card — render only on demand here.
+    if (bot.fleetRole === "crew") return null;
+    const crewCount = bot.fleetRole === "lead" ? grouped.crews.filter((c) => c.parent === bot.id).length : 0;
+    return (
+      <motion.div key={bot.id} custom={idx} variants={fadeUp} initial="hidden" animate="visible">
+        <Card className={cn("cursor-pointer transition-colors hover:border-primary/50", bot.needsYou && "border-yellow-500/40")}>
+          <CardHeader className="pb-2" onClick={() => void openBot(bot.id)}>
+            <div className="flex items-center justify-between">
+              <CardTitle className="flex items-center gap-2 text-base">
+                <Bot className="h-4 w-4" /> {bot.name}
+                {bot.fleetRole === "lead" && <Badge variant="secondary" className="text-yellow-500"><Crown className="h-3 w-3" /> lead</Badge>}
+                {crewCount > 0 && <Badge variant="secondary"><Users className="h-3 w-3" /> {crewCount}</Badge>}
+              </CardTitle>
+              <Badge variant="secondary" className={STATE_STYLES[bot.state]?.className}>
+                {STATE_STYLES[bot.state]?.label ?? bot.state}
+              </Badge>
+            </div>
+          </CardHeader>
+          <CardContent className="space-y-2 text-sm" onClick={() => void openBot(bot.id)}>
+            {liveLabel && (
+              <p className="flex items-center gap-1.5 text-emerald-400 truncate">
+                <span className="inline-block h-1.5 w-1.5 rounded-full bg-emerald-400 animate-pulse" />
+                {liveLabel}
+              </p>
+            )}
+            {bot.fleetRole === "lead" && (
+              <p className="text-muted-foreground">
+                {grouped.crews.filter((c) => c.parent === bot.id).map((c) => {
+                  const cl = live.activity[c.id];
+                  return (
+                    <span key={c.id} className="inline-flex items-center gap-1 mr-2">
+                      ↳ {c.name}
+                      {cl && <span className="text-emerald-400"> {cl.slice(0, 30)}</span>}
+                      {c.needsYou && <AlertTriangle className="h-3 w-3 text-yellow-500" />}
+                    </span>
+                  );
+                })}
+              </p>
+            )}
+            {!liveLabel && bot.needsYou && (
+              <p className="flex items-center gap-1 text-yellow-500"><AlertTriangle className="h-3.5 w-3.5" /> Needs you — check Ops → DLQ</p>
+            )}
+            {!liveLabel && bot.lastRunAt && (
+              <p className="text-muted-foreground">Last run {formatDate(bot.lastRunAt)} · {bot.lastRunState}</p>
+            )}
+          </CardContent>
+        </Card>
+      </motion.div>
+    );
   };
 
-  const createBot = async () => {
-    try {
-      await api.bots.create({ id: newId.toLowerCase(), name: newName, description: newDescription || undefined });
-      setCreating(false);
-      setNewId(""); setNewName(""); setNewDescription("");
-      void refresh();
-    } catch (err) {
-      setError(String(err));
-    }
-  };
-
-  const toggleEnabled = async (bot: BotStatus) => {
-    await (bot.enabled ? api.bots.disable(bot.id) : api.bots.enable(bot.id));
-    void refresh();
-  };
-
-  const replay = async (entry: BotDlqEntry) => {
-    try {
-      await api.bots.replay(entry.botId, entry.id);
-      if (selected) void openDetail(selected);
-    } catch (err) {
-      setError(String(err));
-    }
-  };
+  const openBotDetail = detail && selectedId
+    ? botsList.find((b) => b.id === selectedId)
+      ? { ...detail, bot: detail.bot }
+      : null
+    : null;
 
   return (
     <div className="space-y-6 p-6">
       <div className="flex items-center justify-between">
         <div>
-          <h1 className="text-2xl font-semibold flex items-center gap-2"><Bot className="h-6 w-6" /> Bots</h1>
+          <h1 className="text-2xl font-semibold flex items-center gap-2">
+            <Bot className="h-6 w-6" /> Mercury Bots
+            <span
+              className={cn(
+                "inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded-full border",
+                live.connected ? "text-emerald-500 border-emerald-500/40" : "text-muted-foreground border-muted",
+              )}
+            >
+              <span className={cn("inline-block h-1.5 w-1.5 rounded-full", live.connected ? "bg-emerald-400" : "bg-muted-foreground")} />
+              {live.connected ? "live" : "reconnecting…"}
+            </span>
+          </h1>
           <p className="text-sm text-muted-foreground">
-            Persistent persona-scoped agents — own model, memory, and permissions; run outside the main conversation.
+            Persistent persona-scoped agents — own model, memory, and permissions; run outside the main conversation. Deliverables land in their outputs zone.
           </p>
         </div>
         <div className="flex gap-2">
           <Button variant="outline" size="sm" onClick={() => void refresh()}><RefreshCw className="h-4 w-4" /> Refresh</Button>
-          <Button size="sm" onClick={() => setCreating(true)}><Plus className="h-4 w-4" /> Onboard bot</Button>
+          <Button size="sm" onClick={() => { setNewInFleet("solo"); setWizardOpen(true); }}><Plus className="h-4 w-4" /> Onboard bot</Button>
         </div>
       </div>
 
-      {error && (
-        <div className="rounded-lg border border-destructive/30 bg-destructive/10 px-4 py-2 text-sm text-destructive">{error}</div>
+      {liveBanner && (
+        <div className="rounded-lg border border-primary/40 bg-primary/10 px-4 py-2 text-sm flex items-center gap-2">
+          <Package className="h-4 w-4" /> <b>Delivered:</b> {liveBanner}
+        </div>
       )}
 
       {!available && (
@@ -140,162 +188,53 @@ export function BotsPage() {
         </CardContent></Card>
       )}
 
-      {loading ? (
-        <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
-          {[0, 1, 2].map(i => <Skeleton key={i} className="h-28" />)}
-        </div>
-      ) : botsList.length === 0 ? (
-        <Card><CardContent className="py-8 text-center text-muted-foreground">
-          No bots configured yet. Onboard one to get started.
-        </CardContent></Card>
-      ) : (
-        <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
-          {botsList.map((bot, i) => (
-            <motion.div key={bot.id} custom={i} variants={fadeUp} initial="hidden" animate="visible">
-              <Card
-                className="cursor-pointer transition-colors hover:border-primary/50"
-                onClick={() => void openDetail(bot.id)}
-              >
-                <CardHeader className="pb-2">
-                  <div className="flex items-center justify-between">
-                    <CardTitle className="flex items-center gap-2 text-base">
-                      <Bot className="h-4 w-4" /> {bot.name}
-                    </CardTitle>
-                    <Badge variant="secondary" className={STATE_STYLES[bot.state]?.className}>
-                      {STATE_STYLES[bot.state]?.label ?? bot.state}
-                    </Badge>
-                  </div>
-                </CardHeader>
-                <CardContent className="space-y-2 text-sm">
-                  {bot.activity && <p className="text-muted-foreground truncate">↳ {bot.activity}</p>}
-                  {bot.needsYou && (
-                    <p className="flex items-center gap-1 text-yellow-500"><AlertTriangle className="h-3.5 w-3.5" /> Needs you — see DLQ</p>
-                  )}
-                  {bot.lastRunAt && (
-                    <p className="text-muted-foreground">Last run {formatDate(bot.lastRunAt)} · {bot.lastRunState}</p>
-                  )}
-                </CardContent>
-              </Card>
-            </motion.div>
-          ))}
-        </div>
+      <Tabs defaultValue="fleet">
+        <TabsList>
+          <TabsTrigger value="fleet">Fleet</TabsTrigger>
+          <TabsTrigger value="outputs">
+            <Package className="h-3.5 w-3.5 mr-1" /> Deliverables
+          </TabsTrigger>
+        </TabsList>
+
+        <TabsContent value="fleet" className="mt-4">
+          {loading ? (
+            <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
+              {[0, 1, 2].map((i) => <div key={i} className="animate-pulse rounded-lg bg-muted h-28" />)}
+            </div>
+          ) : !available || botsList.length === 0 ? (
+            <Card><CardContent className="py-8 text-center text-muted-foreground">
+              No bots configured yet. Onboard one to get started.
+            </CardContent></Card>
+          ) : (
+            <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
+              {grouped.leads.map((_, i) => <BotCard key={i} id={grouped.leads[i].id} idx={i} />)}
+              {grouped.solos.map((b, i) => <BotCard key={b.id} id={b.id} idx={i} />)}
+            </div>
+          )}
+        </TabsContent>
+
+        <TabsContent value="outputs" className="mt-4">
+          <DeliverablesList botNames={botNames} lastDelivery={live.lastDelivery} />
+        </TabsContent>
+      </Tabs>
+
+      {openBotDetail && (
+        <BotDetail
+          bot={detail}
+          live={live}
+          open={!!selectedId}
+          onOpenChange={(o) => { if (!o) { setSelectedId(null); setDetail(null); } }}
+          onChanged={() => { void refresh(); if (selectedId) void openBot(selectedId); }}
+        />
       )}
 
-      {/* Detail dialog: config, send, journal, DLQ */}
-      <Dialog open={!!selected} onOpenChange={(o) => { if (!o) { setSelected(null); setDetail(null); } }}>
-        <DialogContent className="max-h-[80vh] max-w-2xl overflow-y-auto">
-          {detail && (
-            <>
-              <DialogHeader>
-                <DialogTitle className="flex items-center gap-2">
-                  <Bot className="h-5 w-5" /> {detail.bot.name} <span className="text-muted-foreground text-sm">({detail.bot.id})</span>
-                </DialogTitle>
-                <DialogDescription>{detail.bot.description ?? "Mercury bot"}</DialogDescription>
-              </DialogHeader>
-              <div className="space-y-4">
-                <div className="flex flex-wrap gap-2 text-sm">
-                  <Badge variant="secondary">model: {detail.bot.model?.provider ?? "inherit"}{detail.bot.model?.model ? `:${detail.bot.model.model}` : ""}</Badge>
-                  <Badge variant="secondary">memory: {detail.bot.memory?.scope ?? "own"}</Badge>
-                  {detail.bot.autonomy?.dailyTokenBudget && <Badge variant="secondary">budget: {detail.bot.autonomy.dailyTokenBudget}/day</Badge>}
-                  {(detail.bot.comms?.canMessage?.length ?? 0) > 0 && <Badge variant="secondary">→ {detail.bot.comms!.canMessage!.join(", ")}</Badge>}
-                </div>
-
-                {(detail.bot.schedules?.length ?? 0) > 0 && (
-                  <div className="text-sm">
-                    <p className="font-medium mb-1">Routines</p>
-                    {detail.bot.schedules!.map(s => (
-                      <p key={s.name} className="text-muted-foreground">⏰ {s.name} — <code>{s.cron}</code></p>
-                    ))}
-                  </div>
-                )}
-
-                <div className="space-y-2">
-                  <Textarea
-                    placeholder={`Message ${detail.bot.name}… (runs outside the main conversation)`}
-                    value={message}
-                    onChange={(e) => setMessage(e.target.value)}
-                    rows={3}
-                  />
-                  <div className="flex gap-2">
-                    <Button size="sm" onClick={() => void sendMessage()} disabled={!message.trim()}>
-                      <Send className="h-3.5 w-3.5" /> Send
-                    </Button>
-                    <Button
-                      size="sm" variant="outline"
-                      onClick={async () => { await (detail.bot.enabled ? api.bots.disable(detail.bot.id) : api.bots.enable(detail.bot.id)); void openDetail(detail.bot.id); void refresh(); }}
-                    >
-                      {detail.bot.enabled ? <><Pause className="h-3.5 w-3.5" /> Disable</> : <><Play className="h-3.5 w-3.5" /> Enable</>}
-                    </Button>
-                    <Button size="sm" variant="outline" onClick={async () => { await api.bots.stop(detail.bot.id); void openDetail(detail.bot.id); }}>
-                      Stop
-                    </Button>
-                  </div>
-                </div>
-
-                <div>
-                  <p className="font-medium text-sm mb-2">Recent runs</p>
-                  {detail.journal.length === 0 ? (
-                    <p className="text-sm text-muted-foreground">No runs yet.</p>
-                  ) : (
-                    <div className="space-y-1.5">
-                      {[...detail.journal].reverse().map(r => (
-                        <div key={r.runId} className="flex items-center gap-2 text-sm">
-                          <Badge variant="secondary" className={
-                            r.state === "completed" ? "bg-emerald-500/15 text-emerald-500"
-                            : r.state === "failed" ? "bg-red-500/15 text-red-500"
-                            : "bg-yellow-500/15 text-yellow-500"
-                          }>{r.state}</Badge>
-                          <span className="text-muted-foreground">{r.trigger}</span>
-                          <span>{(r.durationMs / 1000).toFixed(1)}s</span>
-                          <span className="text-muted-foreground">{r.tokensIn + r.tokensOut} tok</span>
-                          {r.reasonCode && <span className="text-red-500">[{r.reasonCode}]</span>}
-                        </div>
-                      ))}
-                    </div>
-                  )}
-                </div>
-
-                {dlq.length > 0 && (
-                  <div>
-                    <p className="font-medium text-sm mb-2 flex items-center gap-1"><AlertTriangle className="h-4 w-4 text-yellow-500" /> Dead-lettered jobs</p>
-                    <div className="space-y-1.5">
-                      {dlq.map(e => (
-                        <div key={e.id} className="flex items-center gap-2 text-sm">
-                          <span className="text-muted-foreground font-mono">{e.id}</span>
-                          <span className="text-red-500">[{e.reasonCode ?? "unknown"}]</span>
-                          <span className="text-muted-foreground truncate flex-1">{e.prompt.slice(0, 60)}</span>
-                          <Button size="sm" variant="ghost" onClick={() => void replay(e)}><RotateCw className="h-3.5 w-3.5" /> Replay</Button>
-                        </div>
-                      ))}
-                    </div>
-                  </div>
-                )}
-              </div>
-            </>
-          )}
-        </DialogContent>
-      </Dialog>
-
-      {/* Onboard dialog */}
-      <Dialog open={creating} onOpenChange={setCreating}>
-        <DialogContent className="max-w-md">
-          <DialogHeader>
-            <DialogTitle>Onboard a bot</DialogTitle>
-            <DialogDescription>
-              Fail-closed defaults: dangerous tools denied, memory scope own, only its own directory writable. Refine in the profile files afterwards.
-            </DialogDescription>
-          </DialogHeader>
-          <div className="space-y-3">
-            <Input placeholder="id (lowercase, e.g. researcher)" value={newId} onChange={e => setNewId(e.target.value)} />
-            <Input placeholder="Name (e.g. Research)" value={newName} onChange={e => setNewName(e.target.value)} />
-            <Input placeholder="Description (optional)" value={newDescription} onChange={e => setNewDescription(e.target.value)} />
-          </div>
-          <DialogFooter>
-            <Button variant="outline" onClick={() => setCreating(false)}>Cancel</Button>
-            <Button onClick={() => void createBot()} disabled={!newId || !newName}><Trash2 className="hidden" /> Create</Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+      <OnboardWizard
+        open={wizardOpen}
+        onOpenChange={setWizardOpen}
+        leads={grouped.leads.map((l) => ({ id: l.id, name: l.name } as BotManifest))}
+        crewAsLeadId={newInFleet === "solo" ? undefined : newInFleet.leadId}
+        onCreated={() => void refresh()}
+      />
     </div>
   );
 }

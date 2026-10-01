@@ -1,7 +1,7 @@
 import { cpus } from 'node:os';
 import { randomUUID } from 'node:crypto';
 import { basename, extname, isAbsolute, relative, resolve, join } from 'node:path';
-import { copyFileSync, existsSync, mkdirSync, renameSync, statSync, unlinkSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync } from 'node:fs';
 import type { Tool } from 'ai';
 import type { MercuryConfig } from '../utils/config.js';
 import type { ProviderRegistry } from '../providers/registry.js';
@@ -1287,16 +1287,21 @@ export class BotManager {
     }
     const outputsDir = join(this.store.outputsDir(), botId);
     mkdirSync(outputsDir, { recursive: true });
-    const stem = basename(candidate, extname(candidate));
-    const extMatch = extname(candidate);
-    const requested = (rename || stem)
+    // Default name keeps the FULL basename — the extension is part of the
+    // artifact (a report.md stayed .md; the stem-only default silently
+    // stripped it). `saveAs` is honored as written; dedupe inserts the -N
+    // before whatever extension remains.
+    const ext = extname(rename || basename(candidate));
+    const stem = basename(rename || basename(candidate), ext);
+    const requested = (stem)
       .replace(/[ <>:"/\\|?*]/g, '-')
       .replace(/-+/g, '-')
       .replace(/^-|-$/g, '')
       .slice(0, 120) || 'output';
-    let dest = join(outputsDir, requested);
+    const finalExt = ext;
+    let dest = join(outputsDir, `${requested}${finalExt}`);
     for (let i = 2; existsSync(dest); i++) {
-      dest = join(outputsDir, `${requested}-${i}${extMatch}`);
+      dest = join(outputsDir, `${requested}-${i}${finalExt}`);
     }
     try {
       renameSync(candidate, dest);
@@ -1310,7 +1315,73 @@ export class BotManager {
       }
     }
     logger.info({ botId, dest }, 'Bot delivered a final artifact');
+    // The deliverable moment is the event the owner reacts to: broadcast it
+    // on the activity bus so the CLI bot-thread region, the /bots roster and
+    // the web SSE feed all announce the artifact live.
+    this.emitBotActivity({
+      botId,
+      jobId: '',
+      kind: 'tool',
+      label: `Delivered ${basename(dest, extname(dest))}${extname(dest)}`,
+      detail: dest,
+      stepIndex: 0,
+      elapsedMs: 0,
+      status: 'done',
+    });
     return { accepted: true, path: dest };
+  }
+
+  /**
+   * Owner-curated deliverables (bot_deliver → outputs/<botId>/). Read-only
+   * views for the web cockpit: list with newest first; read (text preview,
+   * 64KB cap) and deletes are containment-guarded — nothing outside the
+   * bot's own outputs zone is addressable.
+   */
+  listDeliverables(botId?: string): Array<{ botId: string; name: string; bytes: number; mtimeMs: number }> {
+    const root = this.store.outputsDir();
+    if (!existsSync(root)) return [];
+    const bots = botId
+      ? [botId]
+      : readdirSync(root, { withFileTypes: true }).filter(e => e.isDirectory()).map(e => e.name);
+    const out: Array<{ botId: string; name: string; bytes: number; mtimeMs: number }> = [];
+    for (const bot of bots) {
+      const dir = join(root, bot);
+      if (!existsSync(dir)) continue;
+      for (const name of readdirSync(dir, { withFileTypes: true }).filter(e => e.isFile()).map(e => e.name)) {
+        try {
+          const stat = statSync(join(dir, name));
+          out.push({ botId: bot, name, bytes: stat.size, mtimeMs: stat.mtimeMs });
+        } catch { /* raced a concurrent delete — skip */ }
+      }
+    }
+    return out.sort((a, b) => b.mtimeMs - a.mtimeMs);
+  }
+
+  /** Contained path resolution for deliverable access; null when it escapes. Public for the web API's byte-exact download route. */
+  deliverableFile(botId: string, name: string): string | null {
+    const dir = join(this.store.outputsDir(), botId);
+    const candidate = resolve(dir, name);
+    const rel = relative(dir, candidate);
+    if (rel === '' || rel.startsWith('..') || isAbsolute(rel)) return null;
+    return candidate;
+  }
+
+  readDeliverable(botId: string, name: string, maxBytes = 64 * 1024): { found: boolean; preview?: string; truncated?: boolean } {
+    const file = this.deliverableFile(botId, name);
+    if (!file || !existsSync(file)) return { found: false };
+    const buf = readFileSync(file);
+    return {
+      found: true,
+      preview: buf.subarray(0, maxBytes).toString('utf-8'),
+      truncated: buf.length > maxBytes,
+    };
+  }
+
+  deleteDeliverable(botId: string, name: string): { ok: boolean } {
+    const file = this.deliverableFile(botId, name);
+    if (!file || !existsSync(file)) return { ok: false };
+    unlinkSync(file);
+    return { ok: true };
   }
 
   /**
