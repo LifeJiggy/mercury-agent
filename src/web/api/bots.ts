@@ -1,6 +1,9 @@
 import { Hono } from 'hono';
+import { readFileSync } from 'node:fs';
 import type { BotManager } from '../../bots/bot-manager.js';
 import type { BotManifest } from '../../bots/types.js';
+import { PERMISSION_TIERS, tierPermissionsFile, isPermissionTier, type PermissionTier } from '../../bots/permission-tiers.js';
+import { buildBotBundle, importBotBundle } from '../../bots/bundle.js';
 
 const app = new Hono();
 
@@ -30,9 +33,12 @@ app.post('/api/bots', async (c: any) => {
     return c.json({ error: 'Bots not available' }, 400);
   }
   const body = await c.req.json().catch(() => null) as
-    { id?: string; name?: string; description?: string; persona?: string; manifest?: Partial<BotManifest> } | null;
+    { id?: string; name?: string; description?: string; persona?: string; tier?: string; manifest?: Partial<BotManifest> } | null;
   if (!body?.id || !body?.name) {
     return c.json({ error: 'id and name are required' }, 400);
+  }
+  if (body.tier !== undefined && !isPermissionTier(body.tier)) {
+    return c.json({ error: `Unknown permission tier: ${body.tier}` }, 400);
   }
   try {
     const manifest = botManager.store.create({
@@ -42,10 +48,86 @@ app.post('/api/bots', async (c: any) => {
       persona: body.persona,
       manifest: body.manifest,
     });
+    // Tiers execute (§2.5): the chosen tier writes the full permissions.yaml
+    // — tool gate AND path scopes. A tier choice that only flipped the tool
+    // gate left bots unable to act.
+    if (body.tier) {
+      botManager.store.writePermissions(manifest.id, tierPermissionsFile(body.tier as PermissionTier));
+    }
     botManager.invalidateRuntime(manifest.id);
     return c.json({ bot: manifest }, 201);
   } catch (err: any) {
     return c.json({ error: err?.message ?? 'Failed to create bot' }, 400);
+  }
+});
+
+// ── Real-time fleet feed (SSE) ──────────────────────────────────────────────
+// Mirrors the Kanban events route: one connection per browser tab, roster
+// snapshot on connect, live bot_activity + bot_deliverable events from the
+// in-process activity bus, keepalive, cleanup on abort. The web dashboard
+// rides the same bus as the CLI's bot-thread live region.
+app.get('/api/bots/events', (c: any) => {
+  const bm = botManager;
+  if (!bm) return c.json({ error: 'Bots not available' }, 400);
+  const stream = new ReadableStream({
+    start(controller) {
+      const encoder = new TextEncoder();
+      const controllerRef = controller;
+      const send = (event: string, data: unknown) => {
+        try {
+          controllerRef.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`));
+        } catch {
+          // client disconnected — abort handler cleans up
+        }
+      };
+
+      // Snapshot on connect so the UI paints immediately (no first-event wait).
+      send('bot_roster', { bots: bm.getStatusSummaries(), queue: bm.queue.counts() });
+
+      const unsubscribe = bm.onBotActivity((ev) => send('bot_activity', ev));
+
+      const keepalive = setInterval(() => {
+        try { controller.enqueue(encoder.encode(': keepalive\n\n')); } catch { clearInterval(keepalive); }
+      }, 15000);
+
+      c.req.raw.signal?.addEventListener('abort', () => {
+        clearInterval(keepalive);
+        unsubscribe();
+      });
+    },
+    cancel() {},
+  });
+  return new Response(stream, {
+    headers: { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' },
+  });
+});
+
+// ── Deliverables (owner-curated outputs zone — bot_deliver) ────────────────
+// Fleet-wide inbox, newest first.
+app.get('/api/bots/outputs', (c: any) => {
+  if (!botManager) return c.json({ error: 'Bots not available' }, 400);
+  return c.json({ outputs: botManager.listDeliverables() });
+});
+
+// ── Tier catalog for the onboarding wizard ──────────────────────────────────
+app.get('/api/bots/tiers', (c: any) => {
+  const tiers = Object.entries(PERMISSION_TIERS).map(([id, t]) => ({
+    id, label: t.label, description: t.description, deny: t.deny,
+  }));
+  return c.json({ tiers });
+});
+
+// Import a shared bundle (bots start disabled — review before enabling).
+app.post('/api/bots/import', async (c: any) => {
+  if (!botManager) return c.json({ error: 'Bots not available' }, 400);
+  const bundle = await c.req.json().catch(() => null) as any;
+  if (!bundle) return c.json({ error: 'Invalid JSON body' }, 400);
+  try {
+    const report = importBotBundle(botManager.store, bundle, c.req.query('overwrite') === '1' ? { overwrite: true } : {});
+    for (const created of report.created) botManager.invalidateRuntime(created);
+    return c.json({ report });
+  } catch (err: any) {
+    return c.json({ error: err?.message ?? 'Invalid bundle' }, 400);
   }
 });
 
@@ -195,11 +277,139 @@ app.get('/api/bots/:id/crew', (c: any) => {
 app.post('/api/bots/:id/crew', async (c: any) => {
   if (!botManager) return c.json({ error: 'Bots not available' }, 400);
   const id = c.req.param('id');
-  const body = await c.req.json().catch(() => null) as { id?: string; name?: string; description?: string; persona?: string } | null;
+  const body = await c.req.json().catch(() => null) as { id?: string; name?: string; description?: string; persona?: string; tier?: string } | null;
   if (!body?.id || !body?.name) return c.json({ error: 'id and name are required' }, 400);
+  if (body.tier !== undefined && !isPermissionTier(body.tier)) {
+    return c.json({ error: `Unknown permission tier: ${body.tier}` }, 400);
+  }
   const result = botManager.addCrew(id, { id: body.id, name: body.name, description: body.description, persona: body.persona });
   if (!result.ok) return c.json({ error: result.error }, 400);
+  // A tier choice overrides the crew's verbatim lead inheritance (§2.5:
+  // inherit-unless-edited — an explicit tier IS an edit).
+  if (body.tier) {
+    botManager.store.writePermissions(result.manifest.id, tierPermissionsFile(body.tier as PermissionTier));
+  }
   return c.json({ bot: result.manifest }, 201);
+});
+
+// Persona (character file) — read + write
+app.get('/api/bots/:id/persona', (c: any) => {
+  if (!botManager) return c.json({ error: 'Bots not available' }, 400);
+  const id = c.req.param('id');
+  if (!botManager.store.exists(id)) return c.json({ error: 'Bot not found' }, 404);
+  return c.json({ persona: botManager.store.readPersona(id) });
+});
+
+app.put('/api/bots/:id/persona', async (c: any) => {
+  if (!botManager) return c.json({ error: 'Bots not available' }, 400);
+  const body = await c.req.json().catch(() => null) as { persona?: string } | null;
+  if (typeof body?.persona !== 'string' || !body.persona.trim()) {
+    return c.json({ error: 'persona (non-empty string) is required' }, 400);
+  }
+  try {
+    botManager.store.writePersona(c.req.param('id'), body.persona);
+    botManager.invalidateRuntime(c.req.param('id'));
+    return c.json({ ok: true });
+  } catch (err: any) {
+    return c.json({ error: err?.message ?? 'Bot not found' }, 404);
+  }
+});
+
+// Permissions.yaml — the single source of truth (tool gate, path scopes,
+// shell lists). PUT with a tier applies the tier wholesale; PUT with a
+// full document is the "custom" path. Fleet inheritance: a crew bot shows
+// its inherited file; writing creates its own explicit copy.
+app.get('/api/bots/:id/permissions', (c: any) => {
+  if (!botManager) return c.json({ error: 'Bots not available' }, 400);
+  const id = c.req.param('id');
+  if (!botManager.store.exists(id)) return c.json({ error: 'Bot not found' }, 404);
+  return c.json({ permissions: botManager.store.readPermissions(id) });
+});
+
+app.put('/api/bots/:id/permissions', async (c: any) => {
+  if (!botManager) return c.json({ error: 'Bots not available' }, 400);
+  const id = c.req.param('id');
+  if (!botManager.store.exists(id)) return c.json({ error: 'Bot not found' }, 404);
+  const body = await c.req.json().catch(() => null) as { tier?: string; permissions?: any } | null;
+  if (!body) return c.json({ error: 'Invalid JSON body' }, 400);
+  try {
+    if (body.tier !== undefined) {
+      if (!isPermissionTier(body.tier)) return c.json({ error: `Unknown permission tier: ${body.tier}` }, 400);
+      botManager.store.writePermissions(id, tierPermissionsFile(body.tier as PermissionTier));
+    } else if (body.permissions !== undefined) {
+      botManager.store.writePermissions(id, body.permissions);
+    } else {
+      return c.json({ error: 'Supply tier or permissions' }, 400);
+    }
+    botManager.invalidateRuntime(id);
+    return c.json({ permissions: botManager.store.readPermissions(id) });
+  } catch (err: any) {
+    return c.json({ error: err?.message ?? 'Invalid permissions document' }, 400);
+  }
+});
+
+// Shareable bundle (identity + persona + permissions + skills; a lead's
+// bundle carries its whole crew). Delivered as an attachment download.
+app.get('/api/bots/:id/bundle', (c: any) => {
+  if (!botManager) return c.json({ error: 'Bots not available' }, 400);
+  const id = c.req.param('id');
+  try {
+    const bundle = buildBotBundle(botManager.store, id, { withSkills: true });
+    const json = JSON.stringify(bundle, null, 2);
+    return new Response(json, {
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Disposition': `attachment; filename="${id}-bundle.json"`,
+      },
+    });
+  } catch (err: any) {
+    return c.json({ error: err?.message ?? 'Failed to build bundle' }, 400);
+  }
+});
+
+// This bot's deliverables
+app.get('/api/bots/:id/outputs', (c: any) => {
+  if (!botManager) return c.json({ error: 'Bots not available' }, 400);
+  if (!botManager.store.exists(c.req.param('id'))) return c.json({ error: 'Bot not found' }, 404);
+  return c.json({ outputs: botManager.listDeliverables(c.req.param('id')) });
+});
+
+// Text preview of a deliverable (≤64KB)
+app.get('/api/bots/:id/outputs/:name/preview', (c: any) => {
+  if (!botManager) return c.json({ error: 'Bots not available' }, 400);
+  const result = botManager.readDeliverable(c.req.param('id'), c.req.param('name'));
+  if (!result.found) return c.json({ error: 'Deliverable not found' }, 404);
+  return c.json({ preview: result.preview ?? '', truncated: !!result.truncated });
+});
+
+// Byte-exact download of a deliverable (content-type guessed from ext).
+app.get('/api/bots/:id/outputs/:name/download', (c: any) => {
+  if (!botManager) return c.json({ error: 'Bots not available' }, 400);
+  const id = c.req.param('id');
+  const name = c.req.param('name');
+  const file = botManager.deliverableFile(id, name);
+  if (!file) return c.json({ error: 'Deliverable not found' }, 404);
+  try {
+    const buf = readFileSync(file);
+    const ext = (name.split('.').pop() ?? '').toLowerCase();
+    const mime = MIME_BY_EXT[ext] ?? 'application/octet-stream';
+    return new Response(new Uint8Array(buf), {
+      headers: {
+        'Content-Type': mime,
+        'Content-Disposition': `attachment; filename="${name}"`,
+      },
+    });
+  } catch {
+    return c.json({ error: 'Deliverable not found' }, 404);
+  }
+});
+
+// Owner curation: remove a deliverable
+app.delete('/api/bots/:id/outputs/:name', (c: any) => {
+  if (!botManager) return c.json({ error: 'Bots not available' }, 400);
+  const result = botManager.deleteDeliverable(c.req.param('id'), c.req.param('name'));
+  if (!result.ok) return c.json({ error: 'Deliverable not found' }, 404);
+  return c.json({ ok: true });
 });
 
 function haltedMessage(result: { halted: boolean; heldJobs: number }): string {
@@ -264,5 +474,12 @@ app.post('/api/bots/:id/hooks/:hook', async (c: any) => {
 function contentTypeIsJson(value: string | undefined): boolean {
   return (value ?? '').split(';')[0].trim().toLowerCase() === 'application/json';
 }
+
+const MIME_BY_EXT: Record<string, string> = {
+  txt: 'text/plain', md: 'text/markdown', json: 'application/json', yaml: 'application/yaml', yml: 'application/yaml',
+  csv: 'text/csv', pdf: 'application/pdf', html: 'text/html', svg: 'image/svg+xml',
+  png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp',
+  zip: 'application/zip', tar: 'application/x-tar', gz: 'application/gzip',
+};
 
 export default app;

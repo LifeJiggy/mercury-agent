@@ -652,6 +652,9 @@ export interface BotStatus {
   lastRunAt?: number;
   lastRunState?: string;
   needsYou: boolean;
+  fleetRole?: "lead" | "crew";
+  parent?: string;
+  crewWorking?: number;
 }
 
 export interface BotManifest {
@@ -659,6 +662,8 @@ export interface BotManifest {
   name: string;
   description?: string;
   enabled: boolean;
+  fleetRole?: "lead" | "crew";
+  parent?: string;
   model?: { provider?: string; model?: string };
   memory?: { scope: string };
   comms?: { canMessage?: string[] };
@@ -676,6 +681,7 @@ export interface BotRunRecord {
   tokensIn: number;
   tokensOut: number;
   summary?: string;
+  error?: string;
   reasonCode?: string;
 }
 
@@ -686,6 +692,39 @@ export interface BotDlqEntry {
   prompt: string;
   attempts: number;
   reasonCode?: string;
+}
+
+export interface BotActivityEvent {
+  botId: string;
+  jobId: string;
+  kind: "turn-start" | "step" | "tool" | "turn-end";
+  label: string;
+  detail?: string;
+  stepIndex: number;
+  elapsedMs: number;
+  status?: "running" | "done" | "error";
+}
+
+export interface DeliverableInfo {
+  botId: string;
+  name: string;
+  bytes: number;
+  mtimeMs: number;
+}
+
+export interface BotTierInfo {
+  id: string;
+  label: string;
+  description: string;
+  deny: string[];
+}
+
+export interface BotPermissionsFile {
+  paths?: Array<{ scope: string; mode?: string; note?: string }>;
+  tools?: { allow?: string[]; deny?: string[] };
+  autoApproveCommands?: string[];
+  blockedCommands?: string[];
+  [key: string]: unknown;
 }
 
 export interface Skill {
@@ -857,6 +896,29 @@ const api = {
     replay: (id: string, jobId: string) => post<{ accepted: boolean }>(`/api/bots/${id}/replay/${jobId}`),
     storage: () =>
       get<{ usage: Array<{ id: string; bytes: number; journalBytes: number }>; queue: { pending: number; claimed: number; dlq: number } }>("/api/bots-storage"),
+    // ── Cockpit additions ──
+    tiers: () => get<{ tiers: BotTierInfo[] }>("/api/bots/tiers"),
+    createFull: (body: { id: string; name: string; description?: string; persona?: string; tier: string; manifest?: Partial<BotManifest> }) =>
+      post<{ bot: BotManifest }>("/api/bots", body),
+    addCrewFull: (leadId: string, body: { id: string; name: string; description?: string; persona?: string; tier?: string }) =>
+      post<{ bot: BotManifest }>(`/api/bots/${leadId}/crew`, body),
+    crew: (id: string) =>
+      get<{ lead: BotManifest; crew: BotManifest[]; maxCrew: number }>(`/api/bots/${id}/crew`),
+    persona: (id: string) => get<{ persona: string }>(`/api/bots/${id}/persona`),
+    setPersona: (id: string, persona: string) => put<{ ok: boolean }>(`/api/bots/${id}/persona`, { persona }),
+    permissions: (id: string) => get<{ permissions: BotPermissionsFile }>(`/api/bots/${id}/permissions`),
+    setPermissions: (id: string, body: { tier?: string; permissions?: BotPermissionsFile }) =>
+      put<{ permissions: BotPermissionsFile }>(`/api/bots/${id}/permissions`, body),
+    start: (id: string) => post<{ ok: boolean; resumed: number; message: string }>(`/api/bots/${id}/start`),
+    run: (id: string, routine?: string) => post<{ accepted: boolean; jobId?: string; reasonCode?: string }>(`/api/bots/${id}/run`, { routine }),
+    outputs: () => get<{ outputs: DeliverableInfo[] }>("/api/bots/outputs"),
+    botOutputs: (id: string) => get<{ outputs: DeliverableInfo[] }>(`/api/bots/${id}/outputs`),
+    outputPreview: (id: string, name: string) =>
+      get<{ preview: string; truncated: boolean }>(`/api/bots/${id}/outputs/${encodeURIComponent(name)}/preview`),
+    outputDownloadUrl: (id: string, name: string) => `/api/bots/${id}/outputs/${encodeURIComponent(name)}/download`,
+    deleteOutput: (id: string, name: string) => del<{ ok: boolean }>(`/api/bots/${id}/outputs/${encodeURIComponent(name)}`),
+    bundleUrl: (id: string) => `/api/bots/${id}/bundle`,
+    importBundle: (bundle: unknown) => post<{ report: { created: string[]; skipped: string[] } }>("/api/bots/import?overwrite=0", bundle),
   },
 };
 
