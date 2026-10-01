@@ -13,6 +13,7 @@ import { BotStore, BOT_JOURNAL_FILENAME, BOT_PERMISSIONS_FILENAME, isValidCronEx
 import { BotJournal } from './journal.js';
 import { BotQueue, idempotencyKeyFor, LEASE_SECONDS, type DurableBotJob } from './queue.js';
 import { sweepSharedSandbox } from './retention.js';
+import { proposeCrew } from './fleet-onboarding.js';
 import { createBotCapabilityRegistry, filterBotTools } from './registry-factory.js';
 import { createBotSendTool } from './tools/bot-send.js';
 import { createBotDeliverTool } from './tools/bot-deliver.js';
@@ -817,6 +818,55 @@ export class BotManager {
    * Persona refinement (builder) is the caller's concern (async provider
    * call); addCrew writes the persona text it is given.
    */
+  /** Promote a bot to fleet lead (the cockpit's "lead a fleet" paths). Idempotent. */
+  promoteLead(botId: string): { ok: boolean } {
+    const manifest = this.store.get(botId);
+    if (!manifest) return { ok: false };
+    if (manifest.fleetRole !== 'lead') {
+      this.store.update(botId, m => { m.fleetRole = 'lead'; });
+      this.invalidateRuntime(botId);
+      logger.info({ botId }, 'Bot promoted to fleet lead');
+    }
+    return { ok: true };
+  }
+
+  /**
+   * Fleet auto-build (the TUI onboarding's "auto" path, shared with the web
+   * cockpit): one LLM call proposes 3-5 matched specialists, each created
+   * through the standard addCrew path. DETACHED — the caller hears 202
+   * immediately; per-member progress rides `hooks`, and failures degrade to
+   * "lead with an empty crew" guidance, never an error state.
+   */
+  autoCrew(botId: string, hooks: { onMember?: (name: string, id: string) => void; onError?: (msg: string) => void; onDone?: (created: number) => void } = {}): void {
+    void (async () => {
+      try {
+        const manifest = this.store.get(botId);
+        if (!manifest) return;
+        if (manifest.fleetRole !== 'lead') this.promoteLead(botId);
+        const persona = this.store.readPersona(botId);
+        const leadDescription = manifest.description ?? '';
+        const proposals = await proposeCrew(manifest.name, leadDescription, persona, resolveProvider(this.providers, manifest), this.maxCrew());
+        if (proposals.length === 0) {
+          hooks.onError?.("Crew proposal unavailable (provider) — the lead has an empty crew. Add specialists yourself, or give the lead a task and tell it to hire its own crew (bot_spawn).");
+          return;
+        }
+        let created = 0;
+        for (const p of proposals) {
+          const result = this.addCrew(botId, p);
+          if (result.ok) {
+            created++;
+            hooks.onMember?.(p.name, result.manifest.id);
+          } else {
+            hooks.onError?.(`Crew member ${p.name} (${p.id}): ${result.error}`);
+          }
+        }
+        hooks.onDone?.(created);
+      } catch (err: any) {
+        hooks.onError?.(`Fleet auto-build failed: ${err?.message ?? err} — the lead has an empty crew; add specialists yourself later.`);
+      }
+    })();
+  }
+
   addCrew(leadId: string, spec: { id: string; name: string; description?: string; persona?: string }): { ok: true; manifest: BotManifest } | { ok: false; error: string } {
     const lead = this.store.get(leadId);
     if (!lead) return { ok: false, error: `No bot "${leadId}"` };

@@ -135,6 +135,25 @@ describe('web bots API — cockpit', () => {
     expect(after.outputs).toHaveLength(0);
   });
 
+  it('promote makes the bot a fleet lead (TUI-parity fleet semantics)', async () => {
+    store.create({ id: 'solo', name: 'Solo' });
+    const res = await app.request('/api/bots/solo/promote', { method: 'POST' });
+    expect(res.status).toBe(200);
+    expect(store.get('solo')?.fleetRole).toBe('lead');
+    // Idempotent — no error on a second promote
+    expect((await app.request('/api/bots/solo/promote', { method: 'POST' })).status).toBe(200);
+    expect((await app.request('/api/bots/ghost/promote', { method: 'POST' })).status).toBe(404);
+  });
+
+  it('autocrew accepts detached (202) and the degraded path leaves a lead with helpful guidance', async () => {
+    await app.request('/api/bots', { method: 'POST', body: JSON.stringify({ id: 'leadish', name: 'Lead', persona: '# persona for the fleet' }), headers: { 'Content-Type': 'application/json' } });
+    const res = await app.request('/api/bots/leadish/autocrew', { method: 'POST' });
+    expect(res.status).toBe(202);
+    // Detached — the proposal runs in the background; errors (unusable stub
+    // provider output) must degrade to guidance, never throw.
+    expect(store.get('leadish')?.fleetRole).toBe('lead');
+  });
+
   it('bundle export → import round-trip recreates the bot (disabled) and skips duplicates', async () => {
     await app.request('/api/bots', { method: 'POST', body: JSON.stringify({ id: 'crewbot', name: 'Crew', persona: '# persona', tier: 'builder' }), headers: { 'Content-Type': 'application/json' } });
 
