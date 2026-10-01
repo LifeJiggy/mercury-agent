@@ -66,6 +66,17 @@ app.post('/api/bots', async (c: any) => {
 // snapshot on connect, live bot_activity + bot_deliverable events from the
 // in-process activity bus, keepalive, cleanup on abort. The web dashboard
 // rides the same bus as the CLI's bot-thread live region.
+
+/** Open fleet-feed clients — roster mutations (add crew, promote, delete) push fresh snapshots. */
+const rosterSseClients = new Set<{ send: (event: string, data: unknown) => void }>();
+
+function broadcastRoster(): void {
+  if (!botManager) return;
+  for (const client of rosterSseClients) {
+    client.send('bot_roster', { bots: botManager.getStatusSummaries(), queue: botManager.queue.counts() });
+  }
+}
+
 app.get('/api/bots/events', (c: any) => {
   const bm = botManager;
   if (!bm) return c.json({ error: 'Bots not available' }, 400);
@@ -73,18 +84,19 @@ app.get('/api/bots/events', (c: any) => {
     start(controller) {
       const encoder = new TextEncoder();
       const controllerRef = controller;
-      const send = (event: string, data: unknown) => {
+      const client = { send: (event: string, data: unknown) => {
         try {
           controllerRef.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`));
         } catch {
           // client disconnected — abort handler cleans up
         }
-      };
+      } };
 
       // Snapshot on connect so the UI paints immediately (no first-event wait).
-      send('bot_roster', { bots: bm.getStatusSummaries(), queue: bm.queue.counts() });
+      client.send('bot_roster', { bots: bm.getStatusSummaries(), queue: bm.queue.counts() });
+      rosterSseClients.add(client);
 
-      const unsubscribe = bm.onBotActivity((ev) => send('bot_activity', ev));
+      const unsubscribe = bm.onBotActivity((ev) => client.send('bot_activity', ev));
 
       const keepalive = setInterval(() => {
         try { controller.enqueue(encoder.encode(': keepalive\n\n')); } catch { clearInterval(keepalive); }
@@ -93,6 +105,7 @@ app.get('/api/bots/events', (c: any) => {
       c.req.raw.signal?.addEventListener('abort', () => {
         clearInterval(keepalive);
         unsubscribe();
+        rosterSseClients.delete(client);
       });
     },
     cancel() {},
@@ -251,6 +264,39 @@ app.post('/api/bots/:id/start', (c: any) => {
   } catch (err: any) {
     return c.json({ error: err?.message }, 404);
   }
+});
+
+// Fleet semantics — the CLI parity paths (§2.5 / agent.ts offerFleetStep):
+// promote → lead; auto-build the matched crew detached with live roster
+// broadcasts (30-90s of LLM proposal — the dashboard shows crew cards the
+// moment each is created).
+app.post('/api/bots/:id/promote', (c: any) => {
+  if (!botManager) return c.json({ error: 'Bots not available' }, 400);
+  const id = c.req.param('id');
+  if (!botManager.store.exists(id)) return c.json({ error: 'Bot not found' }, 404);
+  const result = botManager.promoteLead(id);
+  if (!result.ok) return c.json({ error: 'Bot not found' }, 404);
+  broadcastRoster();
+  return c.json({ ok: true, message: 'Bot is now a fleet lead — it can add/retire crew itself (bot_spawn), or you add specialists from its Ops panel.' });
+});
+
+app.post('/api/bots/:id/autocrew', (c: any) => {
+  if (!botManager) return c.json({ error: 'Bots not available' }, 400);
+  const id = c.req.param('id');
+  if (!botManager.store.exists(id)) return c.json({ error: 'Bot not found' }, 404);
+  const bm = botManager;
+  bm.autoCrew(id, {
+    onMember: (_name, _memberId) => broadcastRoster(),
+    onError: (msg) => {
+      for (const client of rosterSseClients) client.send('bot_notice', { message: msg });
+      broadcastRoster();
+    },
+    onDone: () => {
+      for (const client of rosterSseClients) client.send('bot_notice', { message: `Fleet ready — ${bm.getStatusSummaries().filter((s) => s.parent === id).length} crew member(s) created. Dispatch tasks to any crew bot.` });
+      broadcastRoster();
+    },
+  });
+  return c.json({ accepted: true, status: 'building' }, 202);
 });
 
 // Fire a routine now (body { routine }) or send a bare wake turn

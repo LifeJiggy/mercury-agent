@@ -43,7 +43,7 @@ export function OnboardWizard({
   const [provider, setProvider] = useState<string>("inherit");
   const [model, setModel] = useState<string>("");
   const [budget, setBudget] = useState<string>("");
-  const [crewOf, setCrewOf] = useState<string>(crewAsLeadId ?? "solo");
+  const [fleet, setFleet] = useState<string>("solo");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -51,7 +51,7 @@ export function OnboardWizard({
     if (!open) return;
     setStep(0); setId(""); setName(""); setDescription(""); setPersona("");
     setTier("readonly"); setProvider("inherit"); setModel(""); setBudget("");
-    setCrewOf(crewAsLeadId ?? "solo"); setError(null);
+    setFleet("solo"); setError(null);
     api.bots.tiers().then(({ tiers }) => setTiers(tiers)).catch(() => setTiers([]));
   }, [open, crewAsLeadId]);
 
@@ -62,8 +62,8 @@ export function OnboardWizard({
       if (provider !== "inherit" || model) manifestPatch.model = { provider: provider === "inherit" ? undefined : provider, model: model || undefined };
       if (budget) manifestPatch.autonomy = { dailyTokenBudget: parseInt(budget, 10) };
       let bot: BotManifest;
-      if (crewOf !== "solo" && !crewAsLeadId) {
-        bot = (await api.bots.addCrewFull(crewOf.replace(/^lead:/, ""), {
+      if (fleet === "crewman" && crewAsLeadId) {
+        bot = (await api.bots.addCrewFull(crewAsLeadId, {
           id: id.toLowerCase(), name, description: description || undefined, persona: persona || undefined, tier,
         })).bot;
       } else {
@@ -72,6 +72,13 @@ export function OnboardWizard({
           tier, manifest: manifestPatch as never,
         });
         bot = res.bot;
+        if (fleet === "leadauto") {
+          // TUI parity: auto-build runs detached (30-90s LLM proposal); the
+          // roster broadcasts crew members live as they land.
+          void api.bots.autocrew(bot.id);
+        } else if (fleet === "leadman") {
+          void api.bots.promote(bot.id);
+        }
       }
       onCreated(bot);
       onOpenChange(false);
@@ -83,9 +90,7 @@ export function OnboardWizard({
   };
 
   const canNext = step === 0 ? !!id && !!name : step === 3 ? true : true;
-  const targetCrewLead = crewAsLeadId
-    ? crewAsLeadId
-    : crewOf !== "solo" ? crewOf.replace(/^lead:/, "") : null;
+  const targetCrewLead = crewAsLeadId ?? null;
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -163,37 +168,28 @@ export function OnboardWizard({
 
         {step === 3 && (
           <div className="space-y-3">
-            {crewAsLeadId ? (
-              <p className="text-sm text-muted-foreground flex items-center gap-1">
-                <Users className="h-4 w-4" /> Joining <Badge variant="secondary">{crewAsLeadId}</Badge> as crew — it inherits the lead's permissions unless you picked a tier.
-              </p>
-            ) : (
-              <>
-                <Card
-                  className={cn("cursor-pointer", crewOf === "solo" ? "border-primary" : "hover:border-primary/50")}
-                  onClick={() => setCrewOf("solo")}
-                >
-                  <CardContent className="py-3 flex items-center gap-2 text-sm">
-                    <Network className="h-4 w-4" /> Solo bot — independent
+            <p className="text-xs text-muted-foreground">Crew options match the TUI onboarding exactly.</p>
+            {[
+              { key: "solo", title: "Solo bot", desc: "Works independently — no sub-bots.", icon: Network },
+              crewAsLeadId
+                ? { key: "crewman", title: `Crew member of ${crewAsLeadId}`, desc: "Joins this lead; inherits the lead's permissions unless a tier above was picked.", icon: Users }
+                : { key: "leadauto", title: "Lead a fleet — auto-build the crew", desc: "Mercury proposes 3-5 matched specialists (an LLM call) and creates them in the background; they appear live on the roster.", icon: Crown },
+              { key: "leadman", title: "Lead a fleet — I'll add crew myself", desc: "Becomes a lead now (gets bot_spawn) — add specialists later from its Ops panel, or tell it to hire its own crew.", icon: Crown },
+            ].map((opt) => {
+              const Icon = opt.icon;
+              const active = fleet === opt.key;
+              return (
+                <Card key={opt.key} className={cn("cursor-pointer", active ? "border-primary" : "hover:border-primary/50")} onClick={() => setFleet(opt.key)}>
+                  <CardContent className="py-3 flex items-start gap-2 text-sm">
+                    <Icon className={cn("h-4 w-4 mt-0.5", opt.key.startsWith("lead") ? "text-yellow-500" : "")} />
+                    <span>
+                      <b>{opt.title}</b>
+                      <p className="text-xs text-muted-foreground">{opt.desc}</p>
+                    </span>
                   </CardContent>
                 </Card>
-                {leads.length > 0 && (
-                  <div className="space-y-1.5">
-                    {leads.map((lead) => (
-                      <Card
-                        key={lead.id}
-                        className={cn("cursor-pointer", crewOf === `lead:${lead.id}` ? "border-primary" : "hover:border-primary/50")}
-                        onClick={() => setCrewOf(`lead:${lead.id}`)}
-                      >
-                        <CardContent className="py-3 flex items-center gap-2 text-sm">
-                          <Crown className="h-4 w-4 text-yellow-500" /> Crew of <Badge variant="secondary">{lead.name}</Badge> ({lead.id})
-                        </CardContent>
-                      </Card>
-                    ))}
-                  </div>
-                )}
-              </>
-            )}
+              );
+            })}
             {error && <p className="text-sm text-destructive">{error}</p>}
           </div>
         )}
@@ -206,7 +202,7 @@ export function OnboardWizard({
             <Button onClick={() => setStep((s) => s + 1)} disabled={!canNext}>Next <ChevronRight className="h-4 w-4" /></Button>
           ) : (
             <Button onClick={() => void create()} disabled={busy}>
-              {busy ? "Creating…" : targetCrewLead ? "Add to fleet" : "Create bot"}
+              {busy ? "Creating…" : fleet === "leadman" ? "Create lead (add crew later)" : fleet === "leadauto" ? "Create & auto-build crew" : "Create bot"}
             </Button>
           )}
         </DialogFooter>

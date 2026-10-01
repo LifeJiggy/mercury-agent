@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import {
   Bot, Send, Pause, Play, Square, RotateCw, AlertTriangle, Crown, Shield,
-  Download, Package, Clock, Save, RefreshCw,
+  Download, Package, Clock, Save, RefreshCw, Users,
 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -9,6 +9,7 @@ import { Card, CardContent } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import {
   Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription,
 } from "@/components/ui/dialog";
@@ -52,6 +53,10 @@ export function BotDetail({
   const [perms, setPerms] = useState<BotPermissionsFile | null>(null);
   const [permText, setPermText] = useState("");
   const [permState, setPermState] = useState<"clean" | "dirty" | "saved" | "error">("clean");
+  const [crewId, setCrewId] = useState("");
+  const [crewName, setCrewName] = useState("");
+  const [crewPersona, setCrewPersona] = useState("");
+  const [crewTier, setCrewTier] = useState("inherit");
 
   const loadJournal = useCallback(async () => {
     if (!id) return;
@@ -263,6 +268,34 @@ export function BotDetail({
           </TabsContent>
 
           <TabsContent value="ops" className="space-y-4 mt-3">
+            {m.fleetRole === "lead" && (
+              <div className="space-y-1.5">
+                <p className="font-medium text-sm">Add crew member</p>
+                <p className="text-xs text-muted-foreground">Fail-closed specialist under this lead (gets the lead's permissions unless tiered here).</p>
+                <div className="grid grid-cols-2 gap-2">
+                  <Input placeholder="id (lowercase)" value={crewId} onChange={(e) => setCrewId(e.target.value)} />
+                  <Input placeholder="Name" value={crewName} onChange={(e) => setCrewName(e.target.value)} />
+                </div>
+                <Textarea className="text-xs" rows={2} placeholder="Persona (optional)" value={crewPersona} onChange={(e) => setCrewPersona(e.target.value)} />
+                <div className="flex items-center gap-2">
+                  <Button size="sm" variant="outline" onClick={async () => {
+                    if (!crewId || !crewName) return;
+                    await api.bots.addCrewFull(id, { id: crewId.toLowerCase(), name: crewName, persona: crewPersona || undefined, tier: crewTier });
+                    setCrewId(""); setCrewName(""); setCrewPersona("");
+                    onChanged();
+                  }} disabled={!crewId || !crewName}>
+                    <Users className="h-3.5 w-3.5" /> Add to crew
+                  </Button>
+                  <Select value={crewTier} onValueChange={setCrewTier}>
+                    <SelectTrigger className="h-9 w-40 text-xs"><SelectValue /></SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="inherit">inherit lead's permissions</SelectItem>
+                      {tiers.map((t) => <SelectItem key={t.id} value={t.id}>{t.label}</SelectItem>)}
+                    </SelectContent>
+                  </Select>
+                </div>
+              </div>
+            )}
             <div className="flex flex-wrap gap-2">
               <Button size="sm" variant="outline" onClick={async () => { await (m.enabled ? api.bots.disable(id) : api.bots.enable(id)); onChanged(); }}>
                 {m.enabled ? <><Pause className="h-3.5 w-3.5" /> Disable</> : <><Play className="h-3.5 w-3.5" /> Enable</>}

@@ -902,6 +902,8 @@ const api = {
       post<{ bot: BotManifest }>("/api/bots", body),
     addCrewFull: (leadId: string, body: { id: string; name: string; description?: string; persona?: string; tier?: string }) =>
       post<{ bot: BotManifest }>(`/api/bots/${leadId}/crew`, body),
+    promote: (id: string) => post<{ ok: boolean; message: string }>(`/api/bots/${id}/promote`),
+    autocrew: (id: string) => post<{ accepted: boolean; status: string }>(`/api/bots/${id}/autocrew`),
     crew: (id: string) =>
       get<{ lead: BotManifest; crew: BotManifest[]; maxCrew: number }>(`/api/bots/${id}/crew`),
     persona: (id: string) => get<{ persona: string }>(`/api/bots/${id}/persona`),
