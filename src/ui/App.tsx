@@ -1271,6 +1271,7 @@ function ChatBody({ state, maxDynamicLines }: { state: TuiState; maxDynamicLines
             botId={state.botChat.botId}
             botName={state.botChat.botName}
             botLiveActivity={state.botLiveActivity ?? {}}
+            botStreamTails={state.botStreamTails ?? {}}
             botRoster={state.botRoster}
           />
         )}
@@ -1329,6 +1330,7 @@ function CodingBody({ state, maxDynamicLines }: { state: TuiState; maxDynamicLin
             botId={state.botChat.botId}
             botName={state.botChat.botName}
             botLiveActivity={state.botLiveActivity ?? {}}
+            botStreamTails={state.botStreamTails ?? {}}
             botRoster={state.botRoster}
           />
         )}
@@ -2104,16 +2106,18 @@ function ThinkingIndicator({ agentName, steps, mode, liveActivity, thinkingPrevi
  * (CEO → Eng Lead → Backend). One self-ticker drives all rows; the rows
  * also refresh on every activity event.
  */
-function BotFleetLiveRegion({ botId, botName, botLiveActivity, botRoster }: {
+function BotFleetLiveRegion({ botId, botName, botLiveActivity, botStreamTails, botRoster }: {
   botId: string;
   botName: string;
   botLiveActivity: Record<string, LiveActivityState>;
+  botStreamTails: Record<string, { reasoning: string; text: string }>;
   botRoster: Array<{ id: string; name: string; state: string; fleetRole?: 'lead' | 'crew'; parent?: string }>;
 }) {
   const own = botLiveActivity[botId];
   const crew = botRoster.filter(b => b.parent === botId);
   const crewLive = crew.filter(c => botLiveActivity[c.id]);
-  if (!own && crewLive.length === 0) return null;
+  const ownTail = botStreamTails[botId];
+  if (!own && crewLive.length === 0 && !ownTail) return null;
 
   const frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
   const [tick, setTick] = React.useState(0);
@@ -2143,8 +2147,28 @@ function BotFleetLiveRegion({ botId, botName, botLiveActivity, botRoster }: {
     return out;
   };
 
+  // What the open bot is THINKING — the streaming tails from its turn's
+  // provider deltas (reasoning first, then any reply text being composed).
+  const tailSegment = (text: string, kind: 'reasoning' | 'reply'): React.ReactNode[] => {
+    const lines = text.replace(/\n+$/, '').split('\n').slice(-BOT_TAIL_MAX_ROWS);
+    return lines.map((line, idx) => (
+      <Box key={`${kind}:${idx}`} marginLeft={6}>
+        <Text dimColor={kind === 'reasoning'}>{kind === 'reasoning' ? `  ${line}` : line}</Text>
+      </Box>
+    ));
+  };
+  const openTail = ownTail ? [
+    ...tailSegment(ownTail.reasoning.trim(), 'reasoning'),
+    ...tailSegment(ownTail.text.trim(), 'reply'),
+  ] : [];
+
   return (
     <Box marginTop={1} marginLeft={4} flexDirection="column">
+      {openTail.length > 0 && (
+        <Box flexDirection="column" marginBottom={1}>
+          {openTail}
+        </Box>
+      )}
       {own && row(botId, botName, own.detail || own.phase, '')}
       {crewLive.length > 0 && <Text dimColor>  └ crew working ({crewLive.length}):</Text>}
       {renderCrewTree(botId, 1)}
@@ -2377,6 +2401,8 @@ function PlanProgressView({ steps }: { steps: PlanStep[] }): React.ReactNode {
 
 /** Live streaming tail budget: chars of the stream buffer rendered per frame. */
 const STREAM_TAIL_CHARS = 32 * 1024;
+/** Live bot-thinking tail cap (rows) in an open bot thread. */
+const BOT_TAIL_MAX_ROWS = 8;
 const STREAM_TAIL_MIN_LINES = 6;
 /** Absolute ceiling on live tail rows: bounds per-frame markdown + highlight
  * work regardless of terminal height. */

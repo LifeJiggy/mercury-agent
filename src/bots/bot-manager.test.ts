@@ -10,10 +10,11 @@ vi.mock('ai', async (importOriginal) => {
   return {
     ...actual,
     generateText: vi.fn(),
+    streamText: vi.fn(),
   };
 });
 
-import { generateText } from 'ai';
+import { generateText, streamText } from 'ai';
 import { BotManager } from './bot-manager.js';
 import { BotStore } from './store.js';
 import { createBotCapabilityRegistry, filterBotTools } from './registry-factory.js';
@@ -22,6 +23,39 @@ import { getDefaultConfig, type MercuryConfig } from '../utils/config.js';
 import type { BotManifest } from './types.js';
 
 const mockedGenerateText = vi.mocked(generateText);
+
+const mockedStreamText = vi.mocked(streamText);
+// Bot turns run on streamText (live thinking deltas). Tests script
+// generateText; this shim feeds THAT script through the streaming shape the
+// turn loop consumes: the (async, mocked) generateText call fires the same
+// step callbacks inside fullStream consumption, and its final result shows
+// up as the text/finishReason promises runBotTurn awaits.
+mockedStreamText.mockImplementation(((opts: any) => {
+  let final = { text: '', finishReason: 'stop', usage: {} };
+  let failed: unknown = null;
+  let resolveSettled: () => void = () => { };
+  const settled = new Promise<void>((r) => { resolveSettled = r; });
+  const gen: any = (generateText as any)(opts) || Promise.resolve(final);
+  const fullStream = (async function* () {
+    try {
+      final = await gen;
+    } catch (err) {
+      failed = err; // rethrown by the text/finishReason promises below
+    }
+    resolveSettled();
+  })();
+  // Resolve only after the underlying generateText settles; its promises
+  // must never reject unhandled (the fullStream consumer owns the error).
+  const once = async (pick: () => any) => { await settled; if (failed !== null) throw failed; return pick(); };
+  return {
+    fullStream,
+    text: once(() => final.text),
+    finishReason: once(() => final.finishReason),
+    // runBotTurn reads usage from onStepFinish — usage must never reject
+    // unhandled (Promise.all only consumes text/finishReason).
+    usage: once(() => final.usage).catch(() => ({})),
+  };
+}) as any);
 
 function scriptedProvider(name = 'stub') {
   return {
@@ -67,7 +101,8 @@ function seedBot(store: BotStore, id: string, manifestOverrides: Partial<BotMani
 }
 
 beforeEach(() => {
-  mockedGenerateText.mockReset();
+  mockedStreamText.mockClear();
+    mockedGenerateText.mockReset();
 });
 
 // Windows EBUSY guard: every BotManager owns an open SQLite queue handle;
@@ -842,6 +877,26 @@ describe('Bot fleets (lead + crew)', () => {
     store.create({ id: 'rival', name: 'Rival', manifest: { fleetRole: 'lead' } });
     manager.addCrew('rival', { id: 'guard', name: 'Guard' });
     expect(await retire.execute({ id: 'guard' }, {} as any)).toContain('is not crew');
+  });
+
+  it('bot_spawn does not block on persona refinement (refines in background)', async () => {
+    mockedStreamText.mockClear();
+    mockedGenerateText.mockReset();
+    // refinePersona runs provider.generateText (the scripted stub, 'ok') —
+    // the OBSERVABLE contract: the tool resolves to a created crew member
+    // even while the background refinement is still pending, and the raw
+    // persona is what lands at creation.
+    const refineSpy = vi.spyOn(manager as unknown as { schedulePersonaRefinement: (id: string, name: string, raw: string) => void }, 'schedulePersonaRefinement');
+    setupFleet();
+    const tools = runtimeFor('ceo').tools;
+    const spawn = tools.bot_spawn as any;
+    const out = await spawn.execute({ id: 'bgqa', name: 'BGQA', description: 'Background-checks spawn latency', persona: 'A meticulous background QA reviewer persona, checked for spawn latency.' }, {} as any);
+    expect(out).toContain('bgqa');
+    expect(refineSpy).toHaveBeenCalledWith('bgqa', 'BGQA', expect.stringContaining('QA reviewer'));
+    refineSpy.mockRestore();
+    // The raw persona was stored at creation; background refinement (later
+    // turns) overwrites via writePersona — buildTurn re-reads it each turn.
+    expect(store.readPersona('bgqa')).toContain('QA');
   });
 
   it('multi-level fleets: a crew member can lead its own nested crew', () => {

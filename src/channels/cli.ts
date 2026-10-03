@@ -329,6 +329,9 @@ export interface TuiState {
   /** Per-bot real-time activity (what each bot is doing RIGHT NOW) — rendered
    * as a live region in an open bot thread, keyed by bot id. */
   botLiveActivity: Record<string, LiveActivityState>;
+  /** Per-bot streaming tails (what each bot is THINKING / replying right now,
+   * from the bot turn's reasoning/text deltas) — rendered live in its thread. */
+  botStreamTails: Record<string, { reasoning: string; text: string }>;
   /** Live bot roster (drives `/bots` argument autocomplete and badges). */
   botRoster: Array<{ id: string; name: string; state: string; needsYou: boolean; fleetRole?: 'lead' | 'crew'; parent?: string }>;
 }
@@ -367,6 +370,7 @@ const defaultState: TuiState = {
   updateAvailable: null,
   botChat: null,
   botLiveActivity: {},
+  botStreamTails: {},
   botRoster: [],
 };
 
@@ -1799,14 +1803,34 @@ export class CLIChannel extends BaseChannel {
    * gets). Events arrive from the bot activity bus (BotManager.onBotActivity).
    * Mapping: turn-start → "Working on: <task>"; step/tool labels follow the
    * actual work; tool finishes keep the last running label (less churn);
-   * turn-end clears the region.
+   * 'thinking' carries the bot's live reasoning/reply tails and lands in
+   * botStreamTails so the open thread renders what it is thinking;
+   * turn-end clears the region (and the tails).
    */
-  setBotLiveActivity(botId: string, ev: { kind: 'turn-start' | 'step' | 'tool' | 'turn-end'; label: string; detail?: string; status?: string }): void {
+  setBotLiveActivity(botId: string, ev: { kind: 'turn-start' | 'step' | 'tool' | 'turn-end' | 'thinking'; label: string; detail?: string; status?: string; reasoningTail?: string; textTail?: string }): void {
     const map = { ...this.state.botLiveActivity };
     if (ev.kind === 'turn-end') {
-      if (!map[botId]) return;
+      if (!map[botId]) {
+        const tails = { ...this.state.botStreamTails };
+        if (!tails[botId]) return;
+        delete tails[botId];
+        this.update({ botStreamTails: tails });
+        return;
+      }
       delete map[botId];
-      this.update({ botLiveActivity: map });
+      const tails = { ...this.state.botStreamTails };
+      delete tails[botId];
+      this.update({ botLiveActivity: map, botStreamTails: tails });
+      return;
+    }
+    if (ev.kind === 'thinking') {
+      // Skip when the tail hasn't changed — ink re-renders every update and
+      // the streaming cadence (300ms) must not paint identical frames.
+      const tails = { ...this.state.botStreamTails };
+      const prev = tails[botId];
+      if (prev && prev.reasoning === (ev.reasoningTail ?? '') && prev.text === (ev.textTail ?? '')) return;
+      tails[botId] = { reasoning: ev.reasoningTail ?? '', text: ev.textTail ?? '' };
+      this.update({ botStreamTails: tails });
       return;
     }
     // A finished tool keeps its label until the next event — the region
@@ -1823,6 +1847,15 @@ export class CLIChannel extends BaseChannel {
       stepsDone: ev.kind === 'step' ? (existing?.stepsDone ?? 0) + 1 : (existing?.stepsDone ?? 0),
       startedAt: existing?.startedAt ?? Date.now(),
     };
+    // A fresh turn starts thinking anew — any leftover tail (missed turn-end,
+    // restart) must not bleed into the new turn's preview.
+    const staleTail = ev.kind === 'turn-start' && this.state.botStreamTails[botId];
+    if (staleTail) {
+      const tails = { ...this.state.botStreamTails };
+      delete tails[botId];
+      this.update({ botLiveActivity: map, botStreamTails: tails });
+      return;
+    }
     this.update({ botLiveActivity: map });
   }
 

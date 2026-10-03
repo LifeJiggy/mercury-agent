@@ -37,3 +37,35 @@ describe('CLIChannel per-bot live activity', () => {
     expect(ch.getTuiState().botLiveActivity['worker']).toBeUndefined();
   });
 });
+describe('CLIChannel bot thinking stream tails', () => {
+  const ch = new CLIChannel();
+
+  ch.setBotLiveActivity('worker', { kind: 'turn-start', label: 'scrape the prices' });
+  ch.setBotLiveActivity('worker', { kind: 'thinking', label: 'thinking', reasoningTail: 'I should scrape prices…', textTail: '' });
+  it('stores the bot tail in botStreamTails', () => {
+    expect(ch.getTuiState().botStreamTails?.['worker']).toEqual({ reasoning: 'I should scrape prices…', text: '' });
+  });
+
+  it('skips identical tail updates (no ink churn)', () => {
+    ch.setBotLiveActivity('worker', { kind: 'thinking', label: 'thinking', reasoningTail: 'I should scrape prices…', textTail: '' });
+    expect(ch.getTuiState().botStreamTails?.['worker']).toEqual({ reasoning: 'I should scrape prices…', text: '' });
+  });
+
+  it('updates the tail as the stream progresses', () => {
+    ch.setBotLiveActivity('worker', { kind: 'thinking', label: 'thinking', reasoningTail: '…', textTail: 'partial reply' });
+    expect(ch.getTuiState().botStreamTails?.['worker']).toEqual({ reasoning: '…', text: 'partial reply' });
+  });
+
+  it('a fresh turn discards the leftover tail', () => {
+    ch.setBotLiveActivity('worker', { kind: 'turn-start', label: 'new task' });
+    expect(ch.getTuiState().botStreamTails?.['worker']).toBeUndefined();
+    expect(ch.getTuiState().botLiveActivity['worker']).toMatchObject({ phase: 'Working', detail: 'new task' });
+  });
+
+  it('turn-end clears both the live region and the tail', () => {
+    ch.setBotLiveActivity('worker', { kind: 'thinking', label: 'thinking', reasoningTail: 'still thinking', textTail: '' });
+    ch.setBotLiveActivity('worker', { kind: 'turn-end', label: 'completed' });
+    expect(ch.getTuiState().botLiveActivity['worker']).toBeUndefined();
+    expect(ch.getTuiState().botStreamTails?.['worker']).toBeUndefined();
+  });
+});

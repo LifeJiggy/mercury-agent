@@ -1,8 +1,6 @@
 import { tool, zodSchema } from 'ai';
 import { z } from 'zod';
 import type { BotManager } from '../bot-manager.js';
-import { refinePersona } from '../persona-template.js';
-import type { BaseProvider } from '../../providers/base.js';
 
 export interface BotSpawnTools {
   spawn: ReturnType<typeof createSpawnTool>;
@@ -38,16 +36,19 @@ function createSpawnTool(manager: BotManager, leadId: string, maxCrew: number) {
       persona: z.string().min(20).max(8000).describe('The bot\'s persona: character, standing instructions, output style'),
     })),
     execute: async ({ id, name, description, persona }: { id: string; name: string; description: string; persona: string }) => {
-      const provider = manager.resolveProviderFor(leadId);
-      const refined = await refinePersona(persona, name, provider);
-      const result = manager.addCrew(leadId, { id, name, description, persona: refined ?? persona });
+      // No await on refinePersona: it is 1-2 serial LLM calls and used to
+      // run INSIDE this tool, stalling the lead's turn once per spawned
+      // crew member. The member starts on the lead-written persona right
+      // away; refinement lands in the background and overwrites the file.
+      const result = manager.addCrew(leadId, { id, name, description, persona });
       if (!result.ok) {
         return `Error: ${result.error}`;
       }
       if (result.duplicate) {
         return `**${result.manifest.name}** (\`${result.manifest.id}\`) is already on your crew — no new bot created. Check your roster (fleet_status / bot list) before spawning replacements.`;
       }
-      return `Crew member created: **${name}** (${result.manifest.id}) — fail-closed defaults, comms linked to you, persona ${refined ? 'refined through the persona builder' : 'saved as written'}. Dispatch tasks with bot_send (task: true); its results will arrive in your mailbox.`;
+      manager.schedulePersonaRefinement(result.manifest.id, name, persona);
+      return `Crew member created: **${name}** (${result.manifest.id}) — fail-closed defaults, comms linked to you, persona being refined in the background. Dispatch tasks with bot_send (task: true); its results will arrive in your mailbox.`;
     },
   });
 }

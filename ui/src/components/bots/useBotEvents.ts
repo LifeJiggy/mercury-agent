@@ -30,9 +30,12 @@ export function useBotEvents(): BotEventState {
       try {
         const ev = JSON.parse((e as MessageEvent).data) as {
           botId: string;
-          kind: "turn-start" | "step" | "tool" | "turn-end";
+          kind: "turn-start" | "step" | "tool" | "turn-end" | "thinking";
           label: string;
         };
+        // 'thinking' events carry the live stream tail for threads/chattier
+        // surfaces; the dashboard roster wants semantic work labels only.
+        if (ev.kind === "thinking") return;
         // A delivered artifact is the moment the owner reacts to — it banners
         // the inbox AND refreshes its list. Otherwise it's a roster activity label.
         if (ev.kind === "tool" && ev.label.startsWith("Delivered ")) {

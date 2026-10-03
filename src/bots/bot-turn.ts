@@ -1,4 +1,4 @@
-import { generateText, stepCountIs } from 'ai';
+import { streamText, stepCountIs } from 'ai';
 import type { Tool } from 'ai';
 import type { CapabilityRegistry } from '../capabilities/registry.js';
 import type { UserMemoryStore } from '../memory/user-memory.js';
@@ -25,13 +25,17 @@ export interface BotTurnMail {
 export type BotActivityEvent = {
   botId: string;
   jobId: string;
-  kind: 'turn-start' | 'step' | 'tool' | 'turn-end';
+  kind: 'turn-start' | 'step' | 'tool' | 'turn-end' | 'thinking';
   /** Human-readable: "read_file ~/cookies" / "step 4 · 12.3k tok in". */
   label: string;
   detail?: string;
   stepIndex: number;
   elapsedMs: number;
   status?: 'running' | 'done' | 'error';
+  /** kind 'thinking' only: cumulative rolling tails (raw deltas would force
+   *  every consumer to reassemble state — tails render stateless instead). */
+  reasoningTail?: string;
+  textTail?: string;
 };
 
 export interface BotTurnInput {
@@ -79,6 +83,11 @@ export interface BotTurnOutput {
 
 const MAX_STEPS_DEFAULT = 25;
 
+/** 'thinking' tail emission cadence — a live preview, not a firehose. */
+const THINKING_EMIT_INTERVAL_MS = 300;
+/** Rolling tail cap per field; surfaces render the tail bottom-anchored. */
+const THINKING_TAIL_CHARS = 600;
+
 /**
  * One run of one bot: a fresh-context tool loop over the bot's own provider,
  * persona, toolset, memory namespace, and fail-closed permission manager.
@@ -111,7 +120,7 @@ export async function runBotTurn(input: BotTurnInput): Promise<BotTurnOutput> {
   const turnStartedAt = Date.now();
   const toolsUsed = new Set<string>();
   const onActivity = input.onActivity;
-  const emit = (ev: { kind: BotActivityEvent['kind']; label: string; detail?: string; stepIndex: number; status?: BotActivityEvent['status']; elapsedMs?: number }): void => {
+  const emit = (ev: { kind: BotActivityEvent['kind']; label: string; detail?: string; stepIndex: number; status?: BotActivityEvent['status']; elapsedMs?: number; reasoningTail?: string; textTail?: string }): void => {
     if (!onActivity) return;
     try {
       onActivity({
@@ -123,6 +132,8 @@ export async function runBotTurn(input: BotTurnInput): Promise<BotTurnOutput> {
         detail: ev.detail,
         stepIndex: ev.stepIndex,
         status: ev.status,
+        reasoningTail: ev.reasoningTail,
+        textTail: ev.textTail,
       });
     } catch { /* activity feedback must never break a turn */ }
   };
@@ -130,14 +141,19 @@ export async function runBotTurn(input: BotTurnInput): Promise<BotTurnOutput> {
   try {
     emit({ kind: 'turn-start', stepIndex: 0, label: input.prompt ? input.prompt.slice(0, 80) : 'Checking inbox' });
     while (stepsRemaining > 0 && !abortSignal.aborted) {
-      const result = await generateText({
+      // streamText, not generateText: the deltas are the real-time feedback
+      // inside the bot's thread (reasoning + reply tails). Same options and
+      // step-count semantics; the result's final promises preserve the old
+      // result shape exactly (text/finishReason), so all classification below
+      // is unchanged.
+      const stream = streamText({
         model: provider.getModelInstance(),
         system,
         messages,
         tools,
         stopWhen: stepCountIs(stepsRemaining),
         abortSignal,
-        experimental_include: { requestBody: false, responseBody: false },
+        experimental_include: { requestBody: false },
         experimental_onStepStart: () => {
           stepIndex++;
           emit({ kind: 'step', stepIndex, label: `step ${stepIndex}` });
@@ -171,6 +187,37 @@ export async function runBotTurn(input: BotTurnInput): Promise<BotTurnOutput> {
           emit({ kind: 'step', stepIndex, label: `step ${stepIndex} · ${kIn}k tok in` });
         },
       });
+
+      // Live thinking feedback: consume the full stream, accumulate rolling
+      // tails, emit at most every THINKING_EMIT_INTERVAL_MS (a TUI re-render
+      // per delta would thrash ink). Tails are per-round: a new generation
+      // round starts thinking anew. Step boundaries insert a paragraph break
+      // so multi-step narrations don't run together (same fix as the main
+      // chat's stepAwareTextStream).
+      let reasoningTail = '';
+      let textTail = '';
+      let lastEmit = 0;
+      const flushThinking = (): void => {
+        if (!onActivity) return;
+        if (!reasoningTail && !textTail) return;
+        lastEmit = Date.now();
+        emit({ kind: 'thinking', stepIndex, label: 'thinking', reasoningTail, textTail });
+      };
+      for await (const part of stream.fullStream) {
+        if (part.type === 'reasoning-delta' && part.text) {
+          reasoningTail = (reasoningTail + part.text).slice(-THINKING_TAIL_CHARS);
+        } else if (part.type === 'text-delta' && part.text) {
+          textTail = (textTail + part.text).slice(-THINKING_TAIL_CHARS);
+        } else if (part.type === 'start-step' && (reasoningTail || textTail)) {
+          reasoningTail += '\n\n';
+          textTail += '\n\n';
+        }
+        if (Date.now() - lastEmit >= THINKING_EMIT_INTERVAL_MS) flushThinking();
+      }
+      flushThinking();
+
+      const [finalText, finishReason] = await Promise.all([stream.text, stream.finishReason]);
+      const result = { text: finalText, finishReason };
       lastResult = result;
 
       const completion = classifyStreamCompletion({

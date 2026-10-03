@@ -6,11 +6,44 @@ import { join } from 'node:path';
 // Mock generateText; keep the rest of the ai module real for tool factories.
 vi.mock('ai', async (importOriginal) => {
   const actual = await importOriginal<typeof import('ai')>();
-  return { ...actual, generateText: vi.fn() };
+  return { ...actual, generateText: vi.fn(), streamText: vi.fn() };
 });
 
-import { generateText } from 'ai';
+import { generateText, streamText } from 'ai';
 const mockedGenerateText = vi.mocked(generateText);
+
+const mockedStreamText = vi.mocked(streamText);
+// Bot turns run on streamText (live thinking deltas). Tests script
+// generateText; this shim feeds THAT script through the streaming shape the
+// turn loop consumes: the (async, mocked) generateText call fires the same
+// step callbacks inside fullStream consumption, and its final result shows
+// up as the text/finishReason promises runBotTurn awaits.
+mockedStreamText.mockImplementation(((opts: any) => {
+  let final = { text: '', finishReason: 'stop', usage: {} };
+  let failed: unknown = null;
+  let resolveSettled: () => void = () => { };
+  const settled = new Promise<void>((r) => { resolveSettled = r; });
+  const gen: any = (generateText as any)(opts) || Promise.resolve(final);
+  const fullStream = (async function* () {
+    try {
+      final = await gen;
+    } catch (err) {
+      failed = err; // rethrown by the text/finishReason promises below
+    }
+    resolveSettled();
+  })();
+  // Resolve only after the underlying generateText settles; its promises
+  // must never reject unhandled (the fullStream consumer owns the error).
+  const once = async (pick: () => any) => { await settled; if (failed !== null) throw failed; return pick(); };
+  return {
+    fullStream,
+    text: once(() => final.text),
+    finishReason: once(() => final.finishReason),
+    // runBotTurn reads usage from onStepFinish — usage must never reject
+    // unhandled (Promise.all only consumes text/finishReason).
+    usage: once(() => final.usage).catch(() => ({})),
+  };
+}) as any);
 import { BotQueue, JsonFileQueueBackend, SqliteQueueBackend, idempotencyKeyFor, LEASE_SECONDS } from './queue.js';
 import type { DurableBotJob } from './queue.js';
 
@@ -255,6 +288,7 @@ describe('BotManager durable queue integration', () => {
   });
 
   it('persists jobs before ack and dedupes identical pending sends', async () => {
+    mockedStreamText.mockClear();
     mockedGenerateText.mockReset();
     mockedGenerateText.mockResolvedValue({ text: 'ok', finishReason: 'stop', usage: { inputTokens: 1, outputTokens: 1 } } as any);
     store.create({ id: 'alpha', name: 'Alpha' });
@@ -272,6 +306,7 @@ describe('BotManager durable queue integration', () => {
   });
 
   it('permanent failures land in the DLQ and are replayable', async () => {
+    mockedStreamText.mockClear();
     mockedGenerateText.mockReset();
     mockedGenerateText.mockRejectedValue(new Error('permission denied: workspace'));
     store.create({ id: 'alpha', name: 'Alpha' });
@@ -290,6 +325,7 @@ describe('BotManager durable queue integration', () => {
   it('replaying a job under the WRONG bot id does not destroy the DLQ entry', async () => {
     // The old replayDlq removed the entry BEFORE checking the bot — a
     // mismatch permanently deleted real work and still reported not_found.
+    mockedStreamText.mockClear();
     mockedGenerateText.mockReset();
     mockedGenerateText.mockRejectedValue(new Error('permission denied: workspace'));
     store.create({ id: 'alpha', name: 'Alpha' });

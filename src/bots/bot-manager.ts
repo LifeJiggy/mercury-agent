@@ -1,4 +1,4 @@
-import { cpus } from 'node:os';
+import { refinePersona } from './persona-template.js';
 import { randomUUID } from 'node:crypto';
 import { basename, extname, isAbsolute, relative, resolve, join } from 'node:path';
 import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync } from 'node:fs';
@@ -246,8 +246,10 @@ export class BotManager {
   }
   private emitBotActivity(ev: BotActivityEvent): void {
     // Live roster label: keep the static job description until the first
-    // step arrives, then follow the actual work.
-    if (ev.kind !== 'turn-end') this.activity.set(ev.botId, ev.label);
+    // step arrives, then follow the actual work. 'thinking' events are a
+    // stream preview for threads, not a roster label — the label must stay
+    // semantic (step/tool names), not the last 80 chars of reasoning.
+    if (ev.kind !== 'turn-end' && ev.kind !== 'thinking') this.activity.set(ev.botId, ev.label);
     for (const listener of this.activityListeners) {
       try { listener(ev); } catch (err: any) {
         logger.warn({ botId: ev.botId, err: err?.message }, 'Bot activity listener failed');
@@ -274,11 +276,18 @@ export class BotManager {
     }
   }
 
-  /** Fleet-wide concurrency cap: config override or clamp(2, cpus-1). */
+  /**
+   * Fleet-wide concurrency cap: config override or a fixed default of 8.
+   * NOT cpu-derived: a bot turn is a network-bound LLM call plus small tool
+   * subprocesses — a cpus()-1 cap serialized whole fleets on small VMs
+   * (4 vCPU → 3 concurrent turns) while doing nothing to protect a 16-core
+   * box any more than a 1-core one. Providers' own rate limits and the
+   * transient-retry machinery handle 429 pressure.
+   */
   private fleetCap(): number {
     const configured = this.config.bots?.maxConcurrent ?? 0;
     if (configured > 0) return configured;
-    return Math.max(2, Math.min(cpus().length - 1, 8));
+    return 8;
   }
 
   private journalFor(botId: string): BotJournal {
@@ -931,6 +940,32 @@ export class BotManager {
     this.invalidateRuntime(leadId); // lead's roster + fleet prompt change
     logger.info({ leadId, crewId: spec.id }, 'Crew member added to fleet');
     return { ok: true, manifest };
+  }
+
+  /**
+   * Background persona refinement — bot_spawn used to await refinePersona
+   * (up to two serial LLM calls) inside the lead's TOOL EXECUTION, stalling
+   * the lead's turn once per spawned crew member. The member starts on the
+   * lead-written persona immediately and the refined file overwrites it
+   * whenever it lands; every later turn picks it up (buildTurn re-reads the
+   * persona file, so no runtime invalidation is required). Failure keeps the
+   * raw persona — refinePersona's own contract.
+   */
+  schedulePersonaRefinement(botId: string, name: string, rawPersona: string): void {
+    const manifest = this.store.get(botId);
+    if (!manifest) return;
+    const provider = resolveProvider(this.providers, manifest);
+    void refinePersona(rawPersona, name, provider)
+      .then((refined) => {
+        if (!refined) return;
+        try {
+          this.store.writePersona(botId, refined);
+          logger.info({ botId }, 'Background persona refinement landed');
+        } catch (err: any) {
+          logger.warn({ botId, err: err?.message }, 'Background persona write failed');
+        }
+      })
+      .catch((err) => logger.warn({ botId, err: err?.message }, 'Background persona refinement failed'));
   }
 
   /** Remove a crew member (lead's own child only) and record it on the lead. */
