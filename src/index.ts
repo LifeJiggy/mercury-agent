@@ -2219,6 +2219,33 @@ async function configure(existingConfig?: MercuryConfig): Promise<void> {
   console.log('');
 }
 
+/**
+ * The runtime passed the PID-liveness check but its web endpoint is dead — a
+ * hung process, or a web server that failed to bind (EADDRINUSE leaves the
+ * daemon alive but web-less). Without this, the single-runtime rule bricked
+ * the launcher: every `mercury` invocation attached into the dead end and
+ * exited, and only a user who knew to run `mercury stop` could recover.
+ * The user's intent when typing `mercury` is to chat, so restart and boot.
+ */
+/**
+ * Auto-attach entry for launch paths that found a "running" runtime. Attach,
+ * or — when the runtime proved unresponsive — heal it and boot fresh.
+ */
+async function attachOrHeal(): Promise<void> {
+  const result = await runAttach();
+  if (result === 'attached') return;
+  if (result !== 'unhealthy') { process.exitCode = 1; return; }
+  await healRuntimeAndBoot();
+}
+
+async function healRuntimeAndBoot(): Promise<void> {
+  console.log(chalk.yellow('  Runtime is not responding — restarting it...'));
+  await stopForegroundRuntime();
+  await stopDaemon();
+  autoDaemonize();
+  await runAgent();
+}
+
 function autoDaemonize(): void {
   const daemon = getDaemonStatus();
   if (daemon.running && daemon.pid) {
@@ -3686,13 +3713,13 @@ program
     const daemon = getDaemonStatus();
     if (daemon.running && daemon.pid) {
       console.log(chalk.cyan(`  ⚿ Mercury is already running in the background (PID: ${daemon.pid}) — attaching.`));
-      await runAttach();
+      await attachOrHeal();
       return;
     }
     const foreground = getForegroundRuntimeStatus();
     if (foreground.running && foreground.pid) {
       console.log(chalk.cyan(`  ⚿ Mercury is already running (PID: ${foreground.pid}) — attaching.`));
-      await runAttach();
+      await attachOrHeal();
       return;
     }
     autoDaemonize();
@@ -3723,13 +3750,13 @@ program
       const daemon = getDaemonStatus();
       if (daemon.running && daemon.pid) {
         console.log(chalk.cyan(`  ⚿ Mercury is already running in the background (PID: ${daemon.pid}) — attaching.`));
-        await runAttach();
+        await attachOrHeal();
         return;
       }
       const foreground = getForegroundRuntimeStatus();
       if (foreground.running && foreground.pid) {
         console.log(chalk.cyan(`  ⚿ Mercury is already running (PID: ${foreground.pid}) — attaching.`));
-        await runAttach();
+        await attachOrHeal();
         return;
       }
       await runAgent();
@@ -3743,7 +3770,7 @@ program
   .command('attach')
   .description('Attach this terminal to an already-running Mercury runtime (chat + live streaming)')
   .action(async () => {
-    await runAttach();
+    await runAttach({ exitOnFailure: true });
   });
 
 program
@@ -4883,7 +4910,7 @@ cloud
       const daemon = getDaemonStatus();
       if (daemon.running && daemon.pid) {
         console.log(chalk.cyan(`\n  ⚿ Mercury is already running in the background (PID: ${daemon.pid}) — attaching.\n`));
-        await runAttach();
+        await attachOrHeal();
         return;
       }
       console.log(chalk.cyan('\n  Launching Mercury...\n'));

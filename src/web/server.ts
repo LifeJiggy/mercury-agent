@@ -247,7 +247,10 @@ export function startWebServer(): { port: number; url: string } {
 
   server.on('error', (err: any) => {
     if (err?.code === 'EADDRINUSE') {
-      logger.warn(`Port ${port} is already in use. Web dashboard unavailable.`);
+      // The runtime stays alive for its channels, but with no web listener
+      // every attach health check fails — the launcher treats that as an
+      // unresponsive runtime and restarts it. Log the shape of that state.
+      logger.warn(`Port ${port} is already in use — web dashboard unavailable. Attach/launch will report the runtime as unresponsive and restart it.`);
     } else {
       logger.error({ err: err.message }, 'Web server error');
     }

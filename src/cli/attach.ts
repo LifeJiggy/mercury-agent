@@ -258,6 +258,8 @@ export interface AttachTarget {
   pid: number | null;
 }
 
+const RUNTIME_BOOT_GRACE_MS = 15_000;
+
 /**
  * Resolve the running runtime to attach to. Prefers the foreground TUI
  * process, falls back to the daemon. Returns null when no runtime is alive.
@@ -273,12 +275,45 @@ export function findAttachTarget(): AttachTarget | null {
 }
 
 /**
+ * Ride out a runtime that is still booting: the web endpoint comes up some
+ * seconds into boot (channels and bot crew replay run first), so a one-shot
+ * health check classified every slow boot as a broken runtime. Retries until
+ * the grace window expires. An `auth` failure is not retryable — the token
+ * rotated, which means the runtime restarted while we were reading it.
+ */
+export async function waitForRuntimeHealth(
+  client: Pick<AttachClient, 'healthCheck'>,
+  graceMs: number,
+): Promise<{ ok: boolean; message?: string }> {
+  const deadline = Date.now() + graceMs;
+  for (;;) {
+    try {
+      await client.healthCheck();
+      return { ok: true };
+    } catch (err) {
+      const message = String((err as Error)?.message || err);
+      if (message === 'auth') return { ok: false, message };
+      if (Date.now() >= deadline) return { ok: false, message };
+      await new Promise(resolve => setTimeout(resolve, 750));
+    }
+  }
+}
+
+export interface AttachRunOptions {
+  /** Explicit `mercury attach` invocation — a failed attach sets exit code 1.
+   *  Auto-attach launch paths leave the exit code alone so they can self-heal. */
+  exitOnFailure?: boolean;
+}
+
+export type AttachResult = 'attached' | 'unavailable' | 'unhealthy';
+
+/**
  * Entry point for `mercury attach` (and the auto-attach path when a second
  * `mercury` invocation finds the runtime already running). Connects, opens
  * the TUI, and returns when the user detaches (Ctrl+C). The runtime is
  * never touched from here.
  */
-export async function runAttach(): Promise<void> {
+export async function runAttach(opts: AttachRunOptions = {}): Promise<AttachResult> {
   const { render } = await import('ink');
   const React = await import('react');
   const { AttachTui } = await import('../ui/attach-tui.js');
@@ -293,22 +328,29 @@ export async function runAttach(): Promise<void> {
       console.error('  Cannot attach: web is disabled or no attach token was written at boot.');
       console.error('  Enable web (mercury doctor), or `mercury stop` and start again.');
     }
-    process.exitCode = 1;
-    return;
+    if (opts.exitOnFailure) process.exitCode = 1;
+    return 'unavailable';
   }
 
   const client = new AttachClient(target.baseUrl, target.token);
   try {
     await client.healthCheck();
-  } catch (err) {
-    const message = String((err as Error)?.message || err);
-    console.error(`  Runtime is not responding at ${target.baseUrl} (${message}).`);
-    if (message === 'auth') {
-      console.error('  The attach token rotated — the runtime restarted since the token was read.');
-      console.error('  Run `mercury attach` again.');
+  } catch (firstErr) {
+    // Not up yet — either booting or broken. Give it the boot-grace window.
+    console.log(chalk.dim('  Waiting for the runtime to respond...'));
+    const health = await waitForRuntimeHealth(client, RUNTIME_BOOT_GRACE_MS);
+    if (health.ok === false) {
+      const message = String((firstErr as Error)?.message || firstErr);
+      if (message === 'auth') {
+        console.error('  The attach token rotated — the runtime restarted since the token was read.');
+        console.error('  Run `mercury attach` again.');
+      } else {
+        console.error(`  Runtime (PID: ${target.pid}) is not responding at ${target.baseUrl} — likely hung, or its web server never bound.`);
+        console.error(`  Recover with \`mercury stop\`, then launch again. Daemon log: ${getDaemonStatus().logPath}`);
+      }
+      if (opts.exitOnFailure) process.exitCode = 1;
+      return 'unhealthy';
     }
-    process.exitCode = 1;
-    return;
   }
 
   const instance = render(React.createElement(AttachTui, {
@@ -318,4 +360,5 @@ export async function runAttach(): Promise<void> {
   }));
   await instance.waitUntilExit();
   console.log(chalk.dim(`  Detached. Runtime still running${target.pid ? ` (PID ${target.pid})` : ''} — \`mercury stop\` stops it.`));
+  return 'attached';
 }

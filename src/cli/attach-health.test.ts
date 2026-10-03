@@ -1,0 +1,47 @@
+import { describe, expect, it } from 'vitest';
+import { waitForRuntimeHealth } from './attach.js';
+
+/** Fake health probe configurable per test. */
+function clientWith(behavior: () => Promise<void>): { healthCheck: () => Promise<void>; calls: () => number } {
+  let calls = 0;
+  return {
+    healthCheck: async () => { calls++; return behavior(); },
+    calls: () => calls,
+  };
+}
+
+describe('waitForRuntimeHealth (attach boot-grace retry)', () => {
+  it('returns ok on the first healthy probe', async () => {
+    const client = clientWith(async () => {});
+    const result = await waitForRuntimeHealth(client, 300);
+    expect(result.ok).toBe(true);
+    expect(client.calls()).toBe(1);
+  });
+
+  it('retries a still-booting runtime until it responds', async () => {
+    let n = 0;
+    const client = clientWith(async () => {
+      n++;
+      if (n < 3) throw new Error('Unable to connect');
+    });
+    const result = await waitForRuntimeHealth(client, 5_000);
+    expect(result.ok).toBe(true);
+    expect(client.calls()).toBe(3);
+  });
+
+  it('gives up unhealthy after the boot-grace window expires', async () => {
+    const client = clientWith(async () => { throw new Error('Unable to connect'); });
+    const result = await waitForRuntimeHealth(client, 400);
+    expect(result.ok).toBe(false);
+    expect(result.message).toBe('Unable to connect');
+    expect(client.calls()).toBeGreaterThan(1);
+  });
+
+  it('does not retry an auth failure — a rotated token never self-heals', async () => {
+    const client = clientWith(async () => { throw new Error('auth'); });
+    const result = await waitForRuntimeHealth(client, 5_000);
+    expect(result.ok).toBe(false);
+    expect(result.message).toBe('auth');
+    expect(client.calls()).toBe(1);
+  });
+});
