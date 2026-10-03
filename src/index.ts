@@ -3680,6 +3680,15 @@ program
       return;
     }
     // A second terminal joins the running runtime instead of fighting it.
+    // THE DAEMON COUNTS: booting a full foreground runtime next to it gave
+    // two schedulers and two bot pollers on one queue.db — bots got called
+    // twice and fleet-creation turns raced. Attach instead.
+    const daemon = getDaemonStatus();
+    if (daemon.running && daemon.pid) {
+      console.log(chalk.cyan(`  ⚿ Mercury is already running in the background (PID: ${daemon.pid}) — attaching.`));
+      await runAttach();
+      return;
+    }
     const foreground = getForegroundRuntimeStatus();
     if (foreground.running && foreground.pid) {
       console.log(chalk.cyan(`  ⚿ Mercury is already running (PID: ${foreground.pid}) — attaching.`));
@@ -3710,6 +3719,13 @@ program
     }
 
     if (opts.foreground) {
+      // Same single-runtime rule: a live daemon is already "Mercury running".
+      const daemon = getDaemonStatus();
+      if (daemon.running && daemon.pid) {
+        console.log(chalk.cyan(`  ⚿ Mercury is already running in the background (PID: ${daemon.pid}) — attaching.`));
+        await runAttach();
+        return;
+      }
       const foreground = getForegroundRuntimeStatus();
       if (foreground.running && foreground.pid) {
         console.log(chalk.cyan(`  ⚿ Mercury is already running (PID: ${foreground.pid}) — attaching.`));
@@ -4862,6 +4878,14 @@ cloud
     // immediately. The background daemon (started by runCloudConnect) keeps
     // the WebSocket alive even after the user exits the foreground.
     if (isSetupComplete()) {
+      // runCloudConnect (re)starts the daemon — join IT, never boot a second
+      // runtime next to it (two schedulers would call bots in lockstep).
+      const daemon = getDaemonStatus();
+      if (daemon.running && daemon.pid) {
+        console.log(chalk.cyan(`\n  ⚿ Mercury is already running in the background (PID: ${daemon.pid}) — attaching.\n`));
+        await runAttach();
+        return;
+      }
       console.log(chalk.cyan('\n  Launching Mercury...\n'));
       await runAgent();
     } else {

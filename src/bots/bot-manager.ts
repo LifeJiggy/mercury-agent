@@ -854,8 +854,12 @@ export class BotManager {
         for (const p of proposals) {
           const result = this.addCrew(botId, p);
           if (result.ok) {
-            created++;
-            hooks.onMember?.(p.name, result.manifest.id);
+            // A duplicate (already on the crew) is success without growth —
+            // replayed builds converge instead of inflating the roster.
+            if (!result.duplicate) {
+              created++;
+              hooks.onMember?.(p.name, result.manifest.id);
+            }
           } else {
             hooks.onError?.(`Crew member ${p.name} (${p.id}): ${result.error}`);
           }
@@ -867,7 +871,7 @@ export class BotManager {
     })();
   }
 
-  addCrew(leadId: string, spec: { id: string; name: string; description?: string; persona?: string }): { ok: true; manifest: BotManifest } | { ok: false; error: string } {
+  addCrew(leadId: string, spec: { id: string; name: string; description?: string; persona?: string }): { ok: true; manifest: BotManifest; duplicate?: boolean } | { ok: false; error: string } {
     const lead = this.store.get(leadId);
     if (!lead) return { ok: false, error: `No bot "${leadId}"` };
     if (lead.fleetRole !== 'lead') {
@@ -887,16 +891,35 @@ export class BotManager {
       ancestor = this.store.get(ancestor)?.parent;
       if (++depth > 3) return { ok: false, error: 'Fleet nesting is capped at 3 levels' };
     }
+    // Replay-safety BEFORE the crew cap: a re-run "build the crew" turn
+    // (durable job replayed after an interrupted session) re-derives its
+    // specs through the LLM and can land on a DIFFERENT id for a specialist
+    // the fleet already has — the id guard alone let the roster grow a
+    // duplicate crew per replay. A spec matching an id or the normalized
+    // NAME of a member already under THIS lead is already-staffed: success
+    // without creation. Only foreign ids / names from another lead are an
+    // error. Duplicates skip the cap check — a full fleet stays full.
+    const id = spec.id.toLowerCase();
+    let existing: BotManifest | null = this.store.exists(id) ? this.store.get(id) : null;
+    if (!existing) {
+      const nameKey = (spec.name ?? '').trim().toLowerCase();
+      if (nameKey) {
+        existing = this.store.crewOf(leadId).find(m => m.name.trim().toLowerCase() === nameKey) ?? null;
+      }
+    }
+    if (existing) {
+      if (existing.fleetRole === 'crew' && existing.parent === leadId) {
+        return { ok: true, manifest: existing, duplicate: true };
+      }
+      return { ok: false, error: `Bot "${id}" already exists` };
+    }
     const crew = this.store.crewOf(leadId);
     const cap = this.maxCrew();
     if (crew.length >= cap) {
       return { ok: false, error: `Fleet is at the crew cap (${crew.length}/${cap}) — retire a member first or raise BOTS_FLEET_MAX_CREW` };
     }
-    if (this.store.exists(spec.id)) {
-      return { ok: false, error: `Bot "${spec.id}" already exists` };
-    }
     const manifest = this.store.create({
-      id: spec.id.toLowerCase(),
+      id,
       name: spec.name,
       description: spec.description,
       persona: spec.persona,

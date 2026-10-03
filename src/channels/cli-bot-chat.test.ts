@@ -122,3 +122,19 @@ describe('bot chat /persona + /skip routing', () => {
     expect(agentSrc).toMatch(/'open', 'send', 'journal', 'inbox', 'budget', 'edit', 'delete', 'enable', 'disable', 'stop', 'pause', 'start', 'run', 'persona'/);
   });
 });
+
+describe('bot chat /bots routing — control commands stay inside the thread', () => {
+  it('/bots inside a bot chat parks the reply target instead of exiting', () => {
+    // cli side: the /bots branch sets the pending target and passes the
+    // command through; it must precede the generic exit-slash branch.
+    const botsBranch = cliSrc.indexOf("trimmed.startsWith('/bots')");
+    const exitBranch = cliSrc.indexOf("trimmed.startsWith('/')", botsBranch);
+    expect(botsBranch).toBeGreaterThan(-1);
+    expect(exitBranch).toBeGreaterThan(botsBranch);
+    expect(cliSrc.slice(botsBranch, exitBranch)).toMatch(/pendingBotChatTarget = this\.activeBotId/);
+  });
+
+  it('the agent routes /bots replies into the bot thread the command was typed from', () => {
+    expect(agentSrc).toMatch(/const pendingBot = \(channel as any\)\.consumePendingBotChatTarget\?\.\(\) \?\? null;[\s\S]*?const channelId = pendingBot \? `bot:\$\{pendingBot\}` : msg\.channelId;/);
+  });
+});

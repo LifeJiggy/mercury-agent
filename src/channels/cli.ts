@@ -790,6 +790,19 @@ export class CLIChannel extends BaseChannel {
             : `/bots persona ${this.activeBotId}`);
           return;
         }
+        // /bots control commands STAY inside the bot thread: the agent routes
+        // their replies into this transcript via the pending bot-chat target
+        // (same mechanism as /bot dispatch) — the roster, journal, inbox etc.
+        // all render here. `/bots open <other-id>` naturally swaps threads.
+        if (trimmed.startsWith('/bots')) {
+          this.pendingBotChatTarget = this.activeBotId;
+          try {
+            onInput(trimmed);
+          } finally {
+            this.pendingBotChatTarget = null;
+          }
+          return;
+        }
         // Any other slash command exits the bot chat first (review D2):
         // command replies route to the main transcript and would otherwise
         // be invisible from inside the bot thread.

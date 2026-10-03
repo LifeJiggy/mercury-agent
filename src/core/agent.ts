@@ -1291,7 +1291,9 @@ export class Agent {
         for (const p of proposals) {
           const result = bm.addCrew(botId, p);
           if (result.ok) {
-            lines.push(`• **${p.name}** (\`${result.manifest.id}\`) — ${p.description || 'specialist'}`);
+            lines.push(result.duplicate
+              ? `• **${p.name}** (\`${result.manifest.id}\`) — already on the crew, skipped`
+              : `• **${p.name}** (\`${result.manifest.id}\`) — ${p.description || 'specialist'}`);
           } else {
             lines.push(`⚠ ${p.name} (${p.id}): ${result.error}`);
           }
@@ -1412,7 +1414,11 @@ export class Agent {
    */
   private async handleBotsCommand(trimmed: string, msg: ChannelMessage, channel: any): Promise<void> {
     const bm = this.botManager;
-    const channelId = msg.channelId;
+    // A /bots command typed from INSIDE a bot thread replies THERE (cli.ts
+    // parks the thread id) — the roster/journal/inbox render in the bot's
+    // transcript instead of bouncing the user back to the main chat.
+    const pendingBot = (channel as any).consumePendingBotChatTarget?.() ?? null;
+    const channelId = pendingBot ? `bot:${pendingBot}` : msg.channelId;
     if (!bm) {
       await channel.send('Bots are not available (BotManager not wired).', channelId);
       return;
