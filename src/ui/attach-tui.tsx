@@ -2,6 +2,7 @@ import React from 'react';
 import { Box, Text, Spacer, Static, useApp, useInput } from 'ink';
 import type { AttachClient, AttachEvent, AttachThread, AttachThreadMessage } from '../cli/attach.js';
 import { renderMarkdown } from '../utils/markdown.js';
+import { useTerminalSize } from './use-terminal-size.js';
 
 /**
  * Attach TUI — the terminal face of `mercury attach`. Native scrollback
@@ -107,6 +108,10 @@ export function AttachTui({ client, pid, onExit }: { client: AttachClient; pid: 
 
   const [input, setInput] = React.useState('');
   const [cursorPos, setCursorPos] = React.useState(0);
+
+  // Same input width as the main TUI's chat/Code input (App.tsx).
+  const terminalSize = useTerminalSize();
+  const inputWidth = Math.max(40, terminalSize.cols - 4);
 
   React.useEffect(() => {
     client.listThreads()
@@ -406,7 +411,11 @@ export function AttachTui({ client, pid, onExit }: { client: AttachClient; pid: 
         </Box>
       )}
       <Box paddingX={2} flexShrink={0}>
-        <Box borderStyle="round" borderColor="gray" flexDirection="column" paddingX={1}>
+        {/* Explicit width, mirroring the main TUI's input: this box used to
+            rely on Yoga cross-stretch, but its wrapper is direction='row'
+            (ink's Box default), where stretch never applies — so the input
+            rendered at content width (~5 cols) on every machine. */}
+        <Box borderStyle="round" borderColor="gray" flexDirection="column" paddingX={1} width={inputWidth}>
           <Box>
             <Text bold color="cyan">&gt; </Text>
             <Text>{input.slice(0, cursorPos)}</Text>

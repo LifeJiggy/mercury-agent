@@ -9,6 +9,7 @@ import { renderMarkdown } from '../utils/markdown.js';
 import { isDevBuild } from '../utils/dev-build.js';
 import { highlightCodeBlock } from '../utils/highlight.js';
 import { normalizeTerminalText, getViewportWindow } from './terminal-viewport.js';
+import { useTerminalSize as useSharedTerminalSize } from './use-terminal-size.js';
 import { buildMercuryMessageLines, buildMercuryBrandLines, buildStreamTailLines, parseChunkIndex, splitFinalMessage, splitStreamingMessage, type MercuryTranscriptLine } from './mercury-transcript.js';
 import { GENERIC_PHASES, PLANNING_VERBS, lastUserText, pickStatusWord } from './status-word.js';
 import { nextTip, rotateTip } from './tips.js';
@@ -1342,23 +1343,7 @@ function CodingBody({ state, maxDynamicLines }: { state: TuiState; maxDynamicLin
 // ─── Workspace IDE ──────────────────────────────────────────────────────────
 
 function useTerminalSize(): { rows: number; cols: number } {
-  const { stdout } = useStdout();
-  const [size, setSize] = React.useState({ rows: stdout.rows || 24, cols: stdout.columns || 80 });
-  React.useEffect(() => {
-    const onResize = () => {
-      const rows = stdout.rows || 24;
-      const cols = stdout.columns || 80;
-      setSize((current) => current.rows === rows && current.cols === cols ? current : { rows, cols });
-    };
-    stdout.on('resize', onResize);
-    const fallback = setInterval(onResize, 500);
-    fallback.unref?.();
-    return () => {
-      stdout.off('resize', onResize);
-      clearInterval(fallback);
-    };
-  }, [stdout]);
-  return size;
+  return useSharedTerminalSize();
 }
 
 function WorkspaceTabBar({ ws, focusArea, cols }: { ws: WorkspaceState; focusArea: string; cols: number }) {
