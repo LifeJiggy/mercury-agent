@@ -786,7 +786,11 @@ describe('Bot fleets (lead + crew)', () => {
     expect(manager.addCrew('ceo', { id: 'over-cap', name: 'Over' })).toMatchObject({ ok: false });
     store.create({ id: 'solo-bot', name: 'Solo' });
     expect(manager.addCrew('solo-bot', { id: 'x', name: 'X' })).toMatchObject({ ok: false }); // not a lead
-    expect(manager.addCrew('ceo', { id: 'researcher', name: 'Dup' })).toMatchObject({ ok: false }); // exists
+    // Replay-safety: re-adding a member the lead already has (by id or
+    // normalized name) is a no-op success, not a duplicate bot on disk.
+    expect(manager.addCrew('ceo', { id: 'researcher', name: 'Dup' })).toMatchObject({ ok: true, duplicate: true });
+    expect(manager.addCrew('ceo', { id: 'brand-new-id', name: 'researcher' })).toMatchObject({ ok: true, duplicate: true });
+    expect(store.list().filter(m => m.parent === 'ceo')).toHaveLength(6);
   });
 
   it('delegated tasks return results to the lead mailbox (attributed)', async () => {

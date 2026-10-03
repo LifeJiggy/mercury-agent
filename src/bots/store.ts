@@ -253,6 +253,13 @@ export class BotStore {
   list(): BotManifest[] {
     if (!existsSync(this.botsRoot)) return [];
     const manifests: BotManifest[] = [];
+    // Bot identity is the manifest id, and it must stay 1:1 with the roster:
+    // a profile dir that somehow exists in MORE than one place in the tree
+    // (a forked/stale copy — historically possible when a relocate races a
+    // concurrent runtime or a rename fails on Windows) must not let the same
+    // bot appear twice. First occurrence wins; extra copies are flagged.
+    const seenIds = new Set<string>();
+    const reportedForks = new Set<string>();
     // Fleet layout is physical: crew profiles nest inside their lead's dir,
     // so walk the tree (bounded by the fleet depth cap). Data dirs without a
     // bot.yaml (sandbox/, skills/, rotations) are descended harmlessly but
@@ -269,7 +276,15 @@ export class BotStore {
         const sub = join(dir, entry.name);
         try {
           const m = this.get(entry.name);
-          if (m) manifests.push(m);
+          if (m) {
+            if (!seenIds.has(m.id)) {
+              seenIds.add(m.id);
+              manifests.push(m);
+            } else if (!reportedForks.has(m.id)) {
+              reportedForks.add(m.id);
+              logger.warn({ botId: m.id, dir: sub }, 'Duplicate physical bot profile — roster keeps only the first occurrence; run `mercury` and remove the stale copy');
+            }
+          }
         } catch (err: any) {
           logger.warn({ dir: sub, err: err?.message }, 'Skipping unreadable bot profile');
         }

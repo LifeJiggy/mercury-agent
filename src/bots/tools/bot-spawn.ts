@@ -44,6 +44,9 @@ function createSpawnTool(manager: BotManager, leadId: string, maxCrew: number) {
       if (!result.ok) {
         return `Error: ${result.error}`;
       }
+      if (result.duplicate) {
+        return `**${result.manifest.name}** (\`${result.manifest.id}\`) is already on your crew — no new bot created. Check your roster (fleet_status / bot list) before spawning replacements.`;
+      }
       return `Crew member created: **${name}** (${result.manifest.id}) — fail-closed defaults, comms linked to you, persona ${refined ? 'refined through the persona builder' : 'saved as written'}. Dispatch tasks with bot_send (task: true); its results will arrive in your mailbox.`;
     },
   });
