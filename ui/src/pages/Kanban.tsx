@@ -100,7 +100,6 @@ import {
 } from "@/components/ui/sheet";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
-import { MarkdownRenderer } from "@/components/chat/MarkdownRenderer";
 import { cn } from "@/lib/utils";
 import { formatDate, formatTokens, truncate } from "@/lib/utils";
 import api, {
@@ -2028,8 +2027,10 @@ function AttachmentsTab({ card, boardId, onDelete }: { card: BoardCard; boardId:
   );
 }
 
-// Simple markdown renderer (handles headers, bold, code blocks, lists)
-function MarkdownRenderer({ content }: { content: string }) {
+// Simple markdown renderer (handles headers, bold, code blocks, lists).
+// Local by design — the chat MarkdownRenderer (react-markdown) is heavier
+// than card previews need; className passes through to the wrapper div.
+function MarkdownRenderer({ content, className }: { content: string; className?: string }) {
   const lines = content.split('\n');
   const elements: JSX.Element[] = [];
   let inCodeBlock = false;
@@ -2088,7 +2089,7 @@ function MarkdownRenderer({ content }: { content: string }) {
     );
   }
 
-  return <>{elements}</>;
+  return <div className={className}>{elements}</div>;
 }
 
 function renderInline(text: string): React.ReactNode {
