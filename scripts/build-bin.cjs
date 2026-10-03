@@ -189,7 +189,13 @@ function createWebArchive(versionDir, { required }) {
   // for xattr-bearing files. Those entries are invisible to bsdtar's `-tzf`
   // but visible to GNU tar, where they fail install.sh's `^web/` path check
   // ("web.tar.gz contains an unsafe path" — see #122).
-  execFileSync('tar', ['-czf', webTarPath, '-C', versionDir, 'web'], {
+  //
+  // --no-xattrs stops bsdtar from writing xattrs PAX headers
+  // (LIBARCHIVE.xattr.com.apple.provenance, stamped by macOS Gatekeeper).
+  // GNU tar doesn't know those keywords and warns one "ignoring unknown
+  // extended header keyword" line per file during install.sh's extract —
+  // harmless but very noisy on Linux (see #122).
+  execFileSync('tar', ['--no-xattrs', '-czf', webTarPath, '-C', versionDir, 'web'], {
     cwd: root,
     stdio: 'pipe',
     env: { ...process.env, COPYFILE_DISABLE: '1' },
